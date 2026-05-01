@@ -1,3 +1,6 @@
 [submodule "FPTaylor"]
 	path = FPTaylor
 	url = git@github.com:meelgroup/FPTaylor.git
+[submodule "gelpia"]
+	path = gelpia
+	url = git@github.com:meelgroup/gelpia.git
