@@ -1,0 +1,3 @@
+[submodule "FPTaylor"]
+	path = FPTaylor
+	url = git@github.com:meelgroup/FPTaylor.git
