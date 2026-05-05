@@ -21,7 +21,7 @@ FP_BETA = {
 }
 
 COLORS = ['blue', 'green', 'red', 'orange']
-SWITCH = 30 # lambda threshold for switching between low and high range computations
+SWITCH = 40 # lambda threshold for switching between low and high range computations
 
 # ---------------------------------------------------------------------------
 # Core computation
@@ -44,7 +44,7 @@ def _lr_error(lam, eps, dellog, Emax, alpha, gamma1, gamma2, delfactlog, epsilon
     B0 = delfactlog(lam)
     B1 = math.log(lam) * (17*eps + dellog + eps*epsiloninv/2) + 2*Emax*eps + 3 *eps
     B2 = 16*eps + dellog + eps*epsiloninv/2
-    B3 = (3*math.log(alpha) + Emax)*eps + Emax*dellog + (3 * math.sqrt(3) / (16 * math.sqrt(gamma1 * gamma2)) + 27 / (1536 * gamma1 * gamma2)) * (16 *eps + dellog + eps*epsiloninv/2)
+    B3 = (3*math.log(alpha) + Emax)*eps + Emax*dellog  #+ (3 * math.sqrt(3) / (16 * math.sqrt(gamma1 * gamma2)) + 27 / (1536 * gamma1 * gamma2)) * (16 *eps + dellog + eps*epsiloninv/2)
     return 2 / alpha * (B0 + B1 * lam + B2 * math.log(alpha) + 0.5 * B2 * math.log(2*math.pi*math.e*lam) + B3)
 
 def delta_E(lam, eps, dellog, Emax, alpha, gamma1, gamma2, delfactlog, epsiloninv):
@@ -53,7 +53,7 @@ def delta_E(lam, eps, dellog, Emax, alpha, gamma1, gamma2, delfactlog, epsilonin
     B2 = 16*eps + dellog + eps*epsiloninv/2
     B3 = (3*math.log(alpha) + Emax)*eps + Emax*dellog + (3 * math.sqrt(3) / (16 * math.sqrt(gamma1 * gamma2)) + 27 / (1536 * gamma1 * gamma2)) * (16 *eps + dellog + eps*epsiloninv/2)
     B4 = 3 * math.sqrt(3) / (16 * math.sqrt(gamma1 * gamma2)) + 27 / (1536 * gamma1 * gamma2)
-    DeltaE = _lr_error(lam, eps, dellog, Emax, alpha, gamma1, gamma2, delfactlog, epsiloninv) + 2 * B4 / alpha
+    DeltaE = _lr_error(lam, eps, dellog, Emax, alpha, gamma1, gamma2, delfactlog, epsiloninv) # + 2 * B4 / alpha
     return DeltaE, B4
 
 
@@ -95,7 +95,7 @@ def computeDeltaHighRange(lam, beta, verbose=False):
     Deltahapperror = B4
     chernoff_term  = 2 * math.exp(-(slack**2) / (Kmax + lam))
 
-    Delta = 2 * (DeltaH + DeltaE) * alpha + chernoff_term
+    Delta = 2 * (DeltaH + DeltaE) * alpha #+ chernoff_term
 
     slam = math.sqrt(lam)
     b = 0.931 + 2.53 * slam

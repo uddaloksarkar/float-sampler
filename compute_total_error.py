@@ -60,6 +60,21 @@ Expressions
 """
 
 
+LOW_RANGE_TEMPLATE = """Variables
+  real u in [0, 1];
+
+Definitions
+  lambda = {lam},
+  prod = 1,
+  L = {rnd}(exp(-lambda)),
+  prod_next = {rnd}(prod * u);
+
+Expressions
+  L_compute = L;
+  prod_compute = prod_next;
+"""
+
+
 def read_lambdas(path):
     lambdas = []
     for lineno, line in enumerate(path.read_text().splitlines(), start=1):
@@ -130,6 +145,23 @@ def extract_abs_error(output, label):
     return float(match.group(1))
 
 
+def extract_abs_errors_by_problem(output):
+    errors = {}
+    current = None
+    for line in output.splitlines():
+        problem_match = re.match(r"Problem:\s*(\S+)", line)
+        if problem_match:
+            current = problem_match.group(1)
+            continue
+        if current is None:
+            continue
+        error_match = re.match(r"Absolute error [^:]*:\s*([-+\deE.]+)", line)
+        if error_match:
+            errors[current] = float(error_match.group(1))
+            current = None
+    return errors
+
+
 def extract_h_min_lower(output):
     match = MIN_LOWER_RE.search(output)
     if not match:
@@ -139,6 +171,16 @@ def extract_h_min_lower(output):
 
 def write_fptaylor_input(template, lam, fp, path):
     path.write_text(template.format(lam=lam, rnd=FP_TO_FPTAYLOR_RND[fp]))
+
+
+def compute_low_range_delta(lam, l_compute_error, prod_compute_error):
+    l_value = math.exp(-lam)
+    err = 2 * prod_compute_error * (lam + math.sqrt(lam)) + l_compute_error
+    if err >= l_value:
+        delta = math.inf
+    else:
+        delta = math.log((l_value + err) / (l_value - err))
+    return l_value, err, delta
 
 
 def write_gelpia_h_query(lam, args, path):
@@ -167,17 +209,53 @@ def compute_tv(lam, fp):
     return computeDeltaHighRange(lam, beta)[0]
 
 
+def empty_row(lam, fp):
+    return {
+        "lambda": lam,
+        "fp": fp,
+        "regime": "",
+        "delta_e": "",
+        "delta_k": "",
+        "h_min_lower": "",
+        "delta_h": "",
+        "total_error": "",
+        "low_l_value": "",
+        "low_l_compute_error": "",
+        "low_prod_compute_error": "",
+        "low_err": "",
+        "low_delta": "",
+        "compute_delta_low_range": "",
+        "tv": "",
+        "low_range_input": "",
+        "delta_e_input": "",
+        "delta_k_input": "",
+        "h_query": "",
+        "low_range_output": "",
+        "delta_e_output": "",
+        "delta_k_output": "",
+        "h_output": "",
+    }
+
+
 def write_plot(rows, plot_path):
-    points = [
-        (
-            float(row["lambda"]),
-            float(row["delta_e"]),
-            float(row["delta_h"]),
-            float(row["total_error"]),
-            float(row["tv"]),
-        )
-        for row in rows
-    ]
+    points = []
+    for row in rows:
+        if row["regime"] == "low":
+            points.append((
+                float(row["lambda"]),
+                None,
+                None,
+                float(row["low_delta"]),
+                float(row["compute_delta_low_range"]),
+            ))
+        else:
+            points.append((
+                float(row["lambda"]),
+                float(row["delta_e"]),
+                float(row["delta_h"]),
+                float(row["total_error"]),
+                float(row["tv"]),
+            ))
     if not points:
         raise ValueError("no rows available to plot")
 
@@ -199,13 +277,20 @@ def write_plot(rows, plot_path):
         series = [
             ("DeltaE", [row[1] for row in points], "o"),
             ("DeltaH", [row[2] for row in points], "s"),
-            ("DeltaE + DeltaH", [row[3] for row in points], "^"),
-            ("TV from computeDelta.py", [row[4] for row in points], "x"),
+            ("Total/new low delta", [row[3] for row in points], "^"),
+            ("computeDelta.py", [row[4] for row in points], "x"),
         ]
 
         plt.figure(figsize=(7, 4.5))
         for label, ys, marker in series:
-            plt.loglog(xs, ys, marker=marker, label=label)
+            series_points = [
+                (x, y) for x, y in zip(xs, ys)
+                if y is not None and math.isfinite(y) and y > 0
+            ]
+            if not series_points:
+                continue
+            series_xs, series_ys = zip(*series_points)
+            plt.loglog(series_xs, series_ys, marker=marker, label=label)
         plt.xlabel("lambda")
         plt.ylabel("error")
         plt.grid(True, which="both", alpha=0.3)
@@ -263,8 +348,9 @@ def main():
     fptaylor = find_fptaylor(args.fptaylor)
     if not fptaylor:
         parser.error("FPTaylor executable not found; pass --fptaylor or set $FPTAYLOR")
-    gelpia = find_gelpia(args.gelpia)
-    if not gelpia:
+    needs_gelpia = any(float(lam) >= SWITCH for lam in lambdas)
+    gelpia = find_gelpia(args.gelpia) if needs_gelpia else None
+    if needs_gelpia and not gelpia:
         parser.error("Gelpia executable not found; pass --gelpia or set $GELPIA/$GELPIA_PATH")
 
     out_dir = (args.out_dir or default_out_dir(args.lambda_file)).resolve()
@@ -280,6 +366,51 @@ def main():
     for lam in lambdas:
         lam_float = float(lam)
         tag = safe_lambda_name(lam)
+
+        if lam_float < SWITCH:
+            low_range_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
+            write_fptaylor_input(LOW_RANGE_TEMPLATE, lam, args.fp, low_range_input)
+
+            low_code, low_output = run_command([fptaylor, str(low_range_input)], cwd=ROOT, env=env)
+            low_output_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
+            low_output_path.write_text(low_output)
+            if low_code != 0:
+                raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {low_output_path}")
+
+            low_errors = extract_abs_errors_by_problem(low_output)
+            missing = {"L_compute", "prod_compute"} - low_errors.keys()
+            if missing:
+                names = ", ".join(sorted(missing))
+                raise RuntimeError(f"could not parse low-range FPTaylor errors for {names}")
+
+            l_error = low_errors["L_compute"]
+            prod_error = low_errors["prod_compute"]
+            l_value, low_err, low_delta = compute_low_range_delta(
+                lam_float, l_error, prod_error
+            )
+            compute_delta_low = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
+
+            row = empty_row(lam, args.fp)
+            row.update({
+                "regime": "low",
+                "total_error": f"{low_delta:.17e}",
+                "low_l_value": f"{l_value:.17e}",
+                "low_l_compute_error": f"{l_error:.17e}",
+                "low_prod_compute_error": f"{prod_error:.17e}",
+                "low_err": f"{low_err:.17e}",
+                "low_delta": f"{low_delta:.17e}",
+                "compute_delta_low_range": f"{compute_delta_low:.17e}",
+                "tv": f"{compute_delta_low:.17e}",
+                "low_range_input": str(low_range_input),
+                "low_range_output": str(low_output_path),
+            })
+            rows.append(row)
+
+            print(
+                f"lambda={lam} LowErr={row['low_err']} LowDelta={row['low_delta']} "
+                f"ComputeDeltaLowRange={row['compute_delta_low_range']}"
+            )
+            continue
 
         delta_e_input = inputs_dir / f"delta_e_{args.fp}_lam_{tag}.txt"
         delta_k_input = inputs_dir / f"delta_k_{args.fp}_lam_{tag}.txt"
@@ -314,9 +445,9 @@ def main():
         delta_h = delta_k * alpha * (lam_float + math.sqrt(lam_float)) / h_min_lower
         total_error = delta_e + delta_h
         tv = compute_tv(lam_float, args.fp)
-        row = {
-            "lambda": lam,
-            "fp": args.fp,
+        row = empty_row(lam, args.fp)
+        row.update({
+            "regime": "high",
             "delta_e": f"{delta_e:.17e}",
             "delta_k": f"{delta_k:.17e}",
             "h_min_lower": f"{h_min_lower:.17e}",
@@ -329,7 +460,7 @@ def main():
             "delta_e_output": str(delta_e_output_path),
             "delta_k_output": str(delta_k_output_path),
             "h_output": str(h_output_path),
-        }
+        })
         rows.append(row)
 
         print(
@@ -339,7 +470,7 @@ def main():
 
     summary_path = out_dir / "summary.csv"
     with summary_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer = csv.DictWriter(f, fieldnames=empty_row("", args.fp).keys())
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote summary: {summary_path}")
