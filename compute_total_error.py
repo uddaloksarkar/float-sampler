@@ -237,7 +237,7 @@ def empty_row(lam, fp):
     }
 
 
-def write_plot(rows, plot_path):
+def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
     points = []
     for row in rows:
         if row["regime"] == "low":
@@ -274,9 +274,13 @@ def write_plot(rows, plot_path):
 
         points.sort(key=lambda row: row[0])
         xs = [row[0] for row in points]
-        series = [
-            ("DeltaE", [row[1] for row in points], "o"),
-            ("DeltaH", [row[2] for row in points], "s"),
+        series = []
+        if plot_components:
+            series += [
+                ("DeltaE", [row[1] for row in points], "o"),
+                ("DeltaH", [row[2] for row in points], "s"),
+            ]
+        series += [
             ("Total/new low delta", [row[3] for row in points], "^"),
             ("computeDelta.py", [row[4] for row in points], "x"),
         ]
@@ -293,10 +297,14 @@ def write_plot(rows, plot_path):
             plt.loglog(series_xs, series_ys, marker=marker, label=label)
         plt.xlabel("lambda")
         plt.ylabel("error")
+        plt.ylim(top=0.9)
         plt.grid(True, which="both", alpha=0.3)
         plt.legend()
         plt.tight_layout()
         plt.savefig(plot_path)
+        if plot_pgf:
+            pgf_path = plot_path.with_suffix(".pgf")
+            plt.savefig(pgf_path, backend="pgf")
         plt.close()
 
 
@@ -326,7 +334,11 @@ def main():
     parser.add_argument("--u-lo", type=float, default=0.45)
     parser.add_argument("--u-hi", type=float, default=0.49)
     parser.add_argument("--plot", action="store_true",
-                        help="Plot DeltaE, DeltaH, total error, and TV")
+                        help="Plot total error and TV")
+    parser.add_argument("--plot-components", action="store_true",
+                        help="Include DeltaE and DeltaH series in the plot (requires --plot)")
+    parser.add_argument("--plot-pgf", action="store_true",
+                        help="Also save the plot in PGF format alongside the PNG")
     parser.add_argument("--plot-file", type=Path, default=None,
                         help="Plot output path (default: <out-dir>/total_error_vs_lambda.png)")
     parser.add_argument("--gelpia-input-epsilon", type=float, default=1e-8)
@@ -478,7 +490,7 @@ def main():
     if args.plot:
         plot_path = (args.plot_file or (out_dir / "total_error_vs_lambda.png")).resolve()
         plot_path.parent.mkdir(parents=True, exist_ok=True)
-        write_plot(rows, plot_path)
+        write_plot(rows, plot_path, plot_components=args.plot_components, plot_pgf=args.plot_pgf)
         print(f"Wrote plot: {plot_path}")
 
 
