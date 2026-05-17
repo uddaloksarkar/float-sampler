@@ -18,6 +18,7 @@ computeDelta/
 ├── lambdas_10_100_step10.txt
 ├── lambdas_100_1000_step100.txt
 ├── lambdas_100_100000_10_per_decade.txt
+├── distributions/             # reference C samplers (Knuth, PTRS, BTPE, inversion)
 ├── FPTaylor/                  # git submodule
 └── gelpia/                    # git submodule
 ```
