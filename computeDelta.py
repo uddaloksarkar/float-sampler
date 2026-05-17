@@ -21,7 +21,7 @@ FP_BETA = {
 }
 
 COLORS = ['blue', 'green', 'red', 'orange']
-SWITCH = 40 # lambda threshold for switching between low and high range computations
+SWITCH = 30 # lambda threshold for switching between low and high range computations
 
 # ---------------------------------------------------------------------------
 # Core computation

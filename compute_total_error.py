@@ -60,19 +60,25 @@ Expressions
 """
 
 
-LOW_RANGE_TEMPLATE = """Variables
-  real u in [0, 1];
+def make_low_range_template(lam_str, fp):
+    lam = float(lam_str)
+    k_star = int(lam + 10 * math.sqrt(lam))
+    rnd = FP_TO_FPTAYLOR_RND[fp]
 
-Definitions
-  lambda = {lam},
-  prod = 1,
-  L = {rnd}(exp(-lambda)),
-  prod_next = {rnd}(prod * u);
-
-Expressions
-  L_compute = L;
-  prod_compute = prod_next;
-"""
+    var_lines = [f"  real u_{i} in [0, 1]" for i in range(1, k_star + 1)]
+    def_lines = (
+        [f"  lambda = {lam_str}", f"  L = {rnd}(exp(-lambda))", f"  p_1 = {rnd}(u_1)"]
+        + [f"  p_{i} = {rnd}(p_{i-1} * u_{i})" for i in range(2, k_star + 1)]
+    )
+    return (
+        "Variables\n"
+        + ",\n".join(var_lines) + ";\n\n"
+        + "Definitions\n"
+        + ",\n".join(def_lines) + ";\n\n"
+        + "Expressions\n"
+        + f"  L_compute = L;\n"
+        + f"  prod_compute = p_{k_star};\n"
+    )
 
 
 def read_lambdas(path):
@@ -175,12 +181,12 @@ def write_fptaylor_input(template, lam, fp, path):
 
 def compute_low_range_delta(lam, l_compute_error, prod_compute_error):
     l_value = math.exp(-lam)
-    err = 2 * prod_compute_error * (lam + math.sqrt(lam)) + l_compute_error
-    if err >= l_value:
+    E = prod_compute_error + l_compute_error
+    if E >= l_value:
         delta = math.inf
     else:
-        delta = math.log((l_value + err) / (l_value - err))
-    return l_value, err, delta
+        delta = 2 * E / (l_value - E)
+    return l_value, E, delta
 
 
 def write_gelpia_h_query(lam, args, path):
@@ -346,6 +352,8 @@ def main():
     parser.add_argument("--gelpia-output-epsilon-relative", type=float, default=1e-8)
     parser.add_argument("--gelpia-timeout", type=int, default=60)
     parser.add_argument("--gelpia-max-iters", type=int, default=50000)
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print FPTaylor and Gelpia output to stdout")
     args = parser.parse_args()
 
     if args.lam is not None and args.lam <= 0:
@@ -381,11 +389,13 @@ def main():
 
         if lam_float < SWITCH:
             low_range_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
-            write_fptaylor_input(LOW_RANGE_TEMPLATE, lam, args.fp, low_range_input)
+            low_range_input.write_text(make_low_range_template(lam, args.fp))
 
             low_code, low_output = run_command([fptaylor, str(low_range_input)], cwd=ROOT, env=env)
             low_output_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
             low_output_path.write_text(low_output)
+            if args.verbose:
+                print(f"--- FPTaylor low range (lambda={lam}) ---\n{low_output}")
             if low_code != 0:
                 raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {low_output_path}")
 
@@ -419,7 +429,7 @@ def main():
             rows.append(row)
 
             print(
-                f"lambda={lam} LowErr={row['low_err']} LowDelta={row['low_delta']} "
+                f"lambda={lam} Delta={row['low_delta']} "
                 f"ComputeDeltaLowRange={row['compute_delta_low_range']}"
             )
             continue
@@ -434,6 +444,8 @@ def main():
         delta_e_code, delta_e_output = run_command([fptaylor, str(delta_e_input)], cwd=ROOT, env=env)
         delta_e_output_path = outputs_dir / f"delta_e_{args.fp}_lam_{tag}.out"
         delta_e_output_path.write_text(delta_e_output)
+        if args.verbose:
+            print(f"--- FPTaylor DeltaE (lambda={lam}) ---\n{delta_e_output}")
         if delta_e_code != 0:
             raise RuntimeError(f"FPTaylor DeltaE failed for lambda={lam}; see {delta_e_output_path}")
         delta_e = extract_abs_error(delta_e_output, "DeltaE")
@@ -441,6 +453,8 @@ def main():
         delta_k_code, delta_k_output = run_command([fptaylor, str(delta_k_input)], cwd=ROOT, env=env)
         delta_k_output_path = outputs_dir / f"delta_k_{args.fp}_lam_{tag}.out"
         delta_k_output_path.write_text(delta_k_output)
+        if args.verbose:
+            print(f"--- FPTaylor DeltaK (lambda={lam}) ---\n{delta_k_output}")
         if delta_k_code != 0:
             raise RuntimeError(f"FPTaylor DeltaK failed for lambda={lam}; see {delta_k_output_path}")
         delta_k = extract_abs_error(delta_k_output, "DeltaK")
@@ -448,6 +462,8 @@ def main():
         h_code, h_output = run_command([gelpia, "--mode=min", str(h_query)], cwd=ROOT)
         h_output_path = outputs_dir / f"h_min_lam_{tag}.out"
         h_output_path.write_text(h_output)
+        if args.verbose:
+            print(f"--- Gelpia h_min (lambda={lam}) ---\n{h_output}")
         if h_code != 0:
             raise RuntimeError(f"Gelpia h_min failed for lambda={lam}; see {h_output_path}")
         h_min_lower = extract_h_min_lower(h_output)
