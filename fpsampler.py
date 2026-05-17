@@ -221,25 +221,9 @@ def empty_row(lam, fp):
         "fp": fp,
         "regime": "",
         "delta_e": "",
-        "delta_k": "",
-        "h_min_lower": "",
         "delta_h": "",
         "total_error": "",
-        "low_l_value": "",
-        "low_l_compute_error": "",
-        "low_prod_compute_error": "",
-        "low_err": "",
-        "low_delta": "",
-        "compute_delta_low_range": "",
         "tv": "",
-        "low_range_input": "",
-        "delta_e_input": "",
-        "delta_k_input": "",
-        "h_query": "",
-        "low_range_output": "",
-        "delta_e_output": "",
-        "delta_k_output": "",
-        "h_output": "",
     }
 
 
@@ -251,8 +235,8 @@ def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
                 float(row["lambda"]),
                 None,
                 None,
-                float(row["low_delta"]),
-                float(row["compute_delta_low_range"]),
+                float(row["total_error"]),
+                float(row["tv"]),
             ))
         else:
             points.append((
@@ -407,31 +391,18 @@ def main():
 
             l_error = low_errors["L_compute"]
             prod_error = low_errors["prod_compute"]
-            l_value, low_err, low_delta = compute_low_range_delta(
-                lam_float, l_error, prod_error
-            )
+            _, _, low_delta = compute_low_range_delta(lam_float, l_error, prod_error)
             compute_delta_low = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
 
             row = empty_row(lam, args.fp)
             row.update({
                 "regime": "low",
                 "total_error": f"{low_delta:.17e}",
-                "low_l_value": f"{l_value:.17e}",
-                "low_l_compute_error": f"{l_error:.17e}",
-                "low_prod_compute_error": f"{prod_error:.17e}",
-                "low_err": f"{low_err:.17e}",
-                "low_delta": f"{low_delta:.17e}",
-                "compute_delta_low_range": f"{compute_delta_low:.17e}",
                 "tv": f"{compute_delta_low:.17e}",
-                "low_range_input": str(low_range_input),
-                "low_range_output": str(low_output_path),
             })
             rows.append(row)
 
-            print(
-                f"lambda={lam} Delta={row['low_delta']} "
-                f"ComputeDeltaLowRange={row['compute_delta_low_range']}"
-            )
+            print(f"lambda={lam} Total={row['total_error']} TV={row['tv']}")
             continue
 
         delta_e_input = inputs_dir / f"delta_e_{args.fp}_lam_{tag}.txt"
@@ -477,17 +448,9 @@ def main():
         row.update({
             "regime": "high",
             "delta_e": f"{delta_e:.17e}",
-            "delta_k": f"{delta_k:.17e}",
-            "h_min_lower": f"{h_min_lower:.17e}",
             "delta_h": f"{delta_h:.17e}",
             "total_error": f"{total_error:.17e}",
             "tv": f"{tv:.17e}",
-            "delta_e_input": str(delta_e_input),
-            "delta_k_input": str(delta_k_input),
-            "h_query": str(h_query),
-            "delta_e_output": str(delta_e_output_path),
-            "delta_k_output": str(delta_k_output_path),
-            "h_output": str(h_output_path),
         })
         rows.append(row)
 

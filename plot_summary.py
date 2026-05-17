@@ -37,8 +37,8 @@ def build_points(rows):
                 "lambda": lam,
                 "delta_e": None,
                 "delta_h": None,
-                "total": float(row["low_delta"]),
-                "tv": float(row["compute_delta_low_range"]),
+                "total": float(row["total_error"]),
+                "tv": float(row["tv"]),
             })
         else:
             points.append({
