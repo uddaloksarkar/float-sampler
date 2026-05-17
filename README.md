@@ -106,7 +106,7 @@ python fpsampler.py --lam 5
 python fpsampler.py lambdas_1_100_step1.txt
 
 # With plotting
-python fpsampler.py lambdas_1_100_step1.txt --plot --plot-components
+python fpsampler.py lambdas_1_100_step1.txt --plot 
 ```
 
 ### Important flags
