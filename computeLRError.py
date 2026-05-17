@@ -1,6 +1,6 @@
 import argparse
 
-from computeDelta import FP_BETA, atomic_errors, _lr_error
+from analyticError import FP_BETA, atomic_errors, _lr_error
 
 SWITCH = 30
 
