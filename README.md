@@ -93,7 +93,7 @@ python analyticError.py --plot
 
 ## FPSampler 
 
-Runs FPTaylor (and Gelpia for λ ≥ 40) to get rigorous numerical bounds, writes
+Runs FPTaylor (and Gelpia for λ ≥ 30) to get rigorous numerical bounds, writes
 results to a CSV, and optionally plots them.
 
 ### Basic usage
@@ -103,10 +103,10 @@ results to a CSV, and optionally plots them.
 python fpsampler.py --lam 5
 
 # Batch from a file
-python fpsampler.py lambdas_1_100_step1.txt
+python fpsampler.py lambdas_10_100_step10.txt
 
 # With plotting
-python fpsampler.py lambdas_1_100_step1.txt --plot 
+python fpsampler.py lambdas_10_100_step10.txt --plot 
 ```
 
 ### Important flags
