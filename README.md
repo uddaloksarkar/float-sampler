@@ -103,6 +103,9 @@ results to a CSV, and optionally plots them.
 python fpsampler.py --lam 5
 
 # Batch from a file
+python fpsampler.py lambdas_100_1000_step100.txt
+
+# contains Knuth Sampler calls for (λ = 10, 20)
 python fpsampler.py lambdas_10_100_step10.txt
 
 # With plotting
