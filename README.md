@@ -11,16 +11,15 @@ Knuth–Poisson sampler and TRS sampler, using rigorous floating-point error ana
 
 ```
 computeDelta/
-├── analyticError.py            # Analytical bound library + CLI
-├── fpsampler.py     # Verified bound runner (calls FPTaylor / Gelpia)
-├── creator.sh                 # Cluster / MPI worker script
-├── lambdas_1_100_step1.txt    # λ = 1, 2, …, 100
-├── lambdas_10_100_step10.txt
-├── lambdas_100_1000_step100.txt
+├── analyticError.py                        # Analytical bound library + CLI
+├── fpsampler.py                            # Verified bound runner (calls FPTaylor / Gelpia)
+├── lambdas_1_100_step1.txt                 # λ = 1, 2, …, 100
+├── lambdas_10_100_step10.txt               # λ = 10, 20, …, 100
+├── lambdas_100_1000_step100.txt            # λ = 100, 200, …, 1000
 ├── lambdas_100_100000_10_per_decade.txt
-├── distributions/             # reference C samplers (Knuth, PTRS, BTPE, inversion)
-├── FPTaylor/                  # git submodule
-└── gelpia/                    # git submodule
+├── distributions/                          # reference C samplers (Knuth, PTRS, BTPE, inversion)
+├── FPTaylor/                               # git submodule
+└── gelpia/                                 # git submodule
 ```
 
 ---
@@ -66,7 +65,7 @@ pip install matplotlib
 
 | Regime | Condition | Method |
 |---|---|---|
-| **Low range** | λ < 30 | FPTaylor bounds the product error of K\* = ⌊λ + 10√λ⌋ multiplications and the exp error; combined as Δ ≤ 2E / (e^{−λ} − E) |
+| **Low range** | λ < 30 | FPTaylor bounds the product error of K\* = ⌊λ + 10√λ⌋ multiplications and the exp error; combined as Δ ≤ 2E / (e^{−λ} − E) — **computationally expensive; expect long runtimes** |
 | **High range** | λ ≥ 30 | FPTaylor computes ΔE and ΔK; Gelpia minimises h; combined as Δ = ΔE + ΔH |
 
 ---
@@ -105,7 +104,7 @@ python fpsampler.py --lam 5
 # Batch from a file
 python fpsampler.py lambdas_100_1000_step100.txt
 
-# contains Knuth Sampler calls for (λ = 10, 20)
+# contains Knuth Sampler calls for λ = 10, 20 (expect long run times)
 python fpsampler.py lambdas_10_100_step10.txt
 
 # With plotting
