@@ -81,6 +81,29 @@ def make_low_range_template(lam_str, fp):
     )
 
 
+def make_log_low_range_template(lam_str, fp):
+    lam = float(lam_str)
+    k_star = int(lam + 10 * math.sqrt(lam))
+    rnd = FP_TO_FPTAYLOR_RND[fp]
+
+    var_lines = [f"  real u_{i} in [1e-300, 1]" for i in range(1, k_star + 1)]
+    def_lines = (
+        [f"  lambda = {lam_str}",
+         f"  lambda_fp {rnd}= {lam_str}",
+         f"  logp_1 = {rnd}(log(u_1))"]
+        + [f"  logp_{i} = {rnd}(logp_{i-1} + {rnd}(log(u_{i})))" for i in range(2, k_star + 1)]
+    )
+    return (
+        "Variables\n"
+        + ",\n".join(var_lines) + ";\n\n"
+        + "Definitions\n"
+        + ",\n".join(def_lines) + ";\n\n"
+        + "Expressions\n"
+        + f"  log_prod_compute = logp_{k_star};\n"
+        + f"  lambda_fp_compute = lambda_fp;\n"
+    )
+
+
 def read_lambdas(path):
     lambdas = []
     for lineno, line in enumerate(path.read_text().splitlines(), start=1):
@@ -187,6 +210,10 @@ def compute_low_range_delta(lam, l_compute_error, prod_compute_error):
     else:
         delta = 2 * E / (l_value - E)
     return l_value, E, delta
+
+def compute_log_low_range_delta(lambda_fp_error, log_prod_error):
+    E = lambda_fp_error + log_prod_error
+    return E, 2 * E
 
 
 def write_gelpia_h_query(lam, args, path):
@@ -338,6 +365,9 @@ def main():
     parser.add_argument("--gelpia-max-iters", type=int, default=50000)
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print FPTaylor and Gelpia output to stdout")
+    parser.add_argument("--use-log", action="store_true",
+                        help="Use log-space FPTaylor template for low-range lambdas "
+                             "(default: use product-space template)")
     args = parser.parse_args()
 
     if args.lam is not None and args.lam <= 0:
@@ -373,7 +403,10 @@ def main():
 
         if lam_float < SWITCH:
             low_range_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
-            low_range_input.write_text(make_low_range_template(lam, args.fp))
+            if args.use_log:
+                low_range_input.write_text(make_log_low_range_template(lam, args.fp))
+            else:
+                low_range_input.write_text(make_low_range_template(lam, args.fp))
 
             low_code, low_output = run_command([fptaylor, str(low_range_input)], cwd=ROOT, env=env)
             low_output_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
@@ -384,14 +417,20 @@ def main():
                 raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {low_output_path}")
 
             low_errors = extract_abs_errors_by_problem(low_output)
-            missing = {"L_compute", "prod_compute"} - low_errors.keys()
-            if missing:
-                names = ", ".join(sorted(missing))
-                raise RuntimeError(f"could not parse low-range FPTaylor errors for {names}")
-
-            l_error = low_errors["L_compute"]
-            prod_error = low_errors["prod_compute"]
-            _, _, low_delta = compute_low_range_delta(lam_float, l_error, prod_error)
+            if args.use_log:
+                missing = {"log_prod_compute", "lambda_fp_compute"} - low_errors.keys()
+                if missing:
+                    raise RuntimeError(f"could not parse low-range FPTaylor errors for {', '.join(sorted(missing))}")
+                _, low_delta = compute_log_low_range_delta(
+                    low_errors["lambda_fp_compute"], low_errors["log_prod_compute"]
+                )
+            else:
+                missing = {"L_compute", "prod_compute"} - low_errors.keys()
+                if missing:
+                    raise RuntimeError(f"could not parse low-range FPTaylor errors for {', '.join(sorted(missing))}")
+                _, _, low_delta = compute_low_range_delta(
+                    lam_float, low_errors["L_compute"], low_errors["prod_compute"]
+                )
             compute_delta_low = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
 
             row = empty_row(lam, args.fp)
