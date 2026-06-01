@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import csv
+import math
 import os
 import re
 import shutil
@@ -132,6 +134,55 @@ def default_out_dir(input_file):
     return ROOT / f"binom_runs_{input_file.stem}"
 
 
+def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
+    points = [(float(r["n"]) * float(r["p"]),
+               float(r["delta_1"]),
+               float(r["eps_exp"]),
+               float(r["tv"])) for r in rows]
+    if not points:
+        raise ValueError("no rows to plot")
+
+    mpl_cache = plot_path.parent / ".matplotlib"
+    xdg_cache = plot_path.parent / ".cache"
+    mpl_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        points.sort(key=lambda r: r[0])
+        xs = [r[0] for r in points]
+        series = []
+        if plot_components:
+            series += [
+                ("delta_1", [r[1] for r in points], "o"),
+                ("eps_exp", [r[2] for r in points], "s"),
+            ]
+        series.append(("TV", [r[3] for r in points], "^"))
+
+        plt.figure(figsize=(7, 4.5))
+        for lbl, ys, marker in series:
+            pts = [(x, y) for x, y in zip(xs, ys)
+                   if math.isfinite(y) and y > 0]
+            if not pts:
+                continue
+            sx, sy = zip(*pts)
+            plt.loglog(sx, sy, marker=marker, label=lbl)
+        plt.xlabel("np  (mean)")
+        plt.ylabel("error")
+        plt.grid(True, which="both", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        if plot_pgf:
+            plt.savefig(plot_path.with_suffix(".pgf"), backend="pgf")
+        plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -159,6 +210,14 @@ def main():
                         help="Floating-point format (default: fp64)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print FPTaylor output to stdout")
+    parser.add_argument("--plot", action="store_true",
+                        help="Plot TV (and optionally components) vs np")
+    parser.add_argument("--plot-components", action="store_true",
+                        help="Include delta_1 and eps_exp series in the plot")
+    parser.add_argument("--plot-pgf", action="store_true",
+                        help="Also save the plot in PGF format")
+    parser.add_argument("--plot-file", type=Path, default=None,
+                        help="Plot output path (default: <out-dir>/tv_vs_np.png)")
     args = parser.parse_args()
 
     if args.n is not None:
@@ -231,6 +290,14 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote summary: {summary_path}")
+
+    if args.plot:
+        plot_path = (args.plot_file or (out_dir / "tv_vs_np.png")).resolve()
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        write_plot(rows, plot_path,
+                   plot_components=args.plot_components,
+                   plot_pgf=args.plot_pgf)
+        print(f"Wrote plot: {plot_path}")
 
 
 if __name__ == "__main__":
