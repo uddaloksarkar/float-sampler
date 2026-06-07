@@ -26,16 +26,17 @@ int64_t random_poisson_mult(void *rstate, double lam) {
     double prod, U, enlam;
 
     enlam = exp(-lam);
-    X     = 0;
-    prod  = 1.0;
-
-    do {
-        U     = rk_double(rstate);
+    X = 0;
+    prod = 1.0;
+    while (1) {
+        U = rk_double(rstate);
         prod *= U;
-        X++;
-    } while (prod > enlam);
-
-    return X - 1;
+        if (prod > enlam) {
+            X += 1;
+        } else {
+            return X;
+        }
+    }
 }
 
 /* ---- Test harness ---- */
