@@ -23,7 +23,7 @@ MIN_LOWER_RE = __import__("re").compile(r"Minimum lower bound\s+([-+\deE.]+)")
 # ---------------------------------------------------------------------------
 
 DELTA_E_TEMPLATE = """Variables
-  real u in [0.45, 0.49],
+  real u in [-0.49, 0.49],
   real floor_err in [-1, 0];
 
 Definitions
@@ -43,7 +43,7 @@ Expressions
 """
 
 DELTA_K_TEMPLATE = """Variables
-  real u in [0.45, 0.49],
+  real u in [-0.49, 0.49],
   real floor_err in [-1, 0];
 
 Definitions
