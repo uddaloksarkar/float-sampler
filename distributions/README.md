@@ -12,8 +12,8 @@ ideal is analysed by the tools in the parent directory.
 | `random_poisson_mult.c` | Poisson | `random_poisson_mult` — Knuth multiplication method | λ < 10 |
 | `random_poisson_ptrs.c` | Poisson | `random_poisson_ptrs` — PTRS, Transformed Rejection with Squeeze (Hormann 1993) | λ ≥ 10 |
 | `btpe.c` | Binomial | BTPE — Binomial, Triangular, Parallelogram, Exponential (Kachitvichyanukul & Schmeiser 1988) | n·p ≥ 30 |
-| `binomial_inv.c` | Binomial | Inversion (sequential CDF search) | n·p < 30 |
 | `binomial_legacy_inversion.c` | Binomial | Legacy inversion (`legacy_random_binomial_inversion`, cached constants) | n·p ≤ 30 |
+| `btrs.c` | Binomial | `binomialvariate` — BTRS, Transformed Rejection with Squeeze (Hörmann), with BG geometric fallback (Devroye); ported from [CPython's `random.py`](https://github.com/python/cpython/blob/main/Lib/random.py#L789) | n·p < 10 → BG, else BTRS |
 | `multinomial_legacy.c` | Multinomial | `legacy_random_multinomial` — per-coordinate legacy binomial draws (inversion/BTPE chain) | — |
 | `zipf.c` | Zipf | `legacy_random_zipf` — rejection sampling | — |
 | `hypergeometric_hyp.c` | Hypergeometric | `random_hypergeometric_hyp` — direct urn sampling | sample ≤ 10 |

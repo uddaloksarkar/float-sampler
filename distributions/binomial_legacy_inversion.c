@@ -10,6 +10,14 @@
  * random_binomial_inversion in its qn formula (exp(n*log(q)) vs.
  * exp(n*log1p(-p))) and in caching the per-(n,p) constants in `binomial`
  * across calls.
+ *
+ * NOTE: the sampling loop below has been restructured to walk the CDF via an
+ * accumulating `sum` (sum += px; while (U > sum)), mirroring
+ * random_geometric_search's summation strategy in geometric_search.c, rather
+ * than the source's `U -= px; while (U > px)` decrement form. The two are
+ * mathematically equivalent (U > sum_0..k  <=>  U - sum_0..k-1 > px_k) but
+ * round differently in finite precision; this form is used so the same
+ * sum/prod error-decomposition template applies to both samplers.
  */
 
 #include <math.h>
@@ -36,7 +44,7 @@ typedef struct {
 int64_t legacy_random_binomial_inversion(void *rstate, int64_t n, double p,
                                          binomial_t *binomial)
 {
-  double q, qn, np, px, U;
+  double q, qn, np, px, U, sum;
   int64_t X, bound;
 
   if (!(binomial->has_binomial) || (binomial->nsave != n) ||
@@ -56,16 +64,18 @@ int64_t legacy_random_binomial_inversion(void *rstate, int64_t n, double p,
   }
   X = 0;
   px = qn;
+  sum = px;
   U = rk_double(rstate);
-  while (U > px) {
+  while (U > sum) {
     X++;
     if (X > bound) {
       X = 0;
       px = qn;
+      sum = px;
       U = rk_double(rstate);
     } else {
-      U -= px;
       px = ((n - X + 1) * p * px) / (X * q);
+      sum += px;
     }
   }
   return X;

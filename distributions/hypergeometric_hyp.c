@@ -25,22 +25,22 @@ int64_t random_hypergeometric_hyp(void *rstate,
                                   int64_t good,
                                   int64_t bad,
                                   int64_t sample) {
-  int64_t d1, k, z;
-  double d2, u, y;
+  int64_t d1, d2, k, y, z;
+  double u;
 
   d1 = bad + good - sample;
-  d2 = (double)MIN(bad, good);
+  d2 = MIN(bad, good);
 
   y = d2;
   k = sample;
-  while (y > 0.0) {
+  while (y > 0) {
     u = rk_double(rstate);
-    y -= (int64_t)floor(u + y / (d1 + k));
+    y -= (int64_t)floor(u + (double)y / (double)(d1 + k));
     k--;
     if (k == 0)
       break;
   }
-  z = (int64_t)(d2 - y);
+  z = d2 - y;
   if (good > bad)
     z = sample - z;
   return z;

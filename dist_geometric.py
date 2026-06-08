@@ -33,12 +33,13 @@ def make_template(p, fp):
       eps1 : rel. error of prod = z * q
       eps2 : rel. error of sum  = sum + prod
     """
+    z_lo = p * math.exp(-22)
     rnd = FP_TO_FPTAYLOR_RND[fp]
 
     return (
         "Variables\n"
-        f"  real z in [1.0e-10, 1.0],\n"
-        f"  real sum in [1.0e-10, 1.0];\n\n"
+        f"  real z in [{z_lo:.20e}, 1.0],\n"
+        f"  real sum in [{p:.20e}, 1.0];\n\n"
         + "Definitions\n"
         f"  p = {p:.20e},\n"
         f"  q         {rnd}= 1.0 - p,\n"

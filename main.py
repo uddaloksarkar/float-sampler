@@ -31,7 +31,7 @@ from pathlib import Path
 
 from dist_common import add_common_args, find_fptaylor, fptaylor_env
 
-import dist_binom
+import dist_binomial
 import dist_poisson
 import dist_geometric
 import dist_hypergeometric
@@ -39,7 +39,7 @@ import dist_zipf
 
 DISTRIBUTIONS = {
     dist_poisson.NAME:       dist_poisson,
-    dist_binom.NAME:         dist_binom,
+    dist_binomial.NAME:      dist_binomial,
     dist_geometric.NAME:     dist_geometric,
     dist_hypergeometric.NAME: dist_hypergeometric,
     dist_zipf.NAME:          dist_zipf,

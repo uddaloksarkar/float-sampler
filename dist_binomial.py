@@ -12,7 +12,7 @@ from dist_common import (
     save_loglog_plot,
 )
 
-NAME = "binomial_inversion"
+NAME = "binomial"
 CSV_FIELDS = ["n", "p", "eps0", "eps1", "eps2", "tv"]
 
 
@@ -35,13 +35,17 @@ def make_template(n, p, fp):
       eps2 : rel. error of sum + prod
     """
     q = 1.0 - p
-    qn = max(math.exp(n * math.log(q)), sys.float_info.min)
+    qn_raw = math.exp(n * math.log(q))
+    qn = max(qn_raw, sys.float_info.min)
+    z_lo = max(min(qn_raw, math.exp(-22) / math.sqrt(2 * math.pi * n * p * q)),
+               sys.float_info.min)
+    x_hi = min(float(n), n * p + 10.0 * math.sqrt(n * p * q))
     rnd = FP_TO_FPTAYLOR_RND[fp]
 
     return (
         "Variables\n"
-        f"  real z in [1.0e-6, 1.0],\n"
-        f"  real X in [1.0, {float(n):.1f}],\n"
+        f"  real z in [{z_lo:.20e}, 1.0],\n"
+        f"  real X in [1.0, {x_hi:.1f}],\n"
         f"  real sum in [{qn:.20e}, 1.0],\n"
         f"  real prod in [0.0, 1.0];\n\n"
         + "Definitions\n"
@@ -103,11 +107,11 @@ def add_args(parser):
 
 def default_out_dir(args):
     if getattr(args, "n", None) is not None:
-        return ROOT / "binomial_inversion_runs"
+        return ROOT / "binomial_runs"
     lf = getattr(args, "input_file", None)
     if lf is None:
-        return ROOT / "binomial_inversion_runs"
-    return ROOT / f"binomial_inversion_runs_{lf.stem}"
+        return ROOT / "binomial_runs"
+    return ROOT / f"binomial_runs_{lf.stem}"
 
 
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
