@@ -166,7 +166,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             raise RuntimeError(
                 f"N={N} K={K} n={n}: could not parse absolute error for 'delta'")
         delta = abs_errors["delta"]
-        tv    = sample * delta
+        tv    = 2 * sample * delta
 
         rows.append({
             "N": N, "K": K, "n": n,
