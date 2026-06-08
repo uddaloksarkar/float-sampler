@@ -102,6 +102,7 @@ def extract_abs_errors_by_problem(output):
     return errors
 
 
+
 def extract_deltas_by_problem(output, label):
     """
     delta = abs_error / lower_bound — a sound upper bound on relative error:
