@@ -145,35 +145,38 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}")
             continue
 
-        tag = safe_triple_name(N, K, n)
-        input_path = inputs_dir / f"hypergeometric_{args.fp}_{tag}.txt"
-        input_path.write_text(make_template(N, K, n, args.fp))
+        try:
+            tag = safe_triple_name(N, K, n)
+            input_path = inputs_dir / f"hypergeometric_{args.fp}_{tag}.txt"
+            input_path.write_text(make_template(N, K, n, args.fp))
 
-        code, output = run_command(
-            [fptaylor, str(input_path)],
-            cwd=ROOT, env=env,
-        )
-        out_path = outputs_dir / f"hypergeometric_{args.fp}_{tag}.out"
-        out_path.write_text(output)
-        if args.verbose:
-            print(f"--- FPTaylor hypergeometric (N={N} K={K} n={n}) ---\n{output}")
-        if code != 0:
-            raise RuntimeError(
-                f"FPTaylor failed for N={N} K={K} n={n}; see {out_path}")
+            code, output = run_command(
+                [fptaylor, str(input_path)],
+                cwd=ROOT, env=env,
+            )
+            out_path = outputs_dir / f"hypergeometric_{args.fp}_{tag}.out"
+            out_path.write_text(output)
+            if args.verbose:
+                print(f"--- FPTaylor hypergeometric (N={N} K={K} n={n}) ---\n{output}")
+            if code != 0:
+                raise RuntimeError(
+                    f"FPTaylor failed for N={N} K={K} n={n}; see {out_path}")
 
-        abs_errors = extract_abs_errors_by_problem(output)
-        if "delta" not in abs_errors:
-            raise RuntimeError(
-                f"N={N} K={K} n={n}: could not parse absolute error for 'delta'")
-        delta = abs_errors["delta"]
-        tv    = 2 * sample * delta
+            abs_errors = extract_abs_errors_by_problem(output)
+            if "delta" not in abs_errors:
+                raise RuntimeError(
+                    f"N={N} K={K} n={n}: could not parse absolute error for 'delta'")
+            delta = abs_errors["delta"]
+            tv    = 2 * sample * delta
 
-        rows.append({
-            "N": N, "K": K, "n": n,
-            "delta": f"{delta:.17e}",
-            "tv":    f"{tv:.17e}",
-        })
-        print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}")
+            rows.append({
+                "N": N, "K": K, "n": n,
+                "delta": f"{delta:.17e}",
+                "tv":    f"{tv:.17e}",
+            })
+            print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}")
+        except Exception as exc:
+            print(f"WARNING: skipping N={N} K={K} n={n}: {exc}")
 
     return rows
 

@@ -4,3 +4,6 @@
 [submodule "gelpia"]
 	path = gelpia
 	url = git@github.com:meelgroup/gelpia.git
+[submodule "cire"]
+	path = cire
+	url = https://github.com/caydenlund/CIRE

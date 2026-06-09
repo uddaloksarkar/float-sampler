@@ -20,6 +20,7 @@ FP_TO_FPTAYLOR_RND = {
 
 ABS_ERROR_RE = re.compile(r"Absolute error \(exact\)[^:]*:\s*([-+\deE.]+)")
 BOUNDS_LO_RE = re.compile(r"Bounds \(without rounding\):\s*\[([-+\deE.]+),")
+CIRE_ABS_ERROR_RE = re.compile(r"Absolute Error Bound:\s*([-+\deE.]+)")
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +37,32 @@ def find_fptaylor(explicit=None):
     if local.exists():
         return str(local)
     return shutil.which("fptaylor")
+
+
+def find_cire(explicit=None):
+    if explicit:
+        return explicit
+    env_val = os.environ.get("CIRE")
+    if env_val:
+        return env_val
+    local = ROOT / "cire" / "build" / "CIRE_LLVM"
+    if local.exists():
+        return str(local)
+    return shutil.which("CIRE_LLVM")
+
+
+def find_clang():
+    clang = shutil.which("clang")
+    if clang:
+        return clang
+    try:
+        result = subprocess.run(["xcrun", "-f", "clang"],
+                                capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    raise RuntimeError("clang not found; required by the CIRE backend")
 
 
 def find_gelpia(explicit=None):
@@ -72,6 +99,58 @@ def run_command(cmd, cwd=None, env=None):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     return proc.returncode, proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# CIRE runner and output parser
+# ---------------------------------------------------------------------------
+
+def run_cire_llvm(cire_bin, c_code, func_name, domains, tag, inputs_dir, outputs_dir,
+                  verbose=False, param_names=None):
+    """
+    Compile c_code to LLVM IR with clang -O1, then run CIRE_LLVM for func_name.
+
+    domains     : list of (lo, hi) in C parameter order
+    param_names : optional list of names matching domains order; defaults to arg_0, arg_1, …
+    Returns     : (returncode, output_str)
+    """
+    import json
+
+    names = param_names if param_names else [f"arg_{i}" for i in range(len(domains))]
+
+    c_path    = inputs_dir  / f"cire_{tag}.c"
+    ll_path   = inputs_dir  / f"cire_{tag}.ll"
+    out_path  = outputs_dir / f"cire_{tag}_{func_name}.out"
+    json_path = outputs_dir / f"cire_{tag}_{func_name}.json"
+
+    c_path.write_text(c_code)
+
+    clang = find_clang()
+    cc_ret, cc_out = run_command(
+        [clang, "-S", "-emit-llvm", "-O1", str(c_path), "-o", str(ll_path)]
+    )
+    if cc_ret != 0:
+        raise RuntimeError(f"clang failed for {tag}:\n{cc_out}")
+
+    domain_dict = {name: [lo, hi] for name, (lo, hi) in zip(names, domains)}
+    json_path.write_text(json.dumps(domain_dict, indent=2))
+
+    cmd = [cire_bin, str(ll_path), "--domain", str(json_path),
+           "--function", func_name]
+    ret, output = run_command(cmd)
+    out_path.write_text(output)
+
+    if verbose:
+        print(f"--- CIRE {tag}/{func_name} ---\n{output}")
+    return ret, output
+
+
+def extract_cire_abs_error(output, label=""):
+    m = CIRE_ABS_ERROR_RE.search(output)
+    if not m:
+        loc = f" ({label})" if label else ""
+        raise RuntimeError(f"could not parse CIRE absolute error bound{loc}")
+    return float(m.group(1))
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +263,12 @@ def save_loglog_plot(
 # ---------------------------------------------------------------------------
 
 def add_common_args(parser):
+    parser.add_argument("--backend", choices=("fptaylor", "cire"), default="fptaylor",
+                        help="FP analysis backend (default: fptaylor)")
     parser.add_argument("--fptaylor", default=None,
                         help="Path to FPTaylor executable")
+    parser.add_argument("--cire", default=None,
+                        help="Path to CIRE_LLVM executable")
     parser.add_argument("--fp", choices=("fp32", "fp64", "fp128"), default="fp64",
                         help="Floating-point format (default: fp64)")
     parser.add_argument("--out-dir", type=Path, default=None,
@@ -200,3 +283,5 @@ def add_common_args(parser):
                         help="Plot output path (default: <out-dir>/tv_vs_param.png)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print FPTaylor/Gelpia output to stdout")
+    parser.add_argument("--cache", action="store_true",
+                        help="If summary.csv already exists in out-dir, load it and skip re-running")

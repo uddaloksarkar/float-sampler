@@ -206,101 +206,103 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
     for lam in lambdas:
         lam_float = float(lam)
         tag = safe_lambda_name(lam)
+        try:
+            # ---- low range ----
+            if lam_float < SWITCH:
+                lr_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
+                if args.use_log:
+                    lr_input.write_text(_make_log_low_range_template(lam, args.fp))
+                else:
+                    lr_input.write_text(_make_low_range_template(lam, args.fp))
 
-        # ---- low range ----
-        if lam_float < SWITCH:
-            lr_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
-            if args.use_log:
-                lr_input.write_text(_make_log_low_range_template(lam, args.fp))
-            else:
-                lr_input.write_text(_make_low_range_template(lam, args.fp))
+                code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
+                out_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
+                out_path.write_text(output)
+                if args.verbose:
+                    print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
+                if code != 0:
+                    raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {out_path}")
 
-            code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
-            out_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
-            out_path.write_text(output)
+                errs = extract_abs_errors_by_problem(output)
+                if args.use_log:
+                    missing = {"log_prod_compute", "lambda_fp_compute"} - errs.keys()
+                    if missing:
+                        raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
+                    _, low_delta = _compute_log_low_range_delta(
+                        errs["lambda_fp_compute"], errs["log_prod_compute"]
+                    )
+                else:
+                    missing = {"L_compute", "prod_compute"} - errs.keys()
+                    if missing:
+                        raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
+                    _, _, low_delta = _compute_low_range_delta(
+                        lam_float, errs["L_compute"], errs["prod_compute"]
+                    )
+
+                tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
+                row = _empty_row(lam, args.fp)
+                row.update({"regime": "low", "total_error": f"{low_delta:.17e}", "tv": f"{tv:.17e}"})
+                rows.append(row)
+                print(f"lambda={lam} Total={row['total_error']} TV={row['tv']}")
+                continue
+
+            # ---- high range ----
+            de_input = inputs_dir / f"delta_e_{args.fp}_lam_{tag}.txt"
+            dk_input = inputs_dir / f"delta_k_{args.fp}_lam_{tag}.txt"
+            h_query  = inputs_dir / f"h_min_lam_{tag}.dop"
+            _write_fptaylor_input(DELTA_E_TEMPLATE, lam, args.fp, de_input)
+            _write_fptaylor_input(DELTA_K_TEMPLATE, lam, args.fp, dk_input)
+            _write_gelpia_h_query(lam, args, h_query)
+
+            de_code, de_output = run_command([fptaylor, str(de_input)], cwd=ROOT, env=env)
+            de_out = outputs_dir / f"delta_e_{args.fp}_lam_{tag}.out"
+            de_out.write_text(de_output)
             if args.verbose:
-                print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
-            if code != 0:
-                raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {out_path}")
+                print(f"--- FPTaylor DeltaE (lambda={lam}) ---\n{de_output}")
+            if de_code != 0:
+                raise RuntimeError(f"FPTaylor DeltaE failed for lambda={lam}; see {de_out}")
+            delta_e = extract_abs_error(de_output, "DeltaE")
 
-            errs = extract_abs_errors_by_problem(output)
-            if args.use_log:
-                missing = {"log_prod_compute", "lambda_fp_compute"} - errs.keys()
-                if missing:
-                    raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
-                _, low_delta = _compute_log_low_range_delta(
-                    errs["lambda_fp_compute"], errs["log_prod_compute"]
-                )
-            else:
-                missing = {"L_compute", "prod_compute"} - errs.keys()
-                if missing:
-                    raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
-                _, _, low_delta = _compute_low_range_delta(
-                    lam_float, errs["L_compute"], errs["prod_compute"]
-                )
+            dk_code, dk_output = run_command([fptaylor, str(dk_input)], cwd=ROOT, env=env)
+            dk_out = outputs_dir / f"delta_k_{args.fp}_lam_{tag}.out"
+            dk_out.write_text(dk_output)
+            if args.verbose:
+                print(f"--- FPTaylor DeltaK (lambda={lam}) ---\n{dk_output}")
+            if dk_code != 0:
+                raise RuntimeError(f"FPTaylor DeltaK failed for lambda={lam}; see {dk_out}")
+            delta_k = extract_abs_error(dk_output, "DeltaK")
 
-            tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
+            h_code, h_output = run_command([gelpia, "--mode=min", str(h_query)], cwd=ROOT)
+            h_out = outputs_dir / f"h_min_lam_{tag}.out"
+            h_out.write_text(h_output)
+            if args.verbose:
+                print(f"--- Gelpia h_min (lambda={lam}) ---\n{h_output}")
+            if h_code != 0:
+                raise RuntimeError(f"Gelpia h_min failed for lambda={lam}; see {h_out}")
+            m = MIN_LOWER_RE.search(h_output)
+            if not m:
+                raise RuntimeError(f"could not parse Gelpia h_min for lambda={lam}")
+            h_min_lower = float(m.group(1))
+
+            b = 0.931 + 2.53 * math.sqrt(lam_float)
+            alpha = 1.1239 + 1.1328 / (b - 3.4)
+            delta_h = delta_k * alpha * (lam_float + math.sqrt(lam_float)) / h_min_lower
+            total_error = delta_e + delta_h
+            tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
+
             row = _empty_row(lam, args.fp)
-            row.update({"regime": "low", "total_error": f"{low_delta:.17e}", "tv": f"{tv:.17e}"})
+            row.update({
+                "regime": "high",
+                "delta_e": f"{delta_e:.17e}",
+                "delta_h": f"{delta_h:.17e}",
+                "total_error": f"{total_error:.17e}",
+                "tv": f"{tv:.17e}",
+            })
             rows.append(row)
-            print(f"lambda={lam} Total={row['total_error']} TV={row['tv']}")
-            continue
-
-        # ---- high range ----
-        de_input = inputs_dir / f"delta_e_{args.fp}_lam_{tag}.txt"
-        dk_input = inputs_dir / f"delta_k_{args.fp}_lam_{tag}.txt"
-        h_query  = inputs_dir / f"h_min_lam_{tag}.dop"
-        _write_fptaylor_input(DELTA_E_TEMPLATE, lam, args.fp, de_input)
-        _write_fptaylor_input(DELTA_K_TEMPLATE, lam, args.fp, dk_input)
-        _write_gelpia_h_query(lam, args, h_query)
-
-        de_code, de_output = run_command([fptaylor, str(de_input)], cwd=ROOT, env=env)
-        de_out = outputs_dir / f"delta_e_{args.fp}_lam_{tag}.out"
-        de_out.write_text(de_output)
-        if args.verbose:
-            print(f"--- FPTaylor DeltaE (lambda={lam}) ---\n{de_output}")
-        if de_code != 0:
-            raise RuntimeError(f"FPTaylor DeltaE failed for lambda={lam}; see {de_out}")
-        delta_e = extract_abs_error(de_output, "DeltaE")
-
-        dk_code, dk_output = run_command([fptaylor, str(dk_input)], cwd=ROOT, env=env)
-        dk_out = outputs_dir / f"delta_k_{args.fp}_lam_{tag}.out"
-        dk_out.write_text(dk_output)
-        if args.verbose:
-            print(f"--- FPTaylor DeltaK (lambda={lam}) ---\n{dk_output}")
-        if dk_code != 0:
-            raise RuntimeError(f"FPTaylor DeltaK failed for lambda={lam}; see {dk_out}")
-        delta_k = extract_abs_error(dk_output, "DeltaK")
-
-        h_code, h_output = run_command([gelpia, "--mode=min", str(h_query)], cwd=ROOT)
-        h_out = outputs_dir / f"h_min_lam_{tag}.out"
-        h_out.write_text(h_output)
-        if args.verbose:
-            print(f"--- Gelpia h_min (lambda={lam}) ---\n{h_output}")
-        if h_code != 0:
-            raise RuntimeError(f"Gelpia h_min failed for lambda={lam}; see {h_out}")
-        m = MIN_LOWER_RE.search(h_output)
-        if not m:
-            raise RuntimeError(f"could not parse Gelpia h_min for lambda={lam}")
-        h_min_lower = float(m.group(1))
-
-        b = 0.931 + 2.53 * math.sqrt(lam_float)
-        alpha = 1.1239 + 1.1328 / (b - 3.4)
-        delta_h = delta_k * alpha * (lam_float + math.sqrt(lam_float)) / h_min_lower
-        total_error = delta_e + delta_h
-        tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
-
-        row = _empty_row(lam, args.fp)
-        row.update({
-            "regime": "high",
-            "delta_e": f"{delta_e:.17e}",
-            "delta_h": f"{delta_h:.17e}",
-            "total_error": f"{total_error:.17e}",
-            "tv": f"{tv:.17e}",
-        })
-        rows.append(row)
-        print(f"lambda={lam} DeltaE={row['delta_e']} DeltaH={row['delta_h']} "
-              f"Total={row['total_error']} TV={row['tv']}")
+            print(f"lambda={lam} DeltaE={row['delta_e']} DeltaH={row['delta_h']} "
+                  f"Total={row['total_error']} TV={row['tv']}")
+        except Exception as exc:
+            print(f"WARNING: skipping lambda={lam}: {exc}")
 
     return rows
 

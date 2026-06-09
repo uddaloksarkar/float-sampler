@@ -9,7 +9,7 @@ from pathlib import Path
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem,
-    save_loglog_plot,
+    run_cire_llvm, extract_cire_abs_error,
 )
 
 NAME = "binomial"
@@ -63,6 +63,65 @@ def make_template(n, p, fp):
 
 
 # ---------------------------------------------------------------------------
+# CIRE C code
+# ---------------------------------------------------------------------------
+
+_BINOM_C = """\
+#include <math.h>
+/* eps0: absolute error of exp(n * log(1-p)) */
+double binom_eps0(double n, double p) { double q = 1.0 - p; return exp(n * log(q)); }
+/* eps1: absolute error of z * (n - X + 1) * p / (X * (1-p)) */
+double binom_eps1(double z, double X, double n, double p)
+    { double q = 1.0 - p; return z * (n - X + 1.0) * p / (X * q); }
+/* eps2: absolute error of sum + prod */
+double binom_eps2(double s, double pr) { return s + pr; }
+"""
+
+
+def _run_cire(cire, n, p, args, inputs_dir, outputs_dir):
+    """Return (eps0, eps1, eps2) relative errors via CIRE absolute errors."""
+    q = 1.0 - p
+    qn_raw = math.exp(n * math.log(q))
+    qn = max(qn_raw, sys.float_info.min)
+    z_lo = max(min(qn_raw, math.exp(-22) / math.sqrt(2 * math.pi * n * p * q)),
+               sys.float_info.min)
+    x_hi = min(float(n), n * p + 10.0 * math.sqrt(n * p * q))
+
+    tag = safe_pair_name(n, p)
+
+    def _run(func, domains, label):
+        rc, out = run_cire_llvm(
+            cire, _BINOM_C, func, domains, tag, inputs_dir, outputs_dir,
+            verbose=args.verbose,
+        )
+        if rc != 0:
+            raise RuntimeError(f"CIRE failed for {label} (n={n}, p={p}); "
+                               f"see outputs/{tag}_{func}.out")
+        return extract_cire_abs_error(out, label)
+
+    abs0 = _run("binom_eps0",
+                [(float(n), float(n)), (p, p)],
+                "eps0")
+    abs1 = _run("binom_eps1",
+                [(z_lo, 1.0), (1.0, x_hi),
+                 (float(n), float(n)), (p, p)],
+                "eps1")
+    abs2 = _run("binom_eps2",
+                [(qn, 1.0), (0.0, 1.0)],
+                "eps2")
+
+    # relative error = abs_error / lower_bound_of_exact_expression
+    # eps0 lower bound: qn (the exact value, single-point expression)
+    # eps1 lower bound: minimum of z*(n-X+1)*p/(X*q) at z=z_lo, X=x_hi
+    # eps2 lower bound: qn (minimum of sum+prod = qn+0)
+    eps1_lo = max(z_lo * (n - x_hi + 1.0) * p / (x_hi * q), sys.float_info.min)
+    eps0 = abs0 / qn
+    eps1 = abs1 / eps1_lo
+    eps2 = abs2 / qn
+    return eps0, eps1, eps2
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -106,12 +165,13 @@ def add_args(parser):
 
 
 def default_out_dir(args):
+    backend = getattr(args, "backend", "fptaylor")
     if getattr(args, "n", None) is not None:
-        return ROOT / "binomial_runs"
+        return ROOT / f"binomial_runs_{backend}"
     lf = getattr(args, "input_file", None)
     if lf is None:
-        return ROOT / "binomial_runs"
-    return ROOT / f"binomial_runs_{lf.stem}"
+        return ROOT / f"binomial_runs_{backend}"
+    return ROOT / f"binomial_runs_{lf.stem}_{backend}"
 
 
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
@@ -131,50 +191,102 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
     rows = []
     for n, p in pairs:
         tag = safe_pair_name(n, p)
+        try:
+            if args.backend == "cire":
+                eps0, eps1, eps2 = _run_cire(fptaylor, n, p, args, inputs_dir, outputs_dir)
+            else:
+                input_path = inputs_dir / f"binomial_inversion_{args.fp}_{tag}.txt"
+                input_path.write_text(make_template(n, p, args.fp))
+                code, output = run_command(
+                    [fptaylor, "--rel-error", "true", str(input_path)],
+                    cwd=ROOT, env=env,
+                )
+                out_path = outputs_dir / f"binomial_inversion_{args.fp}_{tag}.out"
+                out_path.write_text(output)
+                if args.verbose:
+                    print(f"--- FPTaylor binomial_inversion (n={n}, p={p}) ---\n{output}")
+                if code != 0:
+                    raise RuntimeError(f"FPTaylor failed for n={n}, p={p}; see {out_path}")
+                deltas = extract_deltas_by_problem(output, f"n={n} p={p}")
+                eps0 = deltas["eps0"]
+                eps1 = deltas["eps1"]
+                eps2 = deltas["eps2"]
 
-        input_path = inputs_dir / f"binomial_inversion_{args.fp}_{tag}.txt"
-        input_path.write_text(make_template(n, p, args.fp))
+            bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
+            tv = 0.5 * (eps0 + eps1 * p + eps2 * bound)
 
-        code, output = run_command(
-            [fptaylor, "--rel-error", "true", str(input_path)],
-            cwd=ROOT, env=env,
-        )
-        out_path = outputs_dir / f"binomial_inversion_{args.fp}_{tag}.out"
-        out_path.write_text(output)
-        if args.verbose:
-            print(f"--- FPTaylor binomial_inversion (n={n}, p={p}) ---\n{output}")
-        if code != 0:
-            raise RuntimeError(f"FPTaylor failed for n={n}, p={p}; see {out_path}")
-
-        deltas = extract_deltas_by_problem(output, f"n={n} p={p}")
-        eps0 = deltas["eps0"]
-        eps1 = deltas["eps1"]
-        eps2 = deltas["eps2"]
-        bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
-        tv = 0.5 * (eps0 + eps1 * p + eps2 * bound)
-
-        rows.append({
-            "n": n,
-            "p": f"{p:.17g}",
-            "eps0": f"{eps0:.17e}",
-            "eps1": f"{eps1:.17e}",
-            "eps2": f"{eps2:.17e}",
-            "tv": f"{tv:.17e}",
-        })
-        print(f"n={n} p={p} eps0={eps0:.6e} eps1={eps1:.6e} eps2={eps2:.6e} TV={tv:.6e}")
+            rows.append({
+                "n": n,
+                "p": f"{p:.17g}",
+                "eps0": f"{eps0:.17e}",
+                "eps1": f"{eps1:.17e}",
+                "eps2": f"{eps2:.17e}",
+                "tv": f"{tv:.17e}",
+            })
+            print(f"n={n} p={p} eps0={eps0:.6e} eps1={eps1:.6e} eps2={eps2:.6e} TV={tv:.6e}")
+        except Exception as exc:
+            print(f"WARNING: skipping n={n} p={p}: {exc}")
 
     return rows
 
 
 def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
-    xs = [float(r["n"]) * float(r["p"]) for r in rows]
-    series = []
+    import os, contextlib, math
+    import numpy as np
+
+    fields = [("eps0", "eps0"), ("eps2", "eps2"), ("TV", "tv")]
     if plot_components:
-        series += [
-            ("eps0", [float(r["eps0"]) for r in rows], "o"),
-            ("eps1", [float(r["eps1"]) for r in rows], "s"),
-            ("eps2", [float(r["eps2"]) for r in rows], "d"),
-        ]
-    series.append(("TV", [float(r["tv"]) for r in rows], "^"))
-    save_loglog_plot(xs, series, xlabel="np  (mean)", ylabel="error",
-                     plot_path=plot_path, plot_pgf=plot_pgf)
+        fields = [("eps0", "eps0"), ("eps1", "eps1"), ("eps2", "eps2"), ("TV", "tv")]
+
+    # Reparametrize: x = log2(n), y = log2(np) = ne - pe  (both integers).
+    # This fills a dense rectangle instead of a thin diagonal band.
+    ne_vals  = sorted({round(math.log2(float(r["n"]))) for r in rows})
+    mnp_vals = sorted({round(math.log2(float(r["n"]) * float(r["p"]))) for r in rows})
+    ne_idx   = {v: i for i, v in enumerate(ne_vals)}
+    mnp_idx  = {v: i for i, v in enumerate(mnp_vals)}
+
+    def make_grid(key):
+        grid = np.full((len(mnp_vals), len(ne_vals)), np.nan)
+        for r in rows:
+            ne  = round(math.log2(float(r["n"])))
+            mnp = round(math.log2(float(r["n"]) * float(r["p"])))
+            v   = float(r[key])
+            if math.isfinite(v) and v > 0:
+                grid[mnp_idx[mnp], ne_idx[ne]] = math.log10(v)
+        return grid
+
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        flat_axes = axes.flat
+
+        # y-axis tick labels: np = 2^mnp
+        mnp_labels = [f"$2^{{{v}}}$" for v in mnp_vals]
+
+        grids = [(label, make_grid(key)) for label, key in fields]
+        vmin = min(np.nanmin(g) for _, g in grids)
+        vmax = max(np.nanmax(g) for _, g in grids)
+
+        for ax, (label, grid) in zip(flat_axes, grids):
+            im = ax.pcolormesh(ne_vals, mnp_vals, grid,
+                               cmap="viridis", vmin=vmin, vmax=vmax,
+                               shading="nearest")
+            fig.colorbar(im, ax=ax, label=f"log₁₀({label})")
+            ax.set_xlabel("log₂(n)")
+            ax.set_ylabel("np  (mean)")
+            ax.set_yticks(mnp_vals)
+            ax.set_yticklabels(mnp_labels)
+            ax.set_title(label)
+
+        for ax in list(flat_axes)[len(fields):]:
+            ax.set_visible(False)
+
+        fig.suptitle("Binomial FP error heatmap")
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150)
+        if plot_pgf:
+            plt.savefig(plot_path.with_suffix(".pgf"), backend="pgf")
+        plt.close()

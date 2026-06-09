@@ -29,7 +29,11 @@ import csv
 import sys
 from pathlib import Path
 
-from dist_common import add_common_args, find_fptaylor, fptaylor_env
+from dist_common import (
+    add_common_args,
+    find_fptaylor, fptaylor_env,
+    find_cire,
+)
 
 import dist_binomial
 import dist_poisson
@@ -64,10 +68,22 @@ def main():
     args = parser.parse_args()
     mod = DISTRIBUTIONS[args.dist]
 
-    # --- resolve FPTaylor ---
-    fptaylor = find_fptaylor(args.fptaylor)
-    if not fptaylor:
-        parser.error("FPTaylor not found; pass --fptaylor or set $FPTAYLOR")
+    # --- resolve backend tool ---
+    if args.backend == "fptaylor":
+        tool = find_fptaylor(args.fptaylor)
+        if not tool:
+            parser.error("FPTaylor not found; pass --fptaylor or set $FPTAYLOR")
+        env = fptaylor_env()
+    else:  # cire
+        tool = find_cire(args.cire)
+        if not tool:
+            parser.error(
+                "CIRE_LLVM not found; pass --cire or build cire/ (expected at cire/build/CIRE_LLVM)"
+            )
+        if args.fp != "fp64":
+            parser.error("--backend cire only supports --fp fp64")
+        import os
+        env = os.environ.copy()
 
     # --- output directories ---
     out_dir = (args.out_dir or mod.default_out_dir(args)).resolve()
@@ -76,18 +92,19 @@ def main():
     inputs_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    env = fptaylor_env()
-
-    # --- run distribution-specific analysis ---
-    rows = mod.run(args, fptaylor, inputs_dir, outputs_dir, env)
-
-    # --- write CSV ---
+    # --- run distribution-specific analysis (or load from cache) ---
     summary_path = out_dir / "summary.csv"
-    with summary_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=mod.CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote summary: {summary_path}")
+    if args.cache and summary_path.exists():
+        print(f"Cache hit: loading {summary_path}")
+        with summary_path.open(newline="") as f:
+            rows = list(csv.DictReader(f))
+    else:
+        rows = mod.run(args, tool, inputs_dir, outputs_dir, env)
+        with summary_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=mod.CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Wrote summary: {summary_path}")
 
     # --- plot ---
     if args.plot:
