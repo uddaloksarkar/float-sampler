@@ -10,6 +10,7 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
+    loggam_defs, eps_logv, eps_logus,
 )
 
 NAME = "binomial"
@@ -68,42 +69,6 @@ def make_template(n, p, fp):
 # BTRS FPTaylor template  (n*p >= _BTRS_SWITCH)
 # ---------------------------------------------------------------------------
 
-# Coefficients from random_loggam (hypergeometric_hrua.c)
-_LOGGAM_A = [
-     8.333333333333333e-02, -2.777777777777778e-03,
-     7.936507936507937e-04, -5.952380952380952e-04,
-     8.417508417508418e-04, -1.917526917526918e-03,
-     6.410256410256410e-03, -2.955065359477124e-02,
-     1.796443723688307e-01, -1.39243221690590e+00,
-]
-_LOGGAM_LG2PI = 1.8378770664093453e+00
-
-
-def _loggam_defs(x_expr, prefix, rnd):
-    """
-    Return FPTaylor Definitions lines implementing random_loggam(x_expr)
-    for x_expr >= 7 (Stirling / asymptotic branch, straight-line).
-    prefix must be unique per call-site.  The last entry is the result name.
-    """
-    a = _LOGGAM_A
-    lines = []
-    # x2 = (1/x)*(1/x)
-    lines.append(f"  {prefix}_x2 {rnd}= (1.0 / ({x_expr})) * (1.0 / ({x_expr})),")
-    # Horner from a[9] down to a[0]
-    lines.append(f"  {prefix}_h9 = {a[9]:.20e},")
-    for i in range(8, -1, -1):
-        lines.append(
-            f"  {prefix}_h{i} {rnd}= {prefix}_h{i+1} * {prefix}_x2 + {a[i]:.20e},"
-        )
-    # gl = h0/x + 0.5*log(2pi) + (x-0.5)*log(x) - x
-    lines.append(
-        f"  {prefix}_gl {rnd}= {prefix}_h0 / ({x_expr})"
-        f" + {0.5 * _LOGGAM_LG2PI:.20e}"
-        f" + (({x_expr}) - 0.5) * log({x_expr}) - ({x_expr}),"
-    )
-    return lines, f"{prefix}_gl"
-
-
 def make_btrs_floor_template(n, p, fp, utail):
     """
     FPTaylor expression for eps_floor: absolute error of
@@ -157,8 +122,8 @@ def make_btrs_accept_template(n, p, fp, utail, fast=False):
     k_hi = float(min(n-1, int(math.ceil(m + 10 * spq))))
 
     # Build loggam Definitions for k+1 and n-k+1
-    defs_k,  name_k  = _loggam_defs("k + 1.0",           "lgk",  rnd)
-    defs_nk, name_nk = _loggam_defs(f"{float(n):.1f} - k + 1.0", "lgnk", rnd)
+    defs_k,  name_k  = loggam_defs("k + 1.0",           "lgk",  rnd)
+    defs_nk, name_nk = loggam_defs(f"{float(n):.1f} - k + 1.0", "lgnk", rnd)
 
     log_us_term = "" if fast else " - 2.0 * log(us_)"
 
@@ -183,92 +148,6 @@ def make_btrs_accept_template(n, p, fp, utail, fast=False):
         + "Expressions\n"
           "  eps_accept = btrs_accept;\n"
     )
-
-
-def make_logv_template(fp, vtail):
-    """
-    Absolute error of -log(v), v in [vtail, 1.0] — split out from
-    btrs_accept because folding it into that expression adds v as an
-    extra dimension to FPTaylor's joint branch-and-bound search and
-    blows up the runtime of the whole eps_accept query.
-    """
-    rnd = FP_TO_FPTAYLOR_RND[fp]
-    return (
-        "Variables\n"
-        f"  real v in [{vtail:.1e}, 1.0];\n\n"
-        "Definitions\n"
-        f"  logv_step {rnd}= - log(v);\n\n"
-        "Expressions\n"
-        "  eps_logv = logv_step;\n"
-    )
-
-
-_LOGV_EPS_CACHE = {}
-
-
-def _eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose):
-    """Absolute error of -log(v); same for every (n, p), so cache it."""
-    key = (fp, vtail)
-    if key in _LOGV_EPS_CACHE:
-        return _LOGV_EPS_CACHE[key]
-
-    input_path = inputs_dir  / f"binomial_btrs_logv_{fp}.txt"
-    out_path   = outputs_dir / f"binomial_btrs_logv_{fp}.out"
-    input_path.write_text(make_logv_template(fp, vtail))
-
-    code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
-    out_path.write_text(output)
-    if verbose:
-        print(f"--- FPTaylor BTRS log(v) ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor BTRS log(v) failed; see {out_path}")
-
-    eps_logv = extract_abs_errors_by_problem(output)["eps_logv"]
-    _LOGV_EPS_CACHE[key] = eps_logv
-    return eps_logv
-
-
-def make_btrs_logus_template(fp, utail):
-    """
-    Absolute error of -2*log(us_), with us_ = 0.5 - |u|,
-    u in [-(0.5-utail), 0.5-utail] — split out of btrs_accept for the
-    --fast path (see make_btrs_accept_template).
-    """
-    rnd = FP_TO_FPTAYLOR_RND[fp]
-    return (
-        "Variables\n"
-        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}];\n\n"
-        "Definitions\n"
-        f"  us_       {rnd}= 0.5 - abs(u),\n"
-        f"  logus_step {rnd}= - 2.0 * log(us_);\n\n"
-        "Expressions\n"
-        "  eps_logus = logus_step;\n"
-    )
-
-
-_LOGUS_EPS_CACHE = {}
-
-
-def _eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose):
-    """Absolute error of -2*log(us_); same for every (n, p), so cache it."""
-    key = (fp, utail)
-    if key in _LOGUS_EPS_CACHE:
-        return _LOGUS_EPS_CACHE[key]
-
-    input_path = inputs_dir  / f"binomial_btrs_logus_{fp}.txt"
-    out_path   = outputs_dir / f"binomial_btrs_logus_{fp}.out"
-    input_path.write_text(make_btrs_logus_template(fp, utail))
-
-    code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
-    out_path.write_text(output)
-    if verbose:
-        print(f"--- FPTaylor BTRS log(us) ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor BTRS log(us) failed; see {out_path}")
-
-    eps_logus = extract_abs_errors_by_problem(output)["eps_logus"]
-    _LOGUS_EPS_CACHE[key] = eps_logus
-    return eps_logus
 
 
 def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, verbose, fast=False):
@@ -304,11 +183,11 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
     if code != 0:
         raise RuntimeError(f"FPTaylor BTRS accept failed for n={n}, p={p}; see {accept_output}")
 
-    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"] + _eps_logv(
+    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"] + eps_logv(
         fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     )
     if fast:
-        eps_accept += _eps_logus(
+        eps_accept += eps_logus(
             fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
         )
 

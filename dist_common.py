@@ -285,3 +285,131 @@ def add_common_args(parser):
                         help="Print FPTaylor/Gelpia output to stdout")
     parser.add_argument("--cache", action="store_true",
                         help="If summary.csv already exists in out-dir, load it and skip re-running")
+
+
+# ---------------------------------------------------------------------------
+# Shared FPTaylor helpers for Hormann-style transformed-rejection samplers
+# (BTRS for binomial, PTRS for Poisson): inline lgamma (Stirling, x>=7),
+# and standalone cached queries for -log(v) and -2*log(us).
+# ---------------------------------------------------------------------------
+
+# Coefficients from random_loggam (numpy distributions.c)
+LOGGAM_A = [
+     8.333333333333333e-02, -2.777777777777778e-03,
+     7.936507936507937e-04, -5.952380952380952e-04,
+     8.417508417508418e-04, -1.917526917526918e-03,
+     6.410256410256410e-03, -2.955065359477124e-02,
+     1.796443723688307e-01, -1.39243221690590e+00,
+]
+LOGGAM_LG2PI = 1.8378770664093453e+00
+
+
+def loggam_defs(x_expr, prefix, rnd):
+    """
+    Return FPTaylor Definitions lines implementing random_loggam(x_expr)
+    for x_expr >= 7 (Stirling / asymptotic branch, straight-line).
+    prefix must be unique per call-site.  The last entry is the result name.
+    """
+    a = LOGGAM_A
+    lines = []
+    # x2 = (1/x)*(1/x)
+    lines.append(f"  {prefix}_x2 {rnd}= (1.0 / ({x_expr})) * (1.0 / ({x_expr})),")
+    # Horner from a[9] down to a[0]
+    lines.append(f"  {prefix}_h9 = {a[9]:.20e},")
+    for i in range(8, -1, -1):
+        lines.append(
+            f"  {prefix}_h{i} {rnd}= {prefix}_h{i+1} * {prefix}_x2 + {a[i]:.20e},"
+        )
+    # gl = h0/x + 0.5*log(2pi) + (x-0.5)*log(x) - x
+    lines.append(
+        f"  {prefix}_gl {rnd}= {prefix}_h0 / ({x_expr})"
+        f" + {0.5 * LOGGAM_LG2PI:.20e}"
+        f" + (({x_expr}) - 0.5) * log({x_expr}) - ({x_expr}),"
+    )
+    return lines, f"{prefix}_gl"
+
+
+def make_logv_template(fp, vtail):
+    """
+    Absolute error of -log(v), v in [vtail, 1.0] — split out of the
+    acceptance-test expression because folding it in adds v as an extra
+    dimension to FPTaylor's joint branch-and-bound search and blows up
+    the runtime of the whole eps_accept query.
+    """
+    rnd = FP_TO_FPTAYLOR_RND[fp]
+    return (
+        "Variables\n"
+        f"  real v in [{vtail:.1e}, 1.0];\n\n"
+        "Definitions\n"
+        f"  logv_step {rnd}= - log(v);\n\n"
+        "Expressions\n"
+        "  eps_logv = logv_step;\n"
+    )
+
+
+_LOGV_EPS_CACHE = {}
+
+
+def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose):
+    """Absolute error of -log(v); same for every distribution param, so cache it."""
+    key = (fp, vtail)
+    if key in _LOGV_EPS_CACHE:
+        return _LOGV_EPS_CACHE[key]
+
+    input_path = inputs_dir  / f"logv_{fp}.txt"
+    out_path   = outputs_dir / f"logv_{fp}.out"
+    input_path.write_text(make_logv_template(fp, vtail))
+
+    code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
+    out_path.write_text(output)
+    if verbose:
+        print(f"--- FPTaylor log(v) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor log(v) failed; see {out_path}")
+
+    result = extract_abs_errors_by_problem(output)["eps_logv"]
+    _LOGV_EPS_CACHE[key] = result
+    return result
+
+
+def make_logus_template(fp, utail):
+    """
+    Absolute error of -2*log(us_), with us_ = 0.5 - |u|,
+    u in [-(0.5-utail), 0.5-utail] — split out for the --fast path of
+    accept-expression templates (see e.g. dist_binomial.make_btrs_accept_template).
+    """
+    rnd = FP_TO_FPTAYLOR_RND[fp]
+    return (
+        "Variables\n"
+        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}];\n\n"
+        "Definitions\n"
+        f"  us_        {rnd}= 0.5 - abs(u),\n"
+        f"  logus_step {rnd}= - 2.0 * log(us_);\n\n"
+        "Expressions\n"
+        "  eps_logus = logus_step;\n"
+    )
+
+
+_LOGUS_EPS_CACHE = {}
+
+
+def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose):
+    """Absolute error of -2*log(us_); same for every distribution param, so cache it."""
+    key = (fp, utail)
+    if key in _LOGUS_EPS_CACHE:
+        return _LOGUS_EPS_CACHE[key]
+
+    input_path = inputs_dir  / f"logus_{fp}.txt"
+    out_path   = outputs_dir / f"logus_{fp}.out"
+    input_path.write_text(make_logus_template(fp, utail))
+
+    code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
+    out_path.write_text(output)
+    if verbose:
+        print(f"--- FPTaylor log(us) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor log(us) failed; see {out_path}")
+
+    result = extract_abs_errors_by_problem(output)["eps_logus"]
+    _LOGUS_EPS_CACHE[key] = result
+    return result

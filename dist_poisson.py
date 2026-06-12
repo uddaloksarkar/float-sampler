@@ -1,6 +1,9 @@
 """
 Poisson sampler FP-error analysis.
-Refactored from fpsampler.py; called by main.py.
+High range (lambda >= SWITCH) follows the PTRS algorithm in
+distributions/random_poisson_ptrs.c and mirrors the BTRS analysis in
+dist_binomial.py (eps_floor / eps_accept split, shared -log(v) and
+-2*log(us) helpers, --fast flag).
 """
 import math
 from pathlib import Path
@@ -8,56 +11,145 @@ from pathlib import Path
 from analyticError import FP_BETA, SWITCH, computeDeltaHighRange, computeDeltaLowRange
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
-    find_gelpia, run_command,
-    extract_abs_error, extract_abs_errors_by_problem,
+    run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
+    loggam_defs, eps_logv, eps_logus,
 )
 
 NAME = "poisson"
-CSV_FIELDS = ["lambda", "fp", "regime", "delta_e", "delta_h", "total_error", "tv"]
+CSV_FIELDS = ["lambda", "fp", "regime", "eps_floor", "eps_accept", "tv", "ref_tv"]
 
-MIN_LOWER_RE = __import__("re").compile(r"Minimum lower bound\s+([-+\deE.]+)")
 
 # ---------------------------------------------------------------------------
-# FPTaylor templates
+# PTRS FPTaylor templates  (lambda >= SWITCH)
 # ---------------------------------------------------------------------------
 
-DELTA_E_TEMPLATE = """Variables
-  real u in [-0.49, 0.49],
-  real floor_err in [-1, 0];
+def make_ptrs_floor_template(lam, fp, utail):
+    """
+    FPTaylor expression for eps_floor: absolute error of
+    (2*a/us + b)*u + (lambda + 0.43), with us = 0.5 - |u|
+    [random_poisson_ptrs.c line 89]
+    """
+    slam = math.sqrt(lam)
+    b = 0.931 + 2.53 * slam
+    a = -0.059 + 0.02483 * b
+    c = lam + 0.43
+    rnd = FP_TO_FPTAYLOR_RND[fp]
 
-Definitions
-  lambda = {lam},
-  pi = 3.14159265358979323846,
-  c = lambda + 0.445,
-  b = 0.931 + 2.53 * sqrt(lambda),
-  a = -0.059 + 0.02483 * b,
-  alpha = 1.1239 + 1.1328 / (b - 3.4),
-  K_real = ((2 * a) / (0.5 - abs(u)) + b) * u + c,
-  K = K_real + floor_err,
-  lr {rnd}= -lambda + K * log(lambda) - K * log(K) + K
-            - 0.5 * log(2 * pi * K) - log(u) - log(alpha);
+    return (
+        "Variables\n"
+        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}];\n\n"
+        "Definitions\n"
+        f"  a_  = {a:.20e},\n"
+        f"  b_  = {b:.20e},\n"
+        f"  c_  = {c:.20e},\n"
+        f"  us_ {rnd}= 0.5 - abs(u),\n"
+        f"  ptrs_floor {rnd}= (2.0 * a_ / us_ + b_) * u + c_;\n\n"
+        "Expressions\n"
+        "  eps_floor = ptrs_floor;\n"
+    )
 
-Expressions
-  delta_e = lr;
-"""
 
-DELTA_K_TEMPLATE = """Variables
-  real u in [-0.49, 0.49],
-  real floor_err in [-1, 0];
+def make_ptrs_accept_template(lam, fp, utail, fast=False):
+    """
+    FPTaylor expression for eps_accept (excluding -log(v), see
+    dist_common.make_logv_template): absolute error of
+    -lambda + k*log(lambda) - loggam(k+1) - log(invalpha) + log(a/us^2 + b),
+    with us = 0.5 - |u|   [random_poisson_ptrs.c lines 98-99, rearranged so
+    that log(v) is alone on the left-hand side].
+    lgamma is approximated by inlining random_loggam's x>=7 Stirling branch.
+    log(a/us^2 + b) is rewritten as log(a + b*us^2) - 2*log(us) to avoid
+    forming 1/us^2 directly when us is small (see dist_binomial.py).
 
-Definitions
-  lambda = {lam},
-  c = lambda + 0.445,
-  b = 0.931 + 2.53 * sqrt(lambda),
-  a = -0.059 + 0.02483 * b,
-  K_real = ((2 * a) / (0.5 - abs(u)) + b) * u + c,
-  K {rnd}= K_real + floor_err;
+    If fast is True, the -2*log(us_) term is omitted here and its error is
+    computed separately (see dist_common.make_logus_template) and summed in
+    by the caller. This drops u as a shared variable between the two terms,
+    which may yield a more conservative (looser) overall bound.
+    """
+    slam = math.sqrt(lam)
+    b = 0.931 + 2.53 * slam
+    a = -0.059 + 0.02483 * b
+    invalpha = 1.1239 + 1.1328 / (b - 3.4)
+    loglam = math.log(lam)
+    rnd = FP_TO_FPTAYLOR_RND[fp]
 
-Expressions
-  delta_k = K;
-"""
+    # k_lo >= 6 so that k+1 >= 7 (Stirling branch valid)
+    k_lo = float(max(6, int(lam - 10 * slam)))
+    k_hi = float(int(math.ceil(lam + 10 * slam)))
 
+    defs_k, name_k = loggam_defs("k + 1.0", "lgk", rnd)
+
+    log_us_term = "" if fast else " - 2.0 * log(us_)"
+
+    return (
+        "Variables\n"
+        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}],\n"
+        f"  real k in [{k_lo:.1f}, {k_hi:.1f}];\n\n"
+        "Definitions\n"
+        f"  a_        = {a:.20e},\n"
+        f"  b_        = {b:.20e},\n"
+        f"  lam_      = {lam:.20e},\n"
+        f"  loglam_   = {loglam:.20e},\n"
+        f"  invalpha_ = {invalpha:.20e},\n"
+        + "\n".join(defs_k) + "\n"
+        + f"  us_         {rnd}= 0.5 - abs(u),\n"
+        + f"  us_sq_      {rnd}= us_ * us_,\n"
+        + f"  log_num_    {rnd}= a_ + b_ * us_sq_,\n"
+        + f"  ptrs_accept {rnd}= -lam_ + k * loglam_ - {name_k}"
+          f" - log(invalpha_) + log(log_num_){log_us_term};\n\n"
+        + "Expressions\n"
+          "  eps_accept = ptrs_accept;\n"
+    )
+
+
+def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose, fast=False):
+    """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
+    slam = math.sqrt(lam)
+    b = 0.931 + 2.53 * slam
+    invalpha = 1.1239 + 1.1328 / (b - 3.4)
+    utail = 1e-5
+    vtail = 1e-10
+
+    floor_input  = inputs_dir  / f"poisson_ptrs_floor_{fp}_{tag}.txt"
+    floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
+    floor_input.write_text(make_ptrs_floor_template(lam, fp, utail))
+
+    code, output = run_command([fptaylor, str(floor_input)], cwd=ROOT, env=env)
+    floor_output.write_text(output)
+    if verbose:
+        print(f"--- FPTaylor PTRS floor (lambda={lam}) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor PTRS floor failed for lambda={lam}; see {floor_output}")
+
+    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + 2 * utail
+
+    accept_input  = inputs_dir  / f"poisson_ptrs_accept_{fp}_{tag}.txt"
+    accept_output = outputs_dir / f"poisson_ptrs_accept_{fp}_{tag}.out"
+    accept_input.write_text(make_ptrs_accept_template(lam, fp, utail, fast=fast))
+
+    code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
+    accept_output.write_text(output)
+    if verbose:
+        print(f"--- FPTaylor PTRS accept (lambda={lam}) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor PTRS accept failed for lambda={lam}; see {accept_output}")
+
+    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"] + eps_logv(
+        fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
+    )
+    if fast:
+        eps_accept += eps_logus(
+            fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
+        )
+
+    accept_iter = invalpha 
+    tv = 2 * (eps_floor + vtail) * accept_iter + 2 * eps_accept / (1 - vtail)
+    return eps_floor, eps_accept, tv
+
+
+# ---------------------------------------------------------------------------
+# Low-range FPTaylor templates  (lambda < SWITCH)
+# ---------------------------------------------------------------------------
 
 def _make_low_range_template(lam_str, fp):
     lam = float(lam_str)
@@ -123,10 +215,6 @@ def read_lambdas(path):
     return lambdas
 
 
-def _write_fptaylor_input(template, lam, fp, path):
-    path.write_text(template.format(lam=lam, rnd=FP_TO_FPTAYLOR_RND[fp]))
-
-
 def _compute_low_range_delta(lam, l_compute_error, prod_compute_error):
     l_value = math.exp(-lam)
     E = prod_compute_error + l_compute_error
@@ -139,26 +227,9 @@ def _compute_log_low_range_delta(lambda_fp_error, log_prod_error):
     return E, 2 * E
 
 
-def _write_gelpia_h_query(lam, args, path):
-    path.write_text("\n".join([
-        f"# --input-epsilon {args.gelpia_input_epsilon:e}",
-        f"# --output-epsilon {args.gelpia_output_epsilon:e}",
-        f"# --output-epsilon-relative {args.gelpia_output_epsilon_relative:e}",
-        f"# --timeout {args.gelpia_timeout}",
-        f"# --max-iters {args.gelpia_max_iters}",
-        "",
-        f"[{args.u_lo:.20e}, {args.u_hi:.20e}] u;",
-        "",
-        "(((-0.059 + (0.02483 * (0.931 + (2.53 * sqrt({lam}))))) / "
-        "((0.5 - abs(u)) * (0.5 - abs(u)))) + "
-        "(0.931 + (2.53 * sqrt({lam}))));".format(lam=f"{float(lam):.20e}"),
-        "",
-    ]))
-
-
 def _empty_row(lam, fp):
     return {"lambda": lam, "fp": fp, "regime": "",
-            "delta_e": "", "delta_h": "", "total_error": "", "tv": ""}
+            "eps_floor": "", "eps_accept": "", "tv": "", "ref_tv": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -171,36 +242,25 @@ def add_args(parser):
                         help="File with lambda values, one or more per line")
     source.add_argument("--lam", type=float, default=None,
                         help="Single lambda value")
-    parser.add_argument("--gelpia", default=None,
-                        help="Path to Gelpia executable")
-    parser.add_argument("--u-lo", type=float, default=0.45)
-    parser.add_argument("--u-hi", type=float, default=0.49)
     parser.add_argument("--use-log", action="store_true",
                         help="Use log-space template for low-range lambdas")
-    parser.add_argument("--gelpia-input-epsilon", type=float, default=1e-8)
-    parser.add_argument("--gelpia-output-epsilon", type=float, default=1e-8)
-    parser.add_argument("--gelpia-output-epsilon-relative", type=float, default=1e-8)
-    parser.add_argument("--gelpia-timeout", type=int, default=60)
-    parser.add_argument("--gelpia-max-iters", type=int, default=50000)
+    parser.add_argument("--fast", action="store_true",
+                        help="PTRS only: compute the -2*log(us) term of "
+                             "eps_accept in a separate FPTaylor query and "
+                             "sum it in, decoupling it from the shared "
+                             "variable u. Faster, but may yield a more "
+                             "conservative (looser) bound.")
 
 
 def default_out_dir(args):
     lf = getattr(args, "lambda_file", None)
     if lf is None:
-        return ROOT / "total_error_runs_lam"
-    return ROOT / f"total_error_runs_{lf.stem}"
+        return ROOT / "poisson_runs"
+    return ROOT / f"poisson_runs_{lf.stem}"
 
 
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
     lambdas = [str(args.lam)] if args.lam is not None else read_lambdas(args.lambda_file)
-
-    if args.u_lo < 0 or args.u_hi >= 0.5 or args.u_lo > args.u_hi:
-        raise ValueError("u interval must satisfy 0 <= u-lo <= u-hi < 0.5")
-
-    needs_gelpia = any(float(lam) >= SWITCH for lam in lambdas)
-    gelpia = find_gelpia(getattr(args, "gelpia", None)) if needs_gelpia else None
-    if needs_gelpia and not gelpia:
-        raise RuntimeError("Gelpia not found; pass --gelpia or set $GELPIA/$GELPIA_PATH")
 
     rows = []
     for lam in lambdas:
@@ -228,79 +288,42 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                     missing = {"log_prod_compute", "lambda_fp_compute"} - errs.keys()
                     if missing:
                         raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
-                    _, low_delta = _compute_log_low_range_delta(
+                    _, low_tv = _compute_log_low_range_delta(
                         errs["lambda_fp_compute"], errs["log_prod_compute"]
                     )
                 else:
                     missing = {"L_compute", "prod_compute"} - errs.keys()
                     if missing:
                         raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
-                    _, _, low_delta = _compute_low_range_delta(
+                    _, _, low_tv = _compute_low_range_delta(
                         lam_float, errs["L_compute"], errs["prod_compute"]
                     )
 
-                tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
+                ref_tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
                 row = _empty_row(lam, args.fp)
-                row.update({"regime": "low", "total_error": f"{low_delta:.17e}", "tv": f"{tv:.17e}"})
+                row.update({"regime": "low", "tv": f"{low_tv:.17e}", "ref_tv": f"{ref_tv:.17e}"})
                 rows.append(row)
-                print(f"lambda={lam} Total={row['total_error']} TV={row['tv']}")
+                print(f"lambda={lam} [low] TV={row['tv']} ref_TV={row['ref_tv']}")
                 continue
 
-            # ---- high range ----
-            de_input = inputs_dir / f"delta_e_{args.fp}_lam_{tag}.txt"
-            dk_input = inputs_dir / f"delta_k_{args.fp}_lam_{tag}.txt"
-            h_query  = inputs_dir / f"h_min_lam_{tag}.dop"
-            _write_fptaylor_input(DELTA_E_TEMPLATE, lam, args.fp, de_input)
-            _write_fptaylor_input(DELTA_K_TEMPLATE, lam, args.fp, dk_input)
-            _write_gelpia_h_query(lam, args, h_query)
-
-            de_code, de_output = run_command([fptaylor, str(de_input)], cwd=ROOT, env=env)
-            de_out = outputs_dir / f"delta_e_{args.fp}_lam_{tag}.out"
-            de_out.write_text(de_output)
-            if args.verbose:
-                print(f"--- FPTaylor DeltaE (lambda={lam}) ---\n{de_output}")
-            if de_code != 0:
-                raise RuntimeError(f"FPTaylor DeltaE failed for lambda={lam}; see {de_out}")
-            delta_e = extract_abs_error(de_output, "DeltaE")
-
-            dk_code, dk_output = run_command([fptaylor, str(dk_input)], cwd=ROOT, env=env)
-            dk_out = outputs_dir / f"delta_k_{args.fp}_lam_{tag}.out"
-            dk_out.write_text(dk_output)
-            if args.verbose:
-                print(f"--- FPTaylor DeltaK (lambda={lam}) ---\n{dk_output}")
-            if dk_code != 0:
-                raise RuntimeError(f"FPTaylor DeltaK failed for lambda={lam}; see {dk_out}")
-            delta_k = extract_abs_error(dk_output, "DeltaK")
-
-            h_code, h_output = run_command([gelpia, "--mode=min", str(h_query)], cwd=ROOT)
-            h_out = outputs_dir / f"h_min_lam_{tag}.out"
-            h_out.write_text(h_output)
-            if args.verbose:
-                print(f"--- Gelpia h_min (lambda={lam}) ---\n{h_output}")
-            if h_code != 0:
-                raise RuntimeError(f"Gelpia h_min failed for lambda={lam}; see {h_out}")
-            m = MIN_LOWER_RE.search(h_output)
-            if not m:
-                raise RuntimeError(f"could not parse Gelpia h_min for lambda={lam}")
-            h_min_lower = float(m.group(1))
-
-            b = 0.931 + 2.53 * math.sqrt(lam_float)
-            alpha = 1.1239 + 1.1328 / (b - 3.4)
-            delta_h = delta_k * alpha * (lam_float + math.sqrt(lam_float)) / h_min_lower
-            total_error = delta_e + delta_h
-            tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
+            # ---- high range (PTRS) ----
+            eps_floor, eps_accept, tv = _run_ptrs_fptaylor(
+                fptaylor, lam_float, args.fp, tag, inputs_dir, outputs_dir,
+                env, args.verbose, fast=args.fast,
+            )
+            ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 
             row = _empty_row(lam, args.fp)
             row.update({
-                "regime": "high",
-                "delta_e": f"{delta_e:.17e}",
-                "delta_h": f"{delta_h:.17e}",
-                "total_error": f"{total_error:.17e}",
+                "regime": "ptrs",
+                "eps_floor": f"{eps_floor:.17e}",
+                "eps_accept": f"{eps_accept:.17e}",
                 "tv": f"{tv:.17e}",
+                "ref_tv": f"{ref_tv:.17e}",
             })
             rows.append(row)
-            print(f"lambda={lam} DeltaE={row['delta_e']} DeltaH={row['delta_h']} "
-                  f"Total={row['total_error']} TV={row['tv']}")
+            print(f"lambda={lam} [PTRS] eps_floor={eps_floor:.6e}"
+                  f" eps_accept={eps_accept:.6e} TV={tv:.6e} ref_TV={ref_tv:.6e}")
         except Exception as exc:
             print(f"WARNING: skipping lambda={lam}: {exc}")
 
@@ -310,24 +333,12 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
     points = []
     for row in rows:
-        if row["regime"] == "low":
-            points.append((float(row["lambda"]), None, None,
-                           float(row["total_error"]), float(row["tv"])))
-        else:
-            points.append((float(row["lambda"]), float(row["delta_e"]),
-                           float(row["delta_h"]), float(row["total_error"]),
-                           float(row["tv"])))
+        points.append((float(row["lambda"]), float(row["tv"]), float(row["ref_tv"])))
     points.sort(key=lambda r: r[0])
     xs = [r[0] for r in points]
-    series = []
-    if plot_components:
-        series += [
-            ("DeltaE", [r[1] for r in points], "o"),
-            ("DeltaH", [r[2] for r in points], "s"),
-        ]
-    series += [
-        ("total_error", [r[3] for r in points], "^"),
-        ("TV (analyticError)", [r[4] for r in points], "x"),
+    series = [
+        ("TV (computed)", [r[1] for r in points], "^"),
+        ("TV (analyticError)", [r[2] for r in points], "x"),
     ]
     save_loglog_plot(xs, series, xlabel="lambda", ylabel="error",
                      plot_path=plot_path, plot_pgf=plot_pgf, ylim_top=0.9)

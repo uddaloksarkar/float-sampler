@@ -95,8 +95,13 @@ int64_t random_poisson_ptrs(void *rstate, double lam) {
     }
     /* log(V) == log(0.0) ok here */
     /* if U==0.0 so that us==0.0, log is ok since always returns */
-    if ((log(V) + log(invalpha) - log(a / (us * us) + b)) <=
-        (-lam + (double)k * loglam - random_loggam((double)k + 1))) {
+    /* a / (us * us) + b is rewritten as (a + b * us * us) / (us * us)
+     * to avoid forming 1 / us^2 directly when us is small; the
+     * resulting -log(us * us) = -2.0 * log(us) is folded into the
+     * comparison in log space instead. */
+    double us2 = us * us;
+    if (log(V) <= -lam + (double)k * loglam - random_loggam((double)k + 1)
+                  - log(invalpha) + log(a + b * us2) - 2.0 * log(us)) {
       return k;
     }
   }
