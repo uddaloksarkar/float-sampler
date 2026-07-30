@@ -122,12 +122,6 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     if code != 0:
         raise RuntimeError(f"FPTaylor PTRS floor failed for lambda={lam}; see {floor_output}")
 
-    # Tail term: the FPTaylor floor bound only covers |u| <= 1/2 - utail.
-    # Outside that slab the exact floor (2a/us + b)*u + c can only be reached
-    # by K deviating from the mean lambda by at least s_eta, so bound its
-    # probability with Bernstein's inequality (variance sigma^2 = lambda):
-    #   t_eta = (2a/utail + b) * (1/2 - utail),  s_eta = t_eta - 1/2
-    #   P(|K - lambda| >= s_eta) <= 2 exp(-s_eta^2 / (2 (sigma^2 + s_eta/3)))
     t_eta = (2.0 * a / utail + b) * (0.5 - utail)
     s_eta = t_eta - 0.5
     u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (lam + s_eta / 3.0)))

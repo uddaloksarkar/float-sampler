@@ -171,12 +171,6 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
     if code != 0:
         raise RuntimeError(f"FPTaylor BTRS floor failed for n={n}, p={p}; see {floor_output}")
 
-    # Tail term: the FPTaylor floor bound only covers |u| <= 1/2 - utail.
-    # Outside that slab the exact floor (2a/us + b)*u + c can only be reached
-    # by K deviating from the mean np by at least s_eta, so bound its
-    # probability with Bernstein's inequality (variance sigma^2 = n*p*q):
-    #   t_eta = (2a/utail + b) * (1/2 - utail),  s_eta = t_eta - 1/2
-    #   P(|K - np| >= s_eta) <= 2 exp(-s_eta^2 / (2 (sigma^2 + s_eta/3)))
     t_eta = (2.0 * a / utail + b) * (0.5 - utail)
     s_eta = t_eta - 0.5
     u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (n * p * q + s_eta / 3.0)))

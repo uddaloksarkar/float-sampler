@@ -1,17 +1,29 @@
 """
 Hypergeometric distribution FP-error analysis.
 Follows the pattern in dist_geometric.py; called by main.py.
+
+Two regimes, matching numpy's dispatch:
+  10 <= sample <= good + bad - 10 : HRUA (ratio-of-uniforms,
+                                    distributions/hypergeometric_hrua.c)
+  otherwise                       : HYP  (inversion-style loop,
+                                    distributions/hypergeometric_hyp.c)
 """
+import math
 from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
-    save_loglog_plot,
+    save_loglog_plot, loggam_defs,
 )
 
 NAME = "hypergeometric"
-CSV_FIELDS = ["N", "K", "n", "delta", "tv"]
+CSV_FIELDS = ["N", "K", "n", "regime", "delta", "eps_w", "eps_accept", "tv"]
+
+_HRUA_SWITCH = 10      # see _use_hrua()
+
+_D1 = 1.7155277699214135   # 2*sqrt(2/e)
+_D2 = 0.8989161620588988   # 3 - 2*sqrt(3/e)
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +71,154 @@ def make_template(N, K, n, fp):
 
 
 # ---------------------------------------------------------------------------
+# HRUA FPTaylor templates  (sample > _HRUA_SWITCH)
+# ---------------------------------------------------------------------------
+
+def _hrua_constants(N, K, n):
+    """
+    The d4..d11 setup constants of random_hypergeometric_hrua
+    (distributions/hypergeometric_hrua.c lines 81-93), computed in exact
+    Python arithmetic.
+    """
+    good, bad  = K, N - K
+    mingoodbad = min(good, bad)
+    maxgoodbad = max(good, bad)
+    popsize    = good + bad
+    m          = min(n, popsize - n)
+
+    d4  = mingoodbad / popsize
+    d5  = 1.0 - d4
+    d6  = m * d4 + 0.5
+    d7  = math.sqrt((popsize - m) * n * d4 * d5 / (popsize - 1) + 0.5)
+    d8  = _D1 * d7 + _D2
+    d9  = int(math.floor((m + 1) * (mingoodbad + 1) / (popsize + 2)))
+    d10 = (math.lgamma(d9 + 1) + math.lgamma(mingoodbad - d9 + 1)
+           + math.lgamma(m - d9 + 1) + math.lgamma(maxgoodbad - m + d9 + 1))
+    d11 = min(min(m, mingoodbad) + 1.0, math.floor(d6 + 16 * d7))
+
+    return dict(mingoodbad=mingoodbad, maxgoodbad=maxgoodbad, popsize=popsize,
+                m=m, d6=d6, d7=d7, d8=d8, d10=d10, d11=d11)
+
+
+def make_hrua_w_template(N, K, n, fp, xtail):
+    """
+    FPTaylor expression for eps_w: absolute error of the candidate
+
+        W = d6 + d8 * (Y - 0.5) / X          [hypergeometric_hrua.c line 99]
+
+    X, Y are independent uniforms; X is restricted to [xtail, 1] because
+    W blows up as X -> 0 (those draws are rejected by the W >= d11 test).
+    """
+    c   = _hrua_constants(N, K, n)
+    rnd = FP_TO_FPTAYLOR_RND[fp]
+
+    return (
+        "Variables\n"
+        f"  real X in [{xtail:.20e}, 1.0],\n"
+        f"  real Y in [0.0, 1.0];\n\n"
+        "Definitions\n"
+        f"  d6_ = {c['d6']:.20e},\n"
+        f"  d8_ = {c['d8']:.20e},\n"
+        f"  w_step {rnd}= d6_ + d8_ * (Y - 0.5) / X;\n\n"
+        "Expressions\n"
+        "  eps_w = w_step;\n"
+    )
+
+
+def make_hrua_accept_template(N, K, n, fp, xtail):
+    """
+    FPTaylor expression for eps_accept: absolute error of the acceptance
+    test  2*log(X) <= T  written as a single expression
+
+        2*log(X) - T,   T = d10 - (loggam(Z+1) + loggam(mingoodbad-Z+1)
+                                   + loggam(m-Z+1) + loggam(maxgoodbad-m+Z+1))
+                                             [hypergeometric_hrua.c line 117]
+
+    lgamma is approximated by inlining random_loggam's x >= 7 Stirling
+    branch, so Z is restricted to the range where all four arguments are
+    >= 7 (same restriction as the BTRS/PTRS analyses).
+    """
+    c   = _hrua_constants(N, K, n)
+    rnd = FP_TO_FPTAYLOR_RND[fp]
+    mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
+
+    # Z = floor(W) in [0, d11 - 1]; narrow to keep every loggam argument >= 7
+    z_lo = float(max(0, 6, 6 - (Mgb - m)))
+    z_hi = float(min(int(c["d11"]) - 1, mgb - 6, m - 6))
+    if z_lo > z_hi:
+        raise RuntimeError(
+            f"N={N} K={K} n={n}: no Z range with all loggam arguments >= 7 "
+            f"(z_lo={z_lo}, z_hi={z_hi}); HRUA analysis not applicable")
+
+    defs_z,  name_z  = loggam_defs("Z + 1.0", "lgz", rnd)
+    defs_mz, name_mz = loggam_defs(f"{float(mgb):.1f} - Z + 1.0", "lgmz", rnd)
+    defs_kz, name_kz = loggam_defs(f"{float(m):.1f} - Z + 1.0", "lgkz", rnd)
+    defs_Mz, name_Mz = loggam_defs(f"{float(Mgb - m):.1f} + Z + 1.0", "lgMz", rnd)
+
+    return (
+        "Variables\n"
+        f"  real X in [{xtail:.20e}, 1.0],\n"
+        f"  real Z in [{z_lo:.1f}, {z_hi:.1f}];\n\n"
+        "Definitions\n"
+        f"  d10_ = {c['d10']:.20e},\n"
+        + "\n".join(defs_z)  + "\n"
+        + "\n".join(defs_mz) + "\n"
+        + "\n".join(defs_kz) + "\n"
+        + "\n".join(defs_Mz) + "\n"
+        + f"  hrua_accept {rnd}= 2.0 * log(X) - d10_"
+          f" + {name_z} + {name_mz} + {name_kz} + {name_Mz};\n\n"
+        + "Expressions\n"
+          "  eps_accept = hrua_accept;\n"
+    )
+
+
+def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env, verbose):
+    """Run both HRUA FPTaylor queries and return (eps_w, eps_accept, tv)."""
+    xtail = 1e-3
+
+    w_input  = inputs_dir  / f"hypergeometric_hrua_w_{fp}_{tag}.txt"
+    w_output = outputs_dir / f"hypergeometric_hrua_w_{fp}_{tag}.out"
+    w_input.write_text(make_hrua_w_template(N, K, n, fp, xtail))
+
+    code, output = run_command([fptaylor, str(w_input)], cwd=ROOT, env=env)
+    w_output.write_text(output)
+    if verbose:
+        print(f"--- FPTaylor HRUA W (N={N} K={K} n={n}) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor HRUA W failed for N={N} K={K} n={n}; see {w_output}")
+    eps_w = extract_abs_errors_by_problem(output)["eps_w"]
+
+    accept_input  = inputs_dir  / f"hypergeometric_hrua_accept_{fp}_{tag}.txt"
+    accept_output = outputs_dir / f"hypergeometric_hrua_accept_{fp}_{tag}.out"
+    accept_input.write_text(make_hrua_accept_template(N, K, n, fp, xtail))
+
+    code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
+    accept_output.write_text(output)
+    if verbose:
+        print(f"--- FPTaylor HRUA accept (N={N} K={K} n={n}) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor HRUA accept failed for N={N} K={K} n={n}; see {accept_output}")
+    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"]
+
+    tv = 2 * (eps_w + 1.5 * eps_accept)
+    return eps_w, eps_accept, tv
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _use_hrua(N, K, n):
+    """
+    numpy's regime dispatch (random_hypergeometric):
+        (sample >= 10) && (sample <= good + bad - 10)  ->  HRUA
+        otherwise                                      ->  HYP
+    with good + bad = popsize = N.
+    """
+    good, bad = K, N - K
+    sample = n
+    return sample >= _HRUA_SWITCH and sample <= good + bad - _HRUA_SWITCH
+
 
 def safe_triple_name(N, K, n):
     return f"N{N}_K{K}_n{n}"
@@ -138,7 +296,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
         if sample == 0 or d2 == 0:
             delta, tv = 0.0, 0.0
             rows.append({
-                "N": N, "K": K, "n": n,
+                "N": N, "K": K, "n": n, "regime": "degenerate",
                 "delta": f"{delta:.17e}",
                 "tv":    f"{tv:.17e}",
             })
@@ -147,6 +305,25 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
         try:
             tag = safe_triple_name(N, K, n)
+
+            # ---- HRUA regime ----
+            if _use_hrua(N, K, n):
+                eps_w, eps_accept, tv = _run_hrua_fptaylor(
+                    fptaylor, N, K, n, args.fp, tag, inputs_dir, outputs_dir,
+                    env, args.verbose,
+                )
+                rows.append({
+                    "N": N, "K": K, "n": n, "regime": "hrua",
+                    "delta": "nan",
+                    "eps_w":      f"{eps_w:.17e}",
+                    "eps_accept": f"{eps_accept:.17e}",
+                    "tv":         f"{tv:.17e}",
+                })
+                print(f"N={N} K={K} n={n} [HRUA] eps_w={eps_w:.6e}"
+                      f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
+                continue
+
+            # ---- HYP regime ----
             input_path = inputs_dir / f"hypergeometric_{args.fp}_{tag}.txt"
             input_path.write_text(make_template(N, K, n, args.fp))
 
@@ -170,8 +347,9 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             tv    = 2 * sample * delta
 
             rows.append({
-                "N": N, "K": K, "n": n,
+                "N": N, "K": K, "n": n, "regime": "hyp",
                 "delta": f"{delta:.17e}",
+                "eps_w": "nan", "eps_accept": "nan",
                 "tv":    f"{tv:.17e}",
             })
             print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}")
