@@ -106,8 +106,9 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
     slam = math.sqrt(lam)
     b = 0.931 + 2.53 * slam
+    a = -0.059 + 0.02483 * b
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
-    utail = 1e-5
+    utail = 1e-3
     vtail = 1e-10
 
     floor_input  = inputs_dir  / f"poisson_ptrs_floor_{fp}_{tag}.txt"
@@ -121,7 +122,17 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     if code != 0:
         raise RuntimeError(f"FPTaylor PTRS floor failed for lambda={lam}; see {floor_output}")
 
-    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + 2 * utail
+    # Tail term: the FPTaylor floor bound only covers |u| <= 1/2 - utail.
+    # Outside that slab the exact floor (2a/us + b)*u + c can only be reached
+    # by K deviating from the mean lambda by at least s_eta, so bound its
+    # probability with Bernstein's inequality (variance sigma^2 = lambda):
+    #   t_eta = (2a/utail + b) * (1/2 - utail),  s_eta = t_eta - 1/2
+    #   P(|K - lambda| >= s_eta) <= 2 exp(-s_eta^2 / (2 (sigma^2 + s_eta/3)))
+    t_eta = (2.0 * a / utail + b) * (0.5 - utail)
+    s_eta = t_eta - 0.5
+    u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (lam + s_eta / 3.0)))
+
+    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + u_tail_prob
 
     accept_input  = inputs_dir  / f"poisson_ptrs_accept_{fp}_{tag}.txt"
     accept_output = outputs_dir / f"poisson_ptrs_accept_{fp}_{tag}.out"

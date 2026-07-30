@@ -155,8 +155,9 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
     q    = 1.0 - p
     spq  = math.sqrt(n * p * q)
     b    = 1.15 + 2.53 * spq
+    a    = -0.0873 + 0.0248 * b + 0.01 * p
     alpha = (2.83 + 5.1 / b) * spq
-    utail = 1e-5
+    utail = 1e-3
     vtail = 1e-10
 
     floor_input  = inputs_dir  / f"binomial_btrs_floor_{fp}_{tag}.txt"
@@ -170,7 +171,17 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
     if code != 0:
         raise RuntimeError(f"FPTaylor BTRS floor failed for n={n}, p={p}; see {floor_output}")
 
-    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + 2 * utail
+    # Tail term: the FPTaylor floor bound only covers |u| <= 1/2 - utail.
+    # Outside that slab the exact floor (2a/us + b)*u + c can only be reached
+    # by K deviating from the mean np by at least s_eta, so bound its
+    # probability with Bernstein's inequality (variance sigma^2 = n*p*q):
+    #   t_eta = (2a/utail + b) * (1/2 - utail),  s_eta = t_eta - 1/2
+    #   P(|K - np| >= s_eta) <= 2 exp(-s_eta^2 / (2 (sigma^2 + s_eta/3)))
+    t_eta = (2.0 * a / utail + b) * (0.5 - utail)
+    s_eta = t_eta - 0.5
+    u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (n * p * q + s_eta / 3.0)))
+
+    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + u_tail_prob
 
     accept_input  = inputs_dir  / f"binomial_btrs_accept_{fp}_{tag}.txt"
     accept_output = outputs_dir / f"binomial_btrs_accept_{fp}_{tag}.out"
