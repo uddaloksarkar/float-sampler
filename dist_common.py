@@ -102,6 +102,23 @@ def run_command(cmd, cwd=None, env=None):
 
 
 # ---------------------------------------------------------------------------
+# Verbosity
+# ---------------------------------------------------------------------------
+#   -v  (verbose >= 1): internal parameters derived per problem
+#   -vv (verbose >= 2): full FPTaylor / CIRE / Gelpia output
+
+def vprint(verbose, label, **values):
+    """Level-1 trace of the internal parameters a template was built from."""
+    if verbose < 1:
+        return
+    body = "  ".join(
+        f"{k}={v:.12g}" if isinstance(v, float) else f"{k}={v}"
+        for k, v in values.items()
+    )
+    print(f"[{label}] {body}")
+
+
+# ---------------------------------------------------------------------------
 # CIRE runner and output parser
 # ---------------------------------------------------------------------------
 
@@ -140,7 +157,7 @@ def run_cire_llvm(cire_bin, c_code, func_name, domains, tag, inputs_dir, outputs
     ret, output = run_command(cmd)
     out_path.write_text(output)
 
-    if verbose:
+    if verbose >= 2:
         print(f"--- CIRE {tag}/{func_name} ---\n{output}")
     return ret, output
 
@@ -281,8 +298,11 @@ def add_common_args(parser):
                         help="Also save the plot in PGF format")
     parser.add_argument("--plot-file", type=Path, default=None,
                         help="Plot output path (default: <out-dir>/tv_vs_param.png)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Print FPTaylor/Gelpia output to stdout")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="Increase verbosity: -v prints the internal "
+                             "parameters derived per problem (interval "
+                             "bounds, sampler constants), -vv also prints the "
+                             "full FPTaylor/CIRE/Gelpia output to stdout")
     parser.add_argument("--cache", action="store_true",
                         help="If summary.csv already exists in out-dir, load it and skip re-running")
 
@@ -362,7 +382,7 @@ def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose):
 
     code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
     out_path.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor log(v) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor log(v) failed; see {out_path}")
@@ -399,13 +419,13 @@ def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose):
     if key in _LOGUS_EPS_CACHE:
         return _LOGUS_EPS_CACHE[key]
 
-    input_path = inputs_dir  / f"logus_{fp}.txt"
-    out_path   = outputs_dir / f"logus_{fp}.out"
+    input_path = inputs_dir  / f"logus_{fp}_{utail:.3e}.txt"
+    out_path   = outputs_dir / f"logus_{fp}_{utail:.3e}.out"
     input_path.write_text(make_logus_template(fp, utail))
 
     code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
     out_path.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor log(us) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor log(us) failed; see {out_path}")

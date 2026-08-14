@@ -146,7 +146,7 @@ def _run_fptaylor_geometric(fptaylor, p, tag, args, inputs_dir, outputs_dir, env
     )
     out_path = outputs_dir / f"geometric_{args.fp}_{tag}.out"
     out_path.write_text(output)
-    if args.verbose:
+    if args.verbose >= 2:
         print(f"--- FPTaylor geometric (p={p}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor failed for p={p}; see {out_path}")

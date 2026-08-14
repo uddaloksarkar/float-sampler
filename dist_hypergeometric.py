@@ -100,21 +100,61 @@ def _hrua_constants(N, K, n):
                 m=m, d6=d6, d7=d7, d8=d8, d10=d10, d11=d11)
 
 
-def make_hrua_w_template(N, K, n, fp, xtail):
+def hrua_xtail(N, K, n, ulps=8.0):
+    """
+    The X cutoff that minimizes the total eps_w error budget.
+
+    Restricting X to [xtail, 1] trades two terms against each other.  A draw
+    survives the fast rejection  (W < 0) || (W >= d11)  iff
+
+        -d6*X/d8  <=  Y - 0.5  <  (d11 - d6)*X/d8            [line 99-105]
+
+    so P(survive | X) = min(1, d11*X/d8) -- linear in X, never zero.  Cutting
+    the domain at xtail therefore discards surviving draws with probability
+
+        eps_tail(x) = int_0^x d11*t/d8 dt = d11 * x^2 / (2*d8)     (quadratic)
+
+    while the analysis error grows as the worst case |W| = d6 + d8/(2x):
+
+        eps_w(x) ~ rho * d8 / (2x),  rho ~ `ulps` * 2^-53           (hyperbolic)
+
+    rho is the measured relative error of the FPTaylor bound, flat at ~6e-16
+    (about 5 ulps) over 24 decades of xtail; `ulps` defaults to 8 for margin.
+    Minimizing the sum gives x* = (rho * d8^2 / (2*d11))^(1/3).
+
+    The hyperbolic term is an artifact of the analysis box: FPTaylor treats X
+    and Y as independent and so evaluates at |Y-0.5| = 0.5, where the real
+    algorithm would already have rejected the draw.  A joint constraint on
+    (X, Y) would remove it, at which point xtail could go much lower.
+
+    Returns (xtail, eps_w_estimate, eps_tail).
+    """
+    c = _hrua_constants(N, K, n)
+    d6, d8, d11 = c["d6"], c["d8"], c["d11"]
+    rho = ulps * 2.0 ** -53
+    xtail = (rho * d8 * d8 / (2.0 * d11)) ** (1.0 / 3.0)
+    return xtail, rho * (d6 + d8 / (2.0 * xtail)), d11 * xtail ** 2 / (2.0 * d8)
+
+
+def make_hrua_w_template(N, K, n, fp, xtail, xhi=1.0):
     """
     FPTaylor expression for eps_w: absolute error of the candidate
 
         W = d6 + d8 * (Y - 0.5) / X          [hypergeometric_hrua.c line 99]
 
-    X, Y are independent uniforms; X is restricted to [xtail, 1] because
+    X, Y are independent uniforms; X is restricted to [xtail, xhi] because
     W blows up as X -> 0 (those draws are rejected by the W >= d11 test).
+
+    xhi exists so logbb.log_bb can ask for a sub-box of X: FPTaylor's bound
+    here degrades with the endpoint ratio xhi/xtail, so the domain has to be
+    split geometrically once xtail drops much below 1e-3.
     """
     c   = _hrua_constants(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]
 
     return (
         "Variables\n"
-        f"  real X in [{xtail:.20e}, 1.0],\n"
+        f"  real X in [{xtail:.20e}, {xhi:.20e}],\n"
         f"  real Y in [0.0, 1.0];\n\n"
         "Definitions\n"
         f"  d6_ = {c['d6']:.20e},\n"
@@ -125,7 +165,7 @@ def make_hrua_w_template(N, K, n, fp, xtail):
     )
 
 
-def make_hrua_accept_template(N, K, n, fp, xtail):
+def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     """
     FPTaylor expression for eps_accept: absolute error of the acceptance
     test  2*log(X) <= T  written as a single expression
@@ -157,7 +197,7 @@ def make_hrua_accept_template(N, K, n, fp, xtail):
 
     return (
         "Variables\n"
-        f"  real X in [{xtail:.20e}, 1.0],\n"
+        f"  real X in [{xtail:.20e}, {xhi:.20e}],\n"
         f"  real Z in [{z_lo:.1f}, {z_hi:.1f}];\n\n"
         "Definitions\n"
         f"  d10_ = {c['d10']:.20e},\n"
@@ -174,7 +214,7 @@ def make_hrua_accept_template(N, K, n, fp, xtail):
 
 def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env, verbose):
     """Run both HRUA FPTaylor queries and return (eps_w, eps_accept, tv)."""
-    xtail = 1e-3
+    xtail = 1e-4
 
     w_input  = inputs_dir  / f"hypergeometric_hrua_w_{fp}_{tag}.txt"
     w_output = outputs_dir / f"hypergeometric_hrua_w_{fp}_{tag}.out"
@@ -182,7 +222,7 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
 
     code, output = run_command([fptaylor, str(w_input)], cwd=ROOT, env=env)
     w_output.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor HRUA W (N={N} K={K} n={n}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor HRUA W failed for N={N} K={K} n={n}; see {w_output}")
@@ -194,7 +234,7 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
 
     code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
     accept_output.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor HRUA accept (N={N} K={K} n={n}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor HRUA accept failed for N={N} K={K} n={n}; see {accept_output}")
@@ -333,7 +373,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             )
             out_path = outputs_dir / f"hypergeometric_{args.fp}_{tag}.out"
             out_path.write_text(output)
-            if args.verbose:
+            if args.verbose >= 2:
                 print(f"--- FPTaylor hypergeometric (N={N} K={K} n={n}) ---\n{output}")
             if code != 0:
                 raise RuntimeError(

@@ -117,7 +117,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
 
     code, output = run_command([fptaylor, str(floor_input)], cwd=ROOT, env=env)
     floor_output.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor PTRS floor (lambda={lam}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor PTRS floor failed for lambda={lam}; see {floor_output}")
@@ -134,7 +134,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
 
     code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
     accept_output.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor PTRS accept (lambda={lam}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor PTRS accept failed for lambda={lam}; see {accept_output}")
@@ -283,7 +283,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
                 out_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
                 out_path.write_text(output)
-                if args.verbose:
+                if args.verbose >= 2:
                     print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
                 if code != 0:
                     raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {out_path}")

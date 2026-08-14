@@ -17,7 +17,7 @@ Common options (shared by all distributions):
   --plot-components include error component series
   --plot-pgf        also save PGF
   --plot-file PATH
-  -v / --verbose
+  -v / -vv          -v: internal parameters per problem, -vv: + tool output
 
 To add a new distribution:
   1. Create dist_<name>.py exporting NAME, CSV_FIELDS,
@@ -37,12 +37,14 @@ from dist_common import (
 
 import dist_binomial
 import dist_poisson
+import dist_poisson_stable
 import dist_geometric
 import dist_hypergeometric
 import dist_zipf
 
 DISTRIBUTIONS = {
     dist_poisson.NAME:       dist_poisson,
+    dist_poisson_stable.NAME: dist_poisson_stable,
     dist_binomial.NAME:      dist_binomial,
     dist_geometric.NAME:     dist_geometric,
     dist_hypergeometric.NAME: dist_hypergeometric,

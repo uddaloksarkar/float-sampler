@@ -10,7 +10,7 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
-    loggam_defs, eps_logv, eps_logus,
+    loggam_defs, eps_logv, eps_logus, vprint,
 )
 
 NAME = "binomial"
@@ -22,6 +22,17 @@ _BTRS_SWITCH = 30.0   # n*p threshold: inversion below, BTRS above
 # ---------------------------------------------------------------------------
 # FPTaylor template
 # ---------------------------------------------------------------------------
+
+def inversion_params(n, p):
+    """(qn, z_lo, x_hi): the interval bounds the inversion templates use."""
+    q = 1.0 - p
+    qn_raw = math.exp(n * math.log(q))
+    qn = max(qn_raw, sys.float_info.min)
+    z_lo = max(min(qn_raw, math.exp(-22) / math.sqrt(2 * math.pi * n * p * q)),
+               sys.float_info.min)
+    x_hi = min(float(n), n * p + 10.0 * math.sqrt(n * p * q))
+    return qn, z_lo, x_hi
+
 
 def make_template(n, p, fp):
     """
@@ -37,12 +48,7 @@ def make_template(n, p, fp):
       eps1 : rel. error of px = z * (n - X + 1) * p / (X * q)
       eps2 : rel. error of sum + prod
     """
-    q = 1.0 - p
-    qn_raw = math.exp(n * math.log(q))
-    qn = max(qn_raw, sys.float_info.min)
-    z_lo = max(min(qn_raw, math.exp(-22) / math.sqrt(2 * math.pi * n * p * q)),
-               sys.float_info.min)
-    x_hi = min(float(n), n * p + 10.0 * math.sqrt(n * p * q))
+    qn, z_lo, x_hi = inversion_params(n, p)
     rnd = FP_TO_FPTAYLOR_RND[fp]
 
     return (
@@ -69,7 +75,60 @@ def make_template(n, p, fp):
 # BTRS FPTaylor template  (n*p >= _BTRS_SWITCH)
 # ---------------------------------------------------------------------------
 
-def make_btrs_floor_template(n, p, fp, utail):
+def btrs_u_range(n, p, slack=1.0):
+    """
+    (u_lo, u_hi): the u values that can reach the acceptance test.
+
+    btrs.c draws u in [-0.5, 0.5) and rejects outright unless
+        k = floor(y(u)),   y(u) = (2*a/us + b)*u + c,   us = 0.5 - |u|
+    lands in [0, n]                                  [btrs.c lines 58-64].
+    Real and FP evaluation of y differ by at most eps_floor << 1, so floor
+    can disagree by at most one integer: it is enough to enclose the u with
+    k in [-1, n+1], i.e. y in [-1, n+2).  Outside that window both samplers
+    reject, so those u contribute nothing to the total variation.
+
+    Writing t = us, y = +-(a/t - 2*a + 0.5*b - b*t) + c, so each boundary is
+    the positive root of  b*t^2 + beta*t - a = 0  with
+
+        beta = 2*a - 0.5*b + (n + 1 + slack - c)     u > 0, y = n + 1 + slack
+        beta = 2*a - 0.5*b + (c + slack)             u < 0, y = -slack
+
+    In the BTRS regime a, b > 0, so y is monotone in t on each side of 0
+    (dy/dt = -+(a/t^2 + b)) and each quadratic has exactly one positive root
+    -- taken in the cancellation-free form 2*a / (beta + sqrt(disc)).
+    """
+    q   = 1.0 - p
+    spq = math.sqrt(n * p * q)
+    b   = 1.15 + 2.53 * spq
+    a   = -0.0873 + 0.0248 * b + 0.01 * p
+    c   = n * p + 0.5
+    if a <= 0.0:
+        raise ValueError(f"BTRS shape constant a = {a:.6g} <= 0 "
+                         f"(n*p*q = {n * p * q:.6g} too small); "
+                         "the reachable u range is not a single interval")
+
+    def us_min(gamma):
+        beta = 2.0 * a - 0.5 * b + gamma
+        t = 2.0 * a / (beta + math.sqrt(beta * beta + 4.0 * a * b))
+        # y is extremely steep at the boundary (dy/dt = -+(a/t^2 + b)), so shave
+        # a relative 1e-12 off t: rounding in this solve can then only widen the
+        # enclosure, never clip a reachable u.  t <= 0.5 since u = 0 (t = 0.5)
+        # always satisfies -1 <= c <= n + 2.
+        return min(t * (1.0 - 1e-12), 0.5)
+
+    return -(0.5 - us_min(c + slack)), 0.5 - us_min(n + 1.0 + slack - c)
+
+
+def btrs_k_range(n, p):
+    """(k_lo, k_hi) for the accept template; k_lo >= 6 so that k+1 >= 7
+    (the Stirling branch of random_loggam is only valid there)."""
+    spq = math.sqrt(n * p * (1.0 - p))
+    m   = int(math.floor((n + 1) * p))
+    return (float(max(6,   int(m - 10 * spq))),
+            float(min(n - 1, int(math.ceil(m + 10 * spq)))))
+
+
+def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
     """
     FPTaylor expression for eps_floor: absolute error of
     (2*a/us + b)*u + c, with us = 0.5 - |u|          [btrs.c line 61]
@@ -82,7 +141,7 @@ def make_btrs_floor_template(n, p, fp, utail):
 
     return (
         "Variables\n"
-        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}];\n\n"
+        f"  real u in [{u_lo:.20e}, {u_hi:.20e}];\n\n"
         "Definitions\n"
         f"  a_  = {a:.20e},\n"
         f"  b_  = {b:.20e},\n"
@@ -94,7 +153,7 @@ def make_btrs_floor_template(n, p, fp, utail):
     )
 
 
-def make_btrs_accept_template(n, p, fp, utail, fast=False):
+def make_btrs_accept_template(n, p, fp, u_lo, u_hi, fast=False):
     """
     FPTaylor expression for eps_accept (excluding -log(v), see
     make_logv_template): absolute error of
@@ -117,9 +176,7 @@ def make_btrs_accept_template(n, p, fp, utail, fast=False):
     lpq   = math.log(p / q)
     rnd   = FP_TO_FPTAYLOR_RND[fp]
 
-    # k_lo >= 6 so that k+1 >= 7 (Stirling branch valid)
-    k_lo = float(max(6,   int(m - 10 * spq)))
-    k_hi = float(min(n-1, int(math.ceil(m + 10 * spq))))
+    k_lo, k_hi = btrs_k_range(n, p)
 
     # Build loggam Definitions for k+1 and n-k+1
     defs_k,  name_k  = loggam_defs("k + 1.0",           "lgk",  rnd)
@@ -129,7 +186,7 @@ def make_btrs_accept_template(n, p, fp, utail, fast=False):
 
     return (
         "Variables\n"
-        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}],\n"
+        f"  real u in [{u_lo:.20e}, {u_hi:.20e}],\n"
         f"  real k in [{k_lo:.1f}, {k_hi:.1f}];\n\n"
         "Definitions\n"
         f"  a_     = {a:.20e},\n"
@@ -157,33 +214,38 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
     b    = 1.15 + 2.53 * spq
     a    = -0.0873 + 0.0248 * b + 0.01 * p
     alpha = (2.83 + 5.1 / b) * spq
-    utail = 1e-3
+    u_lo, u_hi = btrs_u_range(n, p)
+    us_min = min(0.5 - u_hi, 0.5 + u_lo)
     vtail = 1e-10
+
+    k_lo, k_hi = btrs_k_range(n, p)
+    vprint(verbose, f"binomial BTRS n={n} p={p}",
+           spq=spq, a=a, b=b, c=n * p + 0.5, alpha=alpha,
+           u_lo=u_lo, u_hi=u_hi, us_min=us_min,
+           k_lo=k_lo, k_hi=k_hi, vtail=vtail)
 
     floor_input  = inputs_dir  / f"binomial_btrs_floor_{fp}_{tag}.txt"
     floor_output = outputs_dir / f"binomial_btrs_floor_{fp}_{tag}.out"
-    floor_input.write_text(make_btrs_floor_template(n, p, fp, utail))
+    floor_input.write_text(make_btrs_floor_template(n, p, fp, u_lo, u_hi))
 
     code, output = run_command([fptaylor, str(floor_input)], cwd=ROOT, env=env)
     floor_output.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor BTRS floor (n={n}, p={p}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor BTRS floor failed for n={n}, p={p}; see {floor_output}")
 
-    t_eta = (2.0 * a / utail + b) * (0.5 - utail)
-    s_eta = t_eta - 0.5
-    u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (n * p * q + s_eta / 3.0)))
-
-    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + u_tail_prob
+    # No u-tail probability to add: [u_lo, u_hi] is the reachable range, and
+    # every u outside it is rejected by both the real and the FP sampler.
+    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"]
 
     accept_input  = inputs_dir  / f"binomial_btrs_accept_{fp}_{tag}.txt"
     accept_output = outputs_dir / f"binomial_btrs_accept_{fp}_{tag}.out"
-    accept_input.write_text(make_btrs_accept_template(n, p, fp, utail, fast=fast))
+    accept_input.write_text(make_btrs_accept_template(n, p, fp, u_lo, u_hi, fast=fast))
 
     code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
     accept_output.write_text(output)
-    if verbose:
+    if verbose >= 2:
         print(f"--- FPTaylor BTRS accept (n={n}, p={p}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor BTRS accept failed for n={n}, p={p}; see {accept_output}")
@@ -192,8 +254,10 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
         fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     )
     if fast:
+        # the -2*log(us) query only sees us, so the smaller of the two tails
+        # (a superset of the reachable us range) is the right bound to pass
         eps_accept += eps_logus(
-            fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
+            fptaylor, fp, us_min, inputs_dir, outputs_dir, env, verbose,
         )
 
     accept_iter = alpha / (math.sqrt(2 * math.pi) * spq)  # btrs is renormalized by the modal pmf f(m) = B(m) ~ 1/(sqrt(2*pi)*spq), so the per-iteration acceptance prob is 1/(alpha*f(m)).
@@ -220,11 +284,7 @@ double binom_eps2(double s, double pr) { return s + pr; }
 def _run_cire(cire, n, p, args, inputs_dir, outputs_dir):
     """Return (eps0, eps1, eps2) relative errors via CIRE absolute errors."""
     q = 1.0 - p
-    qn_raw = math.exp(n * math.log(q))
-    qn = max(qn_raw, sys.float_info.min)
-    z_lo = max(min(qn_raw, math.exp(-22) / math.sqrt(2 * math.pi * n * p * q)),
-               sys.float_info.min)
-    x_hi = min(float(n), n * p + 10.0 * math.sqrt(n * p * q))
+    qn, z_lo, x_hi = inversion_params(n, p)
 
     tag = safe_pair_name(n, p)
 
@@ -354,8 +414,11 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                       f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
             elif args.backend == "cire":
                 # ---- inversion regime, CIRE ----
-                eps0, eps1, eps2 = _run_cire(fptaylor, n, p, args, inputs_dir, outputs_dir)
+                qn, z_lo, x_hi = inversion_params(n, p)
                 bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
+                vprint(args.verbose, f"binomial inversion n={n} p={p}",
+                       qn=qn, z_lo=z_lo, x_hi=x_hi, bound=bound)
+                eps0, eps1, eps2 = _run_cire(fptaylor, n, p, args, inputs_dir, outputs_dir)
                 tv = 0.5 * (eps0 + eps1 * p + eps2 * bound)
                 rows.append({
                     "n": n, "p": f"{p:.17g}", "regime": "inversion",
@@ -366,6 +429,10 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 print(f"n={n} p={p} eps0={eps0:.6e} eps1={eps1:.6e} eps2={eps2:.6e} TV={tv:.6e}")
             else:
                 # ---- inversion regime, FPTaylor ----
+                qn, z_lo, x_hi = inversion_params(n, p)
+                bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
+                vprint(args.verbose, f"binomial inversion n={n} p={p}",
+                       qn=qn, z_lo=z_lo, x_hi=x_hi, bound=bound)
                 input_path = inputs_dir / f"binomial_inversion_{args.fp}_{tag}.txt"
                 input_path.write_text(make_template(n, p, args.fp))
                 code, output = run_command(
@@ -374,13 +441,12 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 )
                 out_path = outputs_dir / f"binomial_inversion_{args.fp}_{tag}.out"
                 out_path.write_text(output)
-                if args.verbose:
+                if args.verbose >= 2:
                     print(f"--- FPTaylor binomial_inversion (n={n}, p={p}) ---\n{output}")
                 if code != 0:
                     raise RuntimeError(f"FPTaylor failed for n={n}, p={p}; see {out_path}")
                 deltas = extract_deltas_by_problem(output, f"n={n} p={p}")
                 eps0, eps1, eps2 = deltas["eps0"], deltas["eps1"], deltas["eps2"]
-                bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
                 tv = 0.5 * (eps0 + eps1 * p + eps2 * bound)
                 rows.append({
                     "n": n, "p": f"{p:.17g}", "regime": "inversion",
