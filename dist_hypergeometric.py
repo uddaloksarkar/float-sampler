@@ -14,7 +14,7 @@ from pathlib import Path
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
-    save_loglog_plot, loggam_defs,
+    save_loglog_plot, loggam_defs, vprint,
 )
 
 NAME = "hypergeometric"
@@ -136,6 +136,68 @@ def hrua_xtail(N, K, n, ulps=8.0):
     return xtail, rho * (d6 + d8 / (2.0 * xtail)), d11 * xtail ** 2 / (2.0 * d8)
 
 
+def hrua_setup_defs(N, K, n, rnd, exact=False, prefix=""):
+    """
+    random_hypergeometric_hrua's setup block [hypergeometric_hrua.c lines
+    85-92] as FPTaylor Definitions.  d4..d8 are derived from the integer
+    parameters, not free inputs, so they are written as expressions: that
+    charges the rounding of the setup arithmetic, which embedding them as
+    literals silently drops.
+
+    mingoodbad, maxgoodbad, popsize and m are integer-valued and exact, so
+    they stay literals.  exact=True drops the rounding markers, for the
+    copies that feed Z (see hrua_z_defs).
+    """
+    c = _hrua_constants(N, K, n)
+    r = "=" if exact else f"{rnd}="
+    P, M, mgb = c["popsize"], c["m"], c["mingoodbad"]
+    return [
+        f"  {prefix}d4_ {r} {float(mgb):.1f} / {float(P):.1f},",
+        f"  {prefix}d5_ {r} 1.0 - {prefix}d4_,",
+        f"  {prefix}d6_ {r} {float(M):.1f} * {prefix}d4_ + 0.5,",
+        f"  {prefix}d7_ {r} sqrt({float(P - M):.1f} * {float(n):.1f}"
+        f" * {prefix}d4_ * {prefix}d5_ / {float(P - 1):.1f} + 0.5),",
+        f"  {prefix}d8_ {r} {_D1:.20e} * {prefix}d7_ + {_D2:.20e},",
+    ]
+
+
+def hrua_z_range(N, K, n):
+    """
+    Z = floor(W) lives in [0, d11 - 1]; narrow it to keep every inlined
+    loggam argument >= 7.  Z = W - f only guarantees Z > W_lo - 1, so the
+    template's W window starts one above z_lo.
+    """
+    c = _hrua_constants(N, K, n)
+    mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
+    z_lo = float(max(0, 6, 6 - (Mgb - m)))
+    z_hi = float(min(int(c["d11"]) - 1, mgb - 6, m - 6))
+    if z_lo >= z_hi:
+        raise RuntimeError(
+            f"N={N} K={K} n={n}: no Z range with all loggam arguments >= 7 "
+            f"(z_lo={z_lo}, z_hi={z_hi}); HRUA analysis not applicable")
+    return z_lo, z_hi
+
+
+def hrua_z_defs():
+    """
+    Z = floor(W) as exact (unrounded) Definitions.
+
+    W = d6 + d8*(Y - 0.5)/X is a *derived* quantity, so Z must not be a free
+    variable.  But the reachable region is a bowtie in (X, Y) -- the sampler
+    rejects W < 0 and W >= d11 before ever forming Z, and no box in (X, Y)
+    excludes those -- which leaves FPTaylor's conservative range for Z
+    spanning zero, tripping its division-by-zero check on 1/(Z+1).
+
+    For fixed X the map Y -> W is affine and invertible, so (X, W) describes
+    exactly the same draws as (X, Y) and there the reachable region *is* a
+    box.  The template therefore takes W as the second variable and recovers
+    Y from it.  As in the BTRS/PTRS templates, these definitions carry no
+    rounding: Z is one integer, computed once, and both samplers feed the
+    same integer into the acceptance test.
+    """
+    return ["  Z_  = W - f,", "  Z1_ = Z_ + 1.0,"]
+
+
 def make_hrua_w_template(N, K, n, fp, xtail, xhi=1.0):
     """
     FPTaylor expression for eps_w: absolute error of the candidate
@@ -149,19 +211,17 @@ def make_hrua_w_template(N, K, n, fp, xtail, xhi=1.0):
     here degrades with the endpoint ratio xhi/xtail, so the domain has to be
     split geometrically once xtail drops much below 1e-3.
     """
-    c   = _hrua_constants(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]
 
     return (
         "Variables\n"
         f"  real X in [{xtail:.20e}, {xhi:.20e}],\n"
         f"  real Y in [0.0, 1.0];\n\n"
-        "Definitions\n"
-        f"  d6_ = {c['d6']:.20e},\n"
-        f"  d8_ = {c['d8']:.20e},\n"
-        f"  w_step {rnd}= d6_ + d8_ * (Y - 0.5) / X;\n\n"
-        "Expressions\n"
-        "  eps_w = w_step;\n"
+        + "Definitions\n"
+        + "\n".join(hrua_setup_defs(N, K, n, rnd)) + "\n"
+        + f"  w_step {rnd}= d6_ + d8_ * (Y - 0.5) / X;\n\n"
+        + "Expressions\n"
+          "  eps_w = w_step;\n"
     )
 
 
@@ -181,26 +241,27 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     c   = _hrua_constants(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
+    z_lo, z_hi = hrua_z_range(N, K, n)
 
-    # Z = floor(W) in [0, d11 - 1]; narrow to keep every loggam argument >= 7
-    z_lo = float(max(0, 6, 6 - (Mgb - m)))
-    z_hi = float(min(int(c["d11"]) - 1, mgb - 6, m - 6))
-    if z_lo > z_hi:
-        raise RuntimeError(
-            f"N={N} K={K} n={n}: no Z range with all loggam arguments >= 7 "
-            f"(z_lo={z_lo}, z_hi={z_hi}); HRUA analysis not applicable")
+    defs_z,  name_z  = loggam_defs("Z1_", "lgz", rnd)
+    defs_mz, name_mz = loggam_defs(f"{float(mgb):.1f} - Z_ + 1.0", "lgmz", rnd)
+    defs_kz, name_kz = loggam_defs(f"{float(m):.1f} - Z_ + 1.0", "lgkz", rnd)
+    defs_Mz, name_Mz = loggam_defs(f"{float(Mgb - m):.1f} + Z_ + 1.0", "lgMz", rnd)
 
-    defs_z,  name_z  = loggam_defs("Z + 1.0", "lgz", rnd)
-    defs_mz, name_mz = loggam_defs(f"{float(mgb):.1f} - Z + 1.0", "lgmz", rnd)
-    defs_kz, name_kz = loggam_defs(f"{float(m):.1f} - Z + 1.0", "lgkz", rnd)
-    defs_Mz, name_Mz = loggam_defs(f"{float(Mgb - m):.1f} + Z + 1.0", "lgMz", rnd)
-
+    # W rather than Y is the second variable, and Z = W - f (see hrua_z_defs);
+    # W in [z_lo + 1, z_hi] is what keeps Z inside the loggam domain.
+    d9 = int(math.floor((m + 1) * (mgb + 1) / (c["popsize"] + 2)))
     return (
         "Variables\n"
         f"  real X in [{xtail:.20e}, {xhi:.20e}],\n"
-        f"  real Z in [{z_lo:.1f}, {z_hi:.1f}];\n\n"
-        "Definitions\n"
-        f"  d10_ = {c['d10']:.20e},\n"
+        f"  real W in [{z_lo + 1.0:.1f}, {z_hi:.1f}],\n"
+        f"  real f in [0.0, 1.0];\n\n"
+        + "Definitions\n"
+        + f"  d10_ {rnd}= {math.lgamma(d9 + 1):.20e}"
+          f" + {math.lgamma(mgb - d9 + 1):.20e}"
+          f" + {math.lgamma(m - d9 + 1):.20e}"
+          f" + {math.lgamma(Mgb - m + d9 + 1):.20e},\n"
+        + "\n".join(hrua_z_defs()) + "\n"
         + "\n".join(defs_z)  + "\n"
         + "\n".join(defs_mz) + "\n"
         + "\n".join(defs_kz) + "\n"
@@ -210,6 +271,29 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
         + "Expressions\n"
           "  eps_accept = hrua_accept;\n"
     )
+
+
+def hrua_z_tail_prob(N, K, n):
+    """
+    Chernoff-Hoeffding bound on P(Z outside [z_lo, z_hi]), the output mass
+    the accept query does not cover.  Hoeffding (1963) shows hypergeometric
+    tails are dominated by the binomial ones with the same mean, so the
+    Bernoulli KL bound applies with p = d4 over m draws.
+    """
+    c = _hrua_constants(N, K, n)
+    m, p = c["m"], c["mingoodbad"] / c["popsize"]
+    z_lo, z_hi = hrua_z_range(N, K, n)
+
+    def kl(a):
+        d = a * math.log(a / p) if a > 0.0 else 0.0
+        return d + ((1.0 - a) * math.log((1.0 - a) / (1.0 - p)) if a < 1.0 else 0.0)
+
+    tail = 0.0
+    if z_lo > 0:
+        tail += math.exp(-m * kl(min(z_lo / m, 1.0)))
+    if z_hi < m:
+        tail += math.exp(-m * kl(min(z_hi / m, 1.0)))
+    return tail
 
 
 def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env, verbose):
@@ -238,7 +322,14 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
         print(f"--- FPTaylor HRUA accept (N={N} K={K} n={n}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor HRUA accept failed for N={N} K={K} n={n}; see {accept_output}")
-    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"]
+    # the accept query only covers Z inside the loggam domain; the rest of the
+    # output mass is charged as z_tail
+    z_tail = hrua_z_tail_prob(N, K, n)
+    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"] + z_tail
+    if verbose >= 1:
+        z_lo, z_hi = hrua_z_range(N, K, n)
+        vprint(verbose, f"hypergeometric HRUA N={N} K={K} n={n}",
+               xtail=xtail, z_lo=z_lo, z_hi=z_hi, z_tail=z_tail)
 
     tv = 2 * (eps_w + 1.5 * eps_accept)
     return eps_w, eps_accept, tv

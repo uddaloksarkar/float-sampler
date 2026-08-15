@@ -5,6 +5,8 @@ Main entry point for FP-error analysis of discrete-distribution samplers.
 Usage:
   python main.py poisson   lambdas.txt  [common opts]
   python main.py binomial  pairs.txt    [common opts]
+  python main.py binomial  --n-range 900 1100 --p-range 0.09 0.11   # one bound
+                                                                   # for the box
   python main.py geometric params.txt   [common opts]   # stub
   python main.py hypergeometric ...     [common opts]   # stub
   python main.py zipf ...               [common opts]   # stub
@@ -112,10 +114,11 @@ def main():
     if args.plot:
         plot_path = (args.plot_file or (out_dir / "tv_vs_param.png")).resolve()
         plot_path.parent.mkdir(parents=True, exist_ok=True)
-        mod.write_plot(rows, plot_path,
-                       plot_components=args.plot_components,
-                       plot_pgf=args.plot_pgf)
-        print(f"Wrote plot: {plot_path}")
+        wrote = mod.write_plot(rows, plot_path,
+                               plot_components=args.plot_components,
+                               plot_pgf=args.plot_pgf)
+        if wrote is not False:      # False = the module had nothing to plot
+            print(f"Wrote plot: {plot_path}")
 
 
 if __name__ == "__main__":

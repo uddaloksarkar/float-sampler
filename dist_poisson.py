@@ -14,6 +14,7 @@ from dist_common import (
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus,
+    hormann_u_at, hormann_k_defs,
 )
 
 NAME = "poisson"
@@ -24,33 +25,143 @@ CSV_FIELDS = ["lambda", "fp", "regime", "eps_floor", "eps_accept", "tv", "ref_tv
 # PTRS FPTaylor templates  (lambda >= SWITCH)
 # ---------------------------------------------------------------------------
 
+def ptrs_consts(lam):
+    """(slam, a, b, c): the setup constants random_poisson_ptrs computes once."""
+    slam = math.sqrt(lam)
+    b = 0.931 + 2.53 * slam
+    a = -0.059 + 0.02483 * b
+    return slam, a, b, lam + 0.43
+
+
+def ptrs_setup_defs(rnd, lam_expr, accept=False):
+    """
+    random_poisson_ptrs's setup block [lines 77-82] as FPTaylor Definitions.
+    These are derived from lambda, not free inputs, so writing them as
+    expressions keeps them correlated and charges the rounding of the setup
+    arithmetic itself.
+    """
+    d = [f"  slam_ {rnd}= sqrt({lam_expr}),",
+         f"  b_    {rnd}= 0.931 + 2.53 * slam_,",
+         f"  a_    {rnd}= -0.059 + 0.02483 * b_,",
+         f"  c_    {rnd}= {lam_expr} + 0.43,"]
+    if accept:
+        d += [f"  ialp_ {rnd}= 1.1239 + 1.1328 / (b_ - 3.4),",
+              f"  llam_ {rnd}= log({lam_expr}),"]
+    return d
+
+
+def ptrs_k_defs(sign, lam_expr):
+    """k = floor(y) for one sign of u (see dist_common.hormann_k_defs)."""
+    return hormann_k_defs(
+        sign,
+        [f"  slamx_ = sqrt({lam_expr}),",
+         f"  bx_    = 0.931 + 2.53 * slamx_,",
+         f"  ax_    = -0.059 + 0.02483 * bx_,",
+         f"  cx_    = {lam_expr} + 0.43,"],
+        "cx_")
+
+
+# k = floor(y) is modelled as y - f with f in [0, 1], so the window's lower end
+# has to be 7 for k + 1 > 7 (random_loggam's Stirling branch needs x >= 7).
+# 7 is the exact limit of that branch, not a margin -- the previous 8 charged
+# a whole extra k of Poisson mass as k_tail for nothing.
+_K_STIRLING_LO = 7.0
+_K_SIGMAS = 10.0
+
+# V is rk_double(), a multiple of 2^-53 in [0, 1), so the accept test never
+# sees a V strictly between 0 and 2^-53: that is the exact floor of log(V)'s
+# reachable domain, and one grid step is the whole quantisation loss of the
+# V <= threshold test.  The old 1e-10 was an arbitrary cut charging 10^6x more.
+_VTAIL = 2.0 ** -53
+
+
+def ptrs_accept_k_range(lam):
+    """k window the accept query covers: Stirling domain, +-10 sigma bulk."""
+    slam = math.sqrt(lam)
+    k_lo = max(_K_STIRLING_LO, math.ceil(lam - _K_SIGMAS * slam))
+    k_hi = math.floor(lam + _K_SIGMAS * slam)
+    if k_lo >= k_hi:
+        raise ValueError(f"empty accept window k in [{k_lo:.6g}, {k_hi:.6g}] "
+                         f"for lambda={lam:.6g}")
+    return float(k_lo), float(k_hi)
+
+
+def ptrs_accept_u_range(lam):
+    """The u that map into ptrs_accept_k_range."""
+    _, a, b, c = ptrs_consts(lam)
+    k_lo, k_hi = ptrs_accept_k_range(lam)
+    return hormann_u_at(a, b, c, k_lo), hormann_u_at(a, b, c, k_hi)
+
+
+def poisson_cdf_below(lam, k_lo):
+    """
+    P(K < k_lo) for K ~ Poisson(lam), summed term by term in log space.
+
+    Only called with k_lo pinned to the Stirling domain (_K_STIRLING_LO), so
+    this is a handful of terms whatever lam is.  Nudged up by a few ulp to
+    stay an upper bound on the exact tail despite lgamma/exp rounding: it is
+    charged as probability mass, so erring high is the safe direction.
+    """
+    m = int(math.ceil(k_lo)) - 1          # largest integer k with k < k_lo
+    if m < 0:
+        return 0.0
+    loglam = math.log(lam)
+    total = math.fsum(
+        math.exp(-lam + k * loglam - math.lgamma(k + 1.0))
+        for k in range(m + 1)
+    )
+    return total * (1.0 + 1e-12)
+
+
+def ptrs_k_tail_prob(lam):
+    """
+    P(K outside the accept window): the output mass that query does not cover.
+
+    The lower tail is summed exactly -- k_lo is pinned to the Stirling domain,
+    so it is O(1) terms, and the Chernoff bound is badly loose that close to
+    the mode (at lambda=30 it gives 1.1e-5 for a tail that is really 1.2e-6),
+    which made it the dominant term of the whole TV bound.
+
+    The upper tail stays on the Chernoff bound, using the Poisson rate
+    function h(t) = t*log(t) - t + 1, i.e. P(K >= x) <= exp(-lam*h(x/lam)):
+    it sits ~10 sigma out where the bound is already negligible and summing
+    it would cost O(lam) terms.  Bernstein is far too crude this far out --
+    at lambda=50 it gives 2e-6 for a tail that is really ~1e-12, which would
+    then dominate the whole bound.
+    """
+    k_lo, k_hi = ptrs_accept_k_range(lam)
+    if not (k_lo < lam < k_hi):
+        raise ValueError(f"accept window [{k_lo:.6g}, {k_hi:.6g}] does not "
+                         f"contain lambda={lam:.6g}")
+
+    def h(t):
+        return t * math.log(t) - t + 1.0 if t > 0.0 else 1.0
+
+    return poisson_cdf_below(lam, k_lo) + math.exp(-lam * h(k_hi / lam))
+
+
 def make_ptrs_floor_template(lam, fp, utail):
     """
     FPTaylor expression for eps_floor: absolute error of
     (2*a/us + b)*u + (lambda + 0.43), with us = 0.5 - |u|
     [random_poisson_ptrs.c line 89]
-    """
-    slam = math.sqrt(lam)
-    b = 0.931 + 2.53 * slam
-    a = -0.059 + 0.02483 * b
-    c = lam + 0.43
-    rnd = FP_TO_FPTAYLOR_RND[fp]
 
+    Only u is free; a, b, c are expressions in the literal lambda.
+    """
+    rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
         f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}];\n\n"
-        "Definitions\n"
-        f"  a_  = {a:.20e},\n"
-        f"  b_  = {b:.20e},\n"
-        f"  c_  = {c:.20e},\n"
-        f"  us_ {rnd}= 0.5 - abs(u),\n"
-        f"  ptrs_floor {rnd}= (2.0 * a_ / us_ + b_) * u + c_;\n\n"
-        "Expressions\n"
-        "  eps_floor = ptrs_floor;\n"
+        + "Definitions\n"
+        + "\n".join(ptrs_setup_defs(rnd, f"{lam:.20e}")) + "\n"
+        + f"  us_   {rnd}= 0.5 - abs(u),\n"
+        + f"  ptrs_floor {rnd}= (2.0 * a_ / us_ + b_) * u + c_;\n\n"
+        + "Expressions\n"
+          "  eps_floor = ptrs_floor;\n"
     )
 
 
-def make_ptrs_accept_template(lam, fp, utail, fast=False):
+def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     """
     FPTaylor expression for eps_accept (excluding -log(v), see
     dist_common.make_logv_template): absolute error of
@@ -66,37 +177,23 @@ def make_ptrs_accept_template(lam, fp, utail, fast=False):
     by the caller. This drops u as a shared variable between the two terms,
     which may yield a more conservative (looser) overall bound.
     """
-    slam = math.sqrt(lam)
-    b = 0.931 + 2.53 * slam
-    a = -0.059 + 0.02483 * b
-    invalpha = 1.1239 + 1.1328 / (b - 3.4)
-    loglam = math.log(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
-
-    # k_lo >= 6 so that k+1 >= 7 (Stirling branch valid)
-    k_lo = float(max(6, int(lam - 10 * slam)))
-    k_hi = float(int(math.ceil(lam + 10 * slam)))
-
-    defs_k, name_k = loggam_defs("k + 1.0", "lgk", rnd)
-
+    defs_k, name_k = loggam_defs("k1_", "lgk", rnd)
     log_us_term = "" if fast else " - 2.0 * log(us_)"
 
     return (
         "Variables\n"
-        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}],\n"
-        f"  real k in [{k_lo:.1f}, {k_hi:.1f}];\n\n"
-        "Definitions\n"
-        f"  a_        = {a:.20e},\n"
-        f"  b_        = {b:.20e},\n"
-        f"  lam_      = {lam:.20e},\n"
-        f"  loglam_   = {loglam:.20e},\n"
-        f"  invalpha_ = {invalpha:.20e},\n"
+        f"  real u in [{u_lo:.20e}, {u_hi:.20e}],\n"
+        f"  real f in [0.0, 1.0];\n\n"
+        + "Definitions\n"
+        + "\n".join(ptrs_setup_defs(rnd, f"{lam:.20e}", accept=True)) + "\n"
+        + f"  us_    {rnd}= 0.5 - abs(u),\n"
+        + "\n".join(ptrs_k_defs(sign, f"{lam:.20e}")) + "\n"
         + "\n".join(defs_k) + "\n"
-        + f"  us_         {rnd}= 0.5 - abs(u),\n"
         + f"  us_sq_      {rnd}= us_ * us_,\n"
         + f"  log_num_    {rnd}= a_ + b_ * us_sq_,\n"
-        + f"  ptrs_accept {rnd}= -lam_ + k * loglam_ - {name_k}"
-          f" - log(invalpha_) + log(log_num_){log_us_term};\n\n"
+        + f"  ptrs_accept {rnd}= -{lam:.20e} + k_ * llam_ - {name_k}"
+          f" - log(ialp_) + log(log_num_){log_us_term};\n\n"
         + "Expressions\n"
           "  eps_accept = ptrs_accept;\n"
     )
@@ -104,12 +201,10 @@ def make_ptrs_accept_template(lam, fp, utail, fast=False):
 
 def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose, fast=False):
     """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
-    slam = math.sqrt(lam)
-    b = 0.931 + 2.53 * slam
-    a = -0.059 + 0.02483 * b
+    _, a, b, _ = ptrs_consts(lam)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
     utail = 1e-3
-    vtail = 1e-10
+    vtail = _VTAIL
 
     floor_input  = inputs_dir  / f"poisson_ptrs_floor_{fp}_{tag}.txt"
     floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
@@ -128,18 +223,28 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
 
     eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + u_tail_prob
 
-    accept_input  = inputs_dir  / f"poisson_ptrs_accept_{fp}_{tag}.txt"
-    accept_output = outputs_dir / f"poisson_ptrs_accept_{fp}_{tag}.out"
-    accept_input.write_text(make_ptrs_accept_template(lam, fp, utail, fast=fast))
+    # k's definition needs the sign of u, so the accept query runs once per side
+    au_lo, au_hi = ptrs_accept_u_range(lam)
+    k_tail = ptrs_k_tail_prob(lam)
+    accept_raw = 0.0
+    for sign, lo, hi in ((-1, au_lo, 0.0), (+1, 0.0, au_hi)):
+        s_tag = "m" if sign < 0 else "p"
+        accept_input  = inputs_dir  / f"poisson_ptrs_accept_{fp}_{tag}_{s_tag}.txt"
+        accept_output = outputs_dir / f"poisson_ptrs_accept_{fp}_{tag}_{s_tag}.out"
+        accept_input.write_text(
+            make_ptrs_accept_template(lam, fp, lo, hi, sign, fast=fast))
 
-    code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
-    accept_output.write_text(output)
-    if verbose >= 2:
-        print(f"--- FPTaylor PTRS accept (lambda={lam}) ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor PTRS accept failed for lambda={lam}; see {accept_output}")
+        code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
+        accept_output.write_text(output)
+        if verbose >= 2:
+            print(f"--- FPTaylor PTRS accept s={sign:+d} (lambda={lam}) ---\n{output}")
+        if code != 0:
+            raise RuntimeError(f"FPTaylor PTRS accept s={sign:+d} failed for "
+                               f"lambda={lam}; see {accept_output}")
+        accept_raw = max(accept_raw,
+                         extract_abs_errors_by_problem(output)["eps_accept"])
 
-    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"] + eps_logv(
+    eps_accept = accept_raw + k_tail + eps_logv(
         fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     )
     if fast:
