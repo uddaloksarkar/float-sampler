@@ -6,11 +6,12 @@ import math
 import sys
 from pathlib import Path
 
+import interval_error as ie
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
-    loggam_defs, eps_logv, eps_logus, vprint,
+    loggam_defs, loggam_ie, eps_logv, eps_logus, vprint,
     us_root, hormann_u_at, hormann_k_defs,
 )
 
@@ -222,6 +223,160 @@ def binom_cdf_below(n, p, k_lo):
         for k in range(m + 1)
     )
     return total * (1.0 + 1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Tail bound on the accept expression (interval arithmetic, not FPTaylor)
+# ---------------------------------------------------------------------------
+#
+# The FPTaylor accept query covers k in the accept window only; the mass
+# outside it used to be charged as a bare k_tail, which is a probability under
+# the *ideal* binomial.  That is circular: bounding TV(ideal, fp) by a term
+# that is itself only a bound on the fp sampler's tail up to TV assumes what
+# is being proved.
+#
+# What breaks the circularity is that the accept test is a comparison in log
+# space, log(v) <= A.  A sound absolute bound |A_fp - A| <= E therefore gives a
+# *multiplicative* bound on the per-k acceptance probability, and after the
+# rejection loop renormalises, a pointwise bound on the output law:
+#
+#     P_fp(K = k)  <=  exp(2E) * P_ideal(K = k)      for every k
+#
+# so  P_fp[K outside window] <= exp(2E) * k_tail.  E comes from FP analysis and
+# k_tail from the binomial; neither depends on TV.
+#
+# E only has to keep exp(2E) an O(1) factor on a term of size ~1e-15, so the
+# bound may be loose -- 0.1 is ample, 1.0 is survivable.  That is why interval
+# arithmetic is the right tool: on this box (us down to us_min, k over the
+# whole out-of-window range) FPTaylor's branch-and-bound is slow and returns
+# 100%-suboptimal results, while interval propagation is cheap and cannot fail
+# to terminate.
+
+def _loggam_at(lo, hi, shift=0):
+    """random_loggam on an exact-integer argument enclosure [lo, hi]."""
+    if lo == hi and (lo == 1.0 or lo == 2.0):
+        return ie.const(0.0)               # early return [random_poisson_ptrs.c:41]
+    return loggam_ie(ie.var(lo, hi), shift=shift)
+
+
+def _btrs_accept_ie(box, n_iv, p_iv, m_iv, fast, shift_k, shift_nk,
+                    nk1_iv=None):
+    """
+    btrs.c's acceptance expression [btrs.c:88-90] in (enclosure, error)
+    arithmetic.  `box` is ((k_lo, k_hi), (us_lo, us_hi)) -- the two dimensions
+    bisect_max_err subdivides.
+
+    k, m and n enter with err = 0 and so do the loggam arguments: k and m are
+    int64_t casts and n - k + 1 / n - m + 1 are computed in integer arithmetic
+    before the cast, so every one of them is an exactly representable double.
+    us is exact too (Sterbenz on 0.5 - |u|, with u on the RNG grid).  The error
+    being bounded is the one the accept arithmetic itself commits, given those
+    inputs -- the error in *choosing* k is eps_floor's job, not this one.
+
+    k and us are treated as independent here.  The reachable set is a curve in
+    that rectangle, so the rectangle is a sound over-approximation, and it
+    avoids reproducing hormann_k_defs' coupling for a bound that does not need
+    the tightness.
+
+    `nk1_iv` overrides the enclosure of n - k + 1.  It is needed wherever the
+    caller enumerates by *offset* from n rather than by k: over a box in n,
+    deriving n - k + 1 from independent n and k enclosures widens it to
+    [n_lo - k_hi + 1, n_hi - k_lo + 1], which straddles zero as soon as the box
+    is wider than the offset, and loggam's 1/x0 then has no sign.  The offset
+    pins the true value -- n - k + 1 = j + 1 for every n -- so the caller
+    passes it directly.
+    """
+    (k_lo, k_hi), (us_lo, us_hi) = box
+    (n_lo, n_hi), (m_lo, m_hi) = n_iv, m_iv
+
+    n, p = ie.var(*n_iv), ie.var(*p_iv)
+    k, m, us = ie.var(k_lo, k_hi), ie.var(m_lo, m_hi), ie.var(us_lo, us_hi)
+    one = ie.const(1.0)
+
+    q   = ie.sub(one, p)
+    spq = ie.isqrt(ie.mul(ie.mul(n, p), q))
+    b   = ie.add(ie.const(1.15), ie.mul(ie.const(2.53), spq))
+    a   = ie.add(ie.add(ie.const(-0.0873), ie.mul(ie.const(0.0248), b)),
+                 ie.mul(ie.const(0.01), p))
+    alpha = ie.mul(ie.add(ie.const(2.83), ie.div(ie.const(5.1), b)), spq)
+    lpq   = ie.ilog(ie.div(p, q))
+
+    # exact integer arguments, formed before any float op touches them
+    h = ie.add(_loggam_at(m_lo + 1.0, m_hi + 1.0),
+               _loggam_at(n_lo - m_hi + 1.0, n_hi - m_lo + 1.0))
+    lgk  = _loggam_at(k_lo + 1.0, k_hi + 1.0, shift_k)
+    nk1_lo, nk1_hi = nk1_iv if nk1_iv is not None else (n_lo - k_hi + 1.0,
+                                                        n_hi - k_lo + 1.0)
+    lgnk = _loggam_at(nk1_lo, nk1_hi, shift_nk)
+
+    log_num = ie.add(a, ie.mul(b, ie.mul(us, us)))
+
+    acc = ie.sub(ie.sub(h, lgk), lgnk)
+    acc = ie.add(acc, ie.mul(ie.sub(k, m), lpq))
+    acc = ie.sub(acc, ie.ilog(alpha))
+    acc = ie.add(acc, ie.ilog(log_num))
+    if not fast:
+        acc = ie.sub(acc, ie.mul(ie.const(2.0), ie.ilog(us)))
+    return acc
+
+
+def btrs_accept_tail_eps(n_iv, p_iv, m_iv, k_win, us_min,
+                         fast=False, target=0.05, max_splits=1024, verbose=0):
+    """
+    Sound bound E on the absolute error of the accept expression over every k
+    the bulk FPTaylor query does not cover, so that k_tail can be charged as
+    exp(2E) * k_tail instead of bare k_tail.
+
+    Covers three regions, which differ only in which random_loggam branch runs:
+
+      - Stirling tail:  k in [6, k_lo] and [k_hi, n_lo - 6], where both
+        k + 1 >= 7 and n - k + 1 >= 7, so shift = 0 as in loggam_defs.
+      - small k:        k = 0..5, where k + 1 < 7 triggers the argument
+        reduction.  Six exact values, enumerated.
+      - k near n:       n - k = 0..5, same branch on the other loggam.
+        Enumerated by offset so it works when n is a box.
+
+    Returns (E, n_boxes).  E is a sound upper bound whether or not `target`
+    was reached; the split budget only controls how loose it is.
+    """
+    n_lo, n_hi = n_iv
+    ak_lo, ak_hi = k_win
+    us_iv = (us_min, 0.5)
+
+    def run(k_iv, shift_k=0, shift_nk=0, nk1_iv=None):
+        f = lambda bx: _btrs_accept_ie(bx, n_iv, p_iv, m_iv, fast,
+                                       shift_k, shift_nk, nk1_iv)
+        return ie.bisect_max_err(f, [(k_iv, us_iv)], target, max_splits)
+
+    worst, boxes = 0.0, 0
+    regions = []
+
+    # Stirling-branch tail, both sides of the window.  k >= 6 is what makes
+    # k + 1 >= 7; k <= n_lo - 6 does the same for n - k + 1 across the box.
+    if ak_lo > 6.0:
+        regions.append(("low", (6.0, ak_lo), 0, 0, None))
+    if ak_hi < n_lo - 6.0:
+        regions.append(("high", (ak_hi, n_lo - 6.0), 0, 0, None))
+    # Argument-reduction branch: k + 1 in 1..6, i.e. k in 0..5.
+    for i in range(6):
+        regions.append((f"k={i}", (float(i), float(i)), 6 - i, 0, None))
+    # ... and the mirror end, n - k + 1 in 1..6.  Enumerated by offset j = n - k
+    # so that n - k + 1 stays pinned at j + 1 over a box in n; see the nk1_iv
+    # note in _btrs_accept_ie.
+    for j in range(6):
+        regions.append((f"n-k={j}", (n_lo - j, n_hi - j), 0, 6 - j,
+                        (j + 1.0, j + 1.0)))
+
+    for tag, k_iv, sk, snk, nk1 in regions:
+        if k_iv[0] > k_iv[1]:
+            continue
+        e, nb = run(k_iv, sk, snk, nk1)
+        boxes += nb
+        if verbose >= 2:
+            print(f"    tail {tag:>8}: k in [{k_iv[0]:.6g}, {k_iv[1]:.6g}] "
+                  f"E={e:.4g} ({nb} boxes)")
+        worst = max(worst, e)
+    return worst, boxes
 
 
 def btrs_setup_defs(rnd, n_expr, p_expr, accept=False):
@@ -618,7 +773,17 @@ def _run_btrs_box(fptaylor, box, fp, tag, inputs_dir, outputs_dir, env,
         accept_raw = max(accept_raw,
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
-    eps_accept = accept_raw + box["k_tail"][0] + eps_logv(
+    # exp(2E) converts the ideal-binomial k_tail into a bound on the *fp*
+    # sampler's out-of-window mass; see btrs_accept_tail_eps.
+    tail_E, tail_boxes = btrs_accept_tail_eps(
+        box["n"], box["p"], box["m"], box["accept_k"], us_min,
+        fast=fast, verbose=verbose)
+    k_tail_fp = math.exp(2.0 * tail_E) * box["k_tail"][0]
+    vprint(verbose, "binomial BTRS box tail",
+           tail_E=tail_E, tail_boxes=tail_boxes,
+           k_tail=box["k_tail"][0], k_tail_fp=k_tail_fp)
+
+    eps_accept = accept_raw + k_tail_fp + eps_logv(
         fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     )
     if fast:
@@ -720,9 +885,19 @@ def _run_btrs_fptaylor(fptaylor, n, p, fp, tag, inputs_dir, outputs_dir, env, ve
         accept_raw = max(accept_raw,
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
+    # exp(2E) converts the ideal-binomial k_tail into a bound on the *fp*
+    # sampler's out-of-window mass; see btrs_accept_tail_eps.
+    m = math.floor((n + 1.0) * p)
+    tail_E, tail_boxes = btrs_accept_tail_eps(
+        (n, n), (p, p), (m, m), (k_lo, k_hi), us_min, fast=fast, verbose=verbose)
+    k_tail_fp = math.exp(2.0 * tail_E) * k_tail
+    vprint(verbose, f"binomial BTRS tail n={n} p={p}",
+           tail_E=tail_E, tail_boxes=tail_boxes,
+           k_tail=k_tail, k_tail_fp=k_tail_fp)
+
     eps_accept = accept_raw + eps_logv(
         fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
-    ) + k_tail
+    ) + k_tail_fp
     if fast:
         # the -2*log(us) query only sees us, so the smaller of the two tails
         # (a superset of the reachable us range) is the right bound to pass

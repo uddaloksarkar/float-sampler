@@ -10,6 +10,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import interval_error as ie
+
 ROOT = Path(__file__).resolve().parent
 
 FP_TO_FPTAYLOR_RND = {
@@ -414,6 +416,44 @@ def loggam_defs(x_expr, prefix, rnd):
         f" + (({x_expr}) - 0.5) * log({x_expr}) - ({x_expr}),"
     )
     return lines, f"{prefix}_gl"
+
+
+def loggam_ie(x, shift=0):
+    """
+    random_loggam(x) in (enclosure, error) interval arithmetic -- the same
+    straight-line code loggam_defs emits for FPTaylor, evaluated instead by
+    interval_error so it can be bounded on boxes FPTaylor cannot handle.
+
+    `shift` reproduces random_loggam's argument reduction n = (int64_t)(7 - x)
+    [random_poisson_ptrs.c:44]: shift == 0 is the Stirling branch, and
+    shift > 0 evaluates Stirling at x0 = x + shift and then peels the shift
+    factors back off with `gl -= log(x0 - 1)` [random_poisson_ptrs.c:59-61].
+    That branch is what covers k + 1 < 7, which the Stirling-only FPTaylor
+    template excludes from its domain.
+
+    Operation order matches the C exactly, including the fact that the Horner
+    step is a separate multiply and add (`gl0 *= x2; gl0 += a[k];`) rather than
+    an fma, so both roundings are charged.
+    """
+    x0 = ie.add(x, ie.const(float(shift))) if shift else x
+    inv = ie.div(ie.const(1.0), x0)
+    x2 = ie.mul(inv, inv)
+
+    gl0 = ie.const(LOGGAM_A[9])
+    for k in range(8, -1, -1):
+        gl0 = ie.add(ie.mul(gl0, x2), ie.const(LOGGAM_A[k]))
+
+    # gl = gl0/x0 + 0.5*lg2pi + (x0 - 0.5)*log(x0) - x0, left to right.
+    # 0.5*lg2pi is a scaling by a power of two, hence exact.
+    gl = ie.add(ie.div(gl0, x0), ie.const(0.5 * LOGGAM_LG2PI))
+    gl = ie.add(gl, ie.mul(ie.sub(x0, ie.const(0.5)), ie.ilog(x0)))
+    gl = ie.sub(gl, x0)
+
+    for _ in range(shift):
+        x0m1 = ie.sub(x0, ie.const(1.0))
+        gl = ie.sub(gl, ie.ilog(x0m1))
+        x0 = x0m1
+    return gl
 
 
 def _fp_var_type(fp):
