@@ -68,13 +68,6 @@ def ptrs_k_defs(sign, lam_expr):
 _K_STIRLING_LO = 7.0
 _K_SIGMAS = 10.0
 
-# V is rk_double(), a multiple of 2^-53 in [0, 1), so the accept test never
-# sees a V strictly between 0 and 2^-53: that is the exact floor of log(V)'s
-# reachable domain, and one grid step is the whole quantisation loss of the
-# V <= threshold test.  The old 1e-10 was an arbitrary cut charging 10^6x more.
-_VTAIL = 2.0 ** -53
-
-
 def ptrs_accept_k_range(lam):
     """k window the accept query covers: Stirling domain, +-10 sigma bulk."""
     slam = math.sqrt(lam)
@@ -199,12 +192,12 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     )
 
 
-def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose, fast=False):
+def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose,
+                       fast=False, u_trunc=2.0 ** -53):
     """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
     _, a, b, _ = ptrs_consts(lam)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
     utail = 1e-3
-    vtail = _VTAIL
 
     floor_input  = inputs_dir  / f"poisson_ptrs_floor_{fp}_{tag}.txt"
     floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
@@ -245,15 +238,15 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
     eps_accept = accept_raw + k_tail + eps_logv(
-        fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
-    )
+        fptaylor, fp, u_trunc, inputs_dir, outputs_dir, env, verbose,
+    )[0]
     if fast:
         eps_accept += eps_logus(
             fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
-        )
+        )[0]
 
-    accept_iter = invalpha 
-    tv = 2 * (eps_floor + vtail) * accept_iter + 2 * eps_accept / (1 - vtail)
+    accept_iter = invalpha
+    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + u_trunc
     return eps_floor, eps_accept, tv
 
 
@@ -419,7 +412,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             # ---- high range (PTRS) ----
             eps_floor, eps_accept, tv = _run_ptrs_fptaylor(
                 fptaylor, lam_float, args.fp, tag, inputs_dir, outputs_dir,
-                env, args.verbose, fast=args.fast,
+                env, args.verbose, fast=args.fast, u_trunc=args.u_trunc,
             )
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 

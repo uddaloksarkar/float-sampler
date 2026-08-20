@@ -307,6 +307,13 @@ def add_common_args(parser):
                              "full FPTaylor/CIRE/Gelpia output to stdout")
     parser.add_argument("--cache", action="store_true",
                         help="If summary.csv already exists in out-dir, load it and skip re-running")
+    parser.add_argument("--u-trunc", type=float, default=2.0 ** -53,
+                        help="Truncation floor for the uniform-seed domain "
+                             "(BTRS/PTRS: the log(v) domain lower bound, "
+                             "replacing the hardcoded 2^-53). Also the flat "
+                             "amount the reported TV is inflated by, e.g. "
+                             "--u-trunc 1e-8 adds exactly 1e-8 to TV "
+                             "(default: 2^-53).")
 
 
 # ---------------------------------------------------------------------------
@@ -393,29 +400,44 @@ LOGGAM_A = [
 LOGGAM_LG2PI = 1.8378770664093453e+00
 
 
-def loggam_defs(x_expr, prefix, rnd):
+def loggam_defs(x_expr, prefix, rnd, shift=0):
     """
-    Return FPTaylor Definitions lines implementing random_loggam(x_expr)
-    for x_expr >= 7 (Stirling / asymptotic branch, straight-line).
+    Return FPTaylor Definitions lines implementing random_loggam(x_expr) with
+    shift == 0, i.e. for x_expr >= 7 (Stirling / asymptotic branch,
+    straight-line).
     prefix must be unique per call-site.  The last entry is the result name.
+
+    `shift` reproduces random_loggam's argument reduction n = (int64_t)(7 - x)
+    [random_poisson_ptrs.c:44] the same way loggam_ie does: Stirling is
+    evaluated at x0 = x + shift and the shift factors are then peeled back off
+    with `gl -= log(x0 - 1)` [random_poisson_ptrs.c:58-61].  x0 and the x0 - i it
+    steps through are exact whenever x_expr is an exact integer, which is the
+    only way the sampler reaches that branch, so they are written as literals.
     """
     a = LOGGAM_A
+    x0 = f"({x_expr} + {float(shift):.1f})" if shift else f"({x_expr})"
     lines = []
     # x2 = (1/x)*(1/x)
-    lines.append(f"  {prefix}_x2 {rnd}= (1.0 / ({x_expr})) * (1.0 / ({x_expr})),")
+    lines.append(f"  {prefix}_x2 {rnd}= (1.0 / {x0}) * (1.0 / {x0}),")
     # Horner from a[9] down to a[0]
     lines.append(f"  {prefix}_h9 = {a[9]:.20e},")
     for i in range(8, -1, -1):
         lines.append(
             f"  {prefix}_h{i} {rnd}= {prefix}_h{i+1} * {prefix}_x2 + {a[i]:.20e},"
         )
-    # gl = h0/x + 0.5*log(2pi) + (x-0.5)*log(x) - x
+    # gl = h0/x0 + 0.5*log(2pi) + (x0-0.5)*log(x0) - x0
     lines.append(
-        f"  {prefix}_gl {rnd}= {prefix}_h0 / ({x_expr})"
+        f"  {prefix}_gl {rnd}= {prefix}_h0 / {x0}"
         f" + {0.5 * LOGGAM_LG2PI:.20e}"
-        f" + (({x_expr}) - 0.5) * log({x_expr}) - ({x_expr}),"
+        f" + ({x0} - 0.5) * log{x0} - {x0},"
     )
-    return lines, f"{prefix}_gl"
+    # ... then gl -= log(x0 - 1) once per shifted factor, x0 walking back down
+    name = f"{prefix}_gl"
+    for i in range(1, shift + 1):
+        lines.append(f"  {prefix}_gl{i} {rnd}= {name}"
+                     f" - log({x0} - {float(i):.1f}),")
+        name = f"{prefix}_gl{i}"
+    return lines, name
 
 
 def loggam_ie(x, shift=0):
@@ -456,14 +478,65 @@ def loggam_ie(x, shift=0):
     return gl
 
 
+def fptaylor_cmd(fptaylor, input_path, work_dir):
+    """
+    argv for one FPTaylor query, with its own temporary and log directories.
+
+    Two things are pinned here, both needed to run queries concurrently.
+
+    The optimizer is forced to `bb-eval` rather than left at `auto`, which picks
+    the compiling `bb` backend for the larger problems.  `bb` writes a generated
+    OCaml program to tmp-base-dir under fixed names -- tmp/bb_1.ml, tmp/bb
+    [FPTaylor/default.cfg:141, FPTaylor/b_and_b/compile.sh] -- and runs it by a
+    path relative to the working directory, so concurrent queries overwrite each
+    other's program and run whichever binary won (observed as a pair of FPTaylor
+    processes hanging indefinitely, and in principle a bound reported for the
+    wrong expression).  It is also fragile on the expressions here: the deeper
+    box templates make it emit OCaml that does not parse ("Syntax error" on a
+    line of 81 closing parentheses), after which FPTaylor dies with Not_found.
+    bb-eval interprets instead of compiling, so it has neither problem.
+
+    Each query still gets its own temporary and log directory, so nothing in
+    FPTaylor's scratch space is shared between concurrent runs.
+    """
+    return [fptaylor, "--opt", "bb-eval",
+            "--tmp-base-dir", str(work_dir / "tmp"),
+            "--log-base-dir", str(work_dir / "log"),
+            str(input_path)]
+
+
+def binade_shells(lo, hi):
+    """
+    Cover [lo, hi] (0 < lo <= hi) by binades [2^j, 2^(j+1)], clipped at both
+    ends: the logarithmic shelling every 1/x- and log(x)-shaped term wants.
+
+    Returned smallest-first, and the union is exactly [lo, hi] -- no gaps, so a
+    max over the shells is a bound over the whole range.  Inside one shell the
+    exponent of x is fixed, so 1/x varies by a factor of 2 and log(x) by one
+    ulp of its exponent: an interval bound on either is then tight to within
+    that factor, instead of being pinned to the worst end of the whole range.
+    """
+    if not 0.0 < lo <= hi:
+        raise ValueError(f"binade_shells needs 0 < {lo:.6g} <= {hi:.6g}")
+
+    edges = [lo]
+    j = math.floor(math.log2(lo)) + 1        # smallest binade edge above lo
+    while 2.0 ** j < hi:
+        edges.append(2.0 ** j)
+        j += 1
+    edges.append(hi)
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)
+            if edges[i] < edges[i + 1]]
+
+
 def _fp_var_type(fp):
     """FPTaylor variable type matching `fp`, for inputs that are already floats."""
     return {"fp32": "float32", "fp64": "float64", "fp128": "float128"}[fp]
 
 
-def make_logv_template(fp, vtail):
+def make_logv_template(fp, v_lo, v_hi=1.0):
     """
-    Absolute error of -log(v), v in [vtail, 1.0] — split out of the
+    Absolute error of -log(v), v in [v_lo, v_hi] — split out of the
     acceptance-test expression because folding it in adds v as an extra
     dimension to FPTaylor's joint branch-and-bound search and blows up
     the runtime of the whole eps_accept query.
@@ -482,7 +555,7 @@ def make_logv_template(fp, vtail):
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
-        f"  {_fp_var_type(fp)} v in [{vtail:.20e}, 1.0];\n\n"
+        f"  {_fp_var_type(fp)} v in [{v_lo:.20e}, {v_hi:.20e}];\n\n"
         "Definitions\n"
         f"  logv_step {rnd}= - log(v);\n\n"
         "Expressions\n"
@@ -493,29 +566,42 @@ def make_logv_template(fp, vtail):
 _LOGV_EPS_CACHE = {}
 
 
-def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose):
-    """Absolute error of -log(v); same for every distribution param, so cache it."""
-    key = (fp, vtail)
+def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
+             shells=False):
+    """
+    Absolute error of -log(v) over v in [vtail, 1]; same for every distribution
+    parameter, so cache it.  Returns (error, n_boxes).
+
+    With shells=True the range is covered binade by binade (see binade_shells)
+    and the max is taken, one FPTaylor query per binade instead of one for the
+    whole range.
+    """
+    key = (fp, vtail, shells)
     if key in _LOGV_EPS_CACHE:
         return _LOGV_EPS_CACHE[key]
 
-    input_path = inputs_dir  / f"logv_{fp}_{vtail:.3e}.txt"
-    out_path   = outputs_dir / f"logv_{fp}_{vtail:.3e}.out"
-    input_path.write_text(make_logv_template(fp, vtail))
+    ranges = binade_shells(vtail, 1.0) if shells else [(vtail, 1.0)]
+    worst = 0.0
+    for v_lo, v_hi in ranges:
+        stem = f"logv_{fp}_{v_lo:.3e}_{v_hi:.3e}"
+        input_path = inputs_dir  / f"{stem}.txt"
+        out_path   = outputs_dir / f"{stem}.out"
+        input_path.write_text(make_logv_template(fp, v_lo, v_hi))
 
-    code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
-    out_path.write_text(output)
-    if verbose >= 2:
-        print(f"--- FPTaylor log(v) ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor log(v) failed; see {out_path}")
+        code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
+        out_path.write_text(output)
+        if verbose >= 2:
+            print(f"--- FPTaylor log(v) on [{v_lo:.3e}, {v_hi:.3e}] ---\n{output}")
+        if code != 0:
+            raise RuntimeError(f"FPTaylor log(v) failed; see {out_path}")
+        worst = max(worst, extract_abs_errors_by_problem(output)["eps_logv"])
 
-    result = extract_abs_errors_by_problem(output)["eps_logv"]
+    result = (worst, len(ranges))
     _LOGV_EPS_CACHE[key] = result
     return result
 
 
-def make_logus_template(fp, utail):
+def make_logus_template(fp, utail, us_hi=0.5):
     """
     Absolute error of -2*log(us_), us_ in [utail, 0.5] — split out for the
     --fast path of accept-expression templates (see e.g.
@@ -540,7 +626,7 @@ def make_logus_template(fp, utail):
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
-        f"  {_fp_var_type(fp)} us_ in [{utail:.20e}, 5.0e-01];\n\n"
+        f"  {_fp_var_type(fp)} us_ in [{utail:.20e}, {us_hi:.20e}];\n\n"
         "Definitions\n"
         f"  logus_step {rnd}= - 2.0 * log(us_);\n\n"
         "Expressions\n"
@@ -551,23 +637,33 @@ def make_logus_template(fp, utail):
 _LOGUS_EPS_CACHE = {}
 
 
-def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose):
-    """Absolute error of -2*log(us_); same for every distribution param, so cache it."""
-    key = (fp, utail)
+def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
+              shells=False):
+    """
+    Absolute error of -2*log(us_) over us_ in [utail, 0.5]; same for every
+    distribution parameter, so cache it.  Returns (error, n_boxes); shells=True
+    covers the range binade by binade (see binade_shells).
+    """
+    key = (fp, utail, shells)
     if key in _LOGUS_EPS_CACHE:
         return _LOGUS_EPS_CACHE[key]
 
-    input_path = inputs_dir  / f"logus_{fp}_{utail:.3e}.txt"
-    out_path   = outputs_dir / f"logus_{fp}_{utail:.3e}.out"
-    input_path.write_text(make_logus_template(fp, utail))
+    ranges = binade_shells(utail, 0.5) if shells else [(utail, 0.5)]
+    worst = 0.0
+    for us_lo, us_hi in ranges:
+        stem = f"logus_{fp}_{us_lo:.3e}_{us_hi:.3e}"
+        input_path = inputs_dir  / f"{stem}.txt"
+        out_path   = outputs_dir / f"{stem}.out"
+        input_path.write_text(make_logus_template(fp, us_lo, us_hi))
 
-    code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
-    out_path.write_text(output)
-    if verbose >= 2:
-        print(f"--- FPTaylor log(us) ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor log(us) failed; see {out_path}")
+        code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
+        out_path.write_text(output)
+        if verbose >= 2:
+            print(f"--- FPTaylor log(us) on [{us_lo:.3e}, {us_hi:.3e}] ---\n{output}")
+        if code != 0:
+            raise RuntimeError(f"FPTaylor log(us) failed; see {out_path}")
+        worst = max(worst, extract_abs_errors_by_problem(output)["eps_logus"])
 
-    result = extract_abs_errors_by_problem(output)["eps_logus"]
+    result = (worst, len(ranges))
     _LOGUS_EPS_CACHE[key] = result
     return result
