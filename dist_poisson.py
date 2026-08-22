@@ -6,6 +6,8 @@ dist_binomial.py (eps_floor / eps_accept split, shared -log(v) and
 -2*log(us) helpers, --fast flag).
 """
 import math
+import shutil
+import tempfile
 from pathlib import Path
 
 from analyticError import FP_BETA, SWITCH, computeDeltaHighRange, computeDeltaLowRange
@@ -13,7 +15,7 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
-    loggam_defs, eps_logv, eps_logus,
+    loggam_defs, eps_logv, eps_logus, fptaylor_cmd,
     hormann_u_at, hormann_k_defs,
 )
 
@@ -192,8 +194,26 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     )
 
 
+def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
+                        bb_eval=False, x_abs_tol=None):
+    """Run one FPTaylor query and return output.
+
+    PTRS queries run one per call site, not concurrently, so the compile race
+    documented in dist_common.fptaylor_cmd does not apply here even with the
+    default --opt bb backend.
+    """
+    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
+    try:
+        return run_command(
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            cwd=ROOT, env=env)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose,
-                       fast=False, u_trunc=2.0 ** -53):
+                       fast=False, u_trunc=2.0 ** -53, ratio_tol=2.0,
+                       bb_eval=False, x_abs_tol=None):
     """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
     _, a, b, _ = ptrs_consts(lam)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
@@ -203,7 +223,8 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
     floor_input.write_text(make_ptrs_floor_template(lam, fp, utail))
 
-    code, output = run_command([fptaylor, str(floor_input)], cwd=ROOT, env=env)
+    code, output = _run_fptaylor_query(fptaylor, floor_input, outputs_dir, env,
+                                       ratio_tol, bb_eval, x_abs_tol)
     floor_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor PTRS floor (lambda={lam}) ---\n{output}")
@@ -227,7 +248,8 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
         accept_input.write_text(
             make_ptrs_accept_template(lam, fp, lo, hi, sign, fast=fast))
 
-        code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
+        code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir,
+                                           env, ratio_tol, bb_eval, x_abs_tol)
         accept_output.write_text(output)
         if verbose >= 2:
             print(f"--- FPTaylor PTRS accept s={sign:+d} (lambda={lam}) ---\n{output}")
@@ -238,11 +260,13 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
     eps_accept = accept_raw + k_tail + eps_logv(
-        fptaylor, fp, u_trunc, inputs_dir, outputs_dir, env, verbose,
+        fptaylor, fp, u_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
+        bb_eval, x_abs_tol,
     )[0]
     if fast:
         eps_accept += eps_logus(
-            fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
+            fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose, ratio_tol,
+            bb_eval, x_abs_tol,
         )[0]
 
     accept_iter = invalpha
@@ -413,6 +437,8 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             eps_floor, eps_accept, tv = _run_ptrs_fptaylor(
                 fptaylor, lam_float, args.fp, tag, inputs_dir, outputs_dir,
                 env, args.verbose, fast=args.fast, u_trunc=args.u_trunc,
+                ratio_tol=args.bb_geometric_ratio_tol,
+                bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
             )
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 

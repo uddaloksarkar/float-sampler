@@ -3,9 +3,10 @@ Binomial sampler FP-error analysis: legacy inversion for n*p < _BTRS_SWITCH,
 BTRS (Hormann transformed rejection, distributions/btrs.c) above it.
 
 The BTRS bound covers the whole reachable u -- from u_lo, the u that maps to
-k = 0, up to u_hi, the u that maps to k = n -- by splitting it into binade
-shells of us = 0.5 - |u| and running one FPTaylor query per shell; see the
-"Binade shelling of u" section.
+k = 0, up to u_hi, the u that maps to k = n -- with one FPTaylor query per
+side of u = 0 (see the "Sign-splitting of u" section); the 1/us conditioning
+within a side is left to FPTaylor's own branch-and-bound splitting
+(--opt bb --bb-split geometric, see dist_common.fptaylor_cmd).
 
 Follows the pattern in dist_geometric.py; called by main.py.
 """
@@ -21,9 +22,11 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
-    loggam_defs, eps_logv, eps_logus, vprint, _fp_var_type,
+    loggam_defs, eps_logv, eps_logus,
+    transcendental_error_bound,
+    vprint, _fp_var_type,
     fptaylor_cmd,
-    binade_shells, us_root, hormann_u_at, hormann_k_defs,
+    us_root, hormann_u_at, hormann_k_defs,
 )
 
 NAME = "binomial"
@@ -98,21 +101,23 @@ def btrs_u_at(n, p, y, consts=None):
 
 
 # ---------------------------------------------------------------------------
-# Binade shelling of u
+# Sign-splitting of u
 # ---------------------------------------------------------------------------
-# btrs.c reaches u only through us = 0.5 - |u|, and both analysed quantities
-# blow up as us -> 0: y = (2*a/us + b)*u + c [btrs.c:61] and -2*log(us)
-# [btrs.c:90].  us reaches ~a/n at k = 0 and k = n, so one query over all of u
-# charges every u the worst corner's error.  Shelling us one binade at a time
-# (dist_common.binade_shells) holds each 1/us factor to a factor of 2; one query
-# per shell, error = max over shells, ~10 shells at n = 1000.  Only sampler
-# variables are shelled -- n and p get midpoint bisection instead.
+# btrs.c reaches u only through us = 0.5 - |u|, so u = 0 is a fold point where
+# neither the accept template's sign-dependent k definition (btrs_k_defs) nor
+# us itself is one-to-one.  Each side of u = 0 is therefore its own query; the
+# 1/us blow-up as us -> 0 within a side is left to FPTaylor's own
+# branch-and-bound splitting (--opt bb --bb-split geometric) rather than
+# pre-shelled by binade in Python.
 
 _K_SLACK = 1.0            # floor can disagree by one integer: y in [k-1, k+2]
 
 # random_loggam is straight-line (Stirling) iff its argument is >= 7
 # [random_poisson_ptrs.c:44], i.e. k in [6, n-6]; the twelve k outside that
-# window go one at a time through make_btrs_accept_k_template.
+# window take random_loggam's argument-reduction branch instead and are
+# tracked separately in a ledger rather than analysed here (see
+# _btrs_accept_boxes; make_btrs_accept_k_template still builds their template
+# for reference/reuse, it just isn't called from the accept sweep).
 _K_STIRLING_LO = 6.0
 _K_STIRLING_HI_MARGIN = 6.0
 
@@ -127,21 +132,18 @@ def y_window(k_lo, k_hi, slack=_K_SLACK):
 
 def shell_u(u_lo, u_hi, y_lo, y_hi):
     """
-    Cover [u_lo, u_hi] by binade shells of us = 0.5 - |u|, as (sign, lo, hi).
-
-    Split at u = 0 first: us is not one-to-one across it, and the accept
-    template needs the sign anyway (btrs_k_defs).  Each side is shelled in us
-    and mapped back, u = sign * (0.5 - us).  y_lo/y_hi are only for the error.
+    Split [u_lo, u_hi] at u = 0 into (sign, lo, hi) pieces, one per side that
+    is non-empty.  us = 0.5 - |u| is not one-to-one across u = 0, and the
+    accept template needs the sign anyway (btrs_k_defs).  y_lo/y_hi are only
+    for the error message.
     """
     if u_lo > u_hi:
         raise ValueError(f"empty u window for y in [{y_lo:.6g}, {y_hi:.6g}]")
     shells = []
-    if u_lo < 0.0:                                   # us = 0.5 + u
-        for t_lo, t_hi in binade_shells(0.5 + u_lo, 0.5 + min(u_hi, 0.0)):
-            shells.append((-1, t_lo - 0.5, t_hi - 0.5))
-    if u_hi > 0.0:                                   # us = 0.5 - u
-        for t_lo, t_hi in binade_shells(0.5 - u_hi, 0.5 - max(u_lo, 0.0)):
-            shells.append((+1, 0.5 - t_hi, 0.5 - t_lo))
+    if u_lo < 0.0:
+        shells.append((-1, u_lo, min(u_hi, 0.0)))
+    if u_hi > 0.0:
+        shells.append((+1, max(u_lo, 0.0), u_hi))
     return shells
 
 
@@ -400,7 +402,7 @@ def box_u_at(box_consts, y):
 
 
 def box_u_shells(box_consts, y_lo, y_hi):
-    """shell_u over a parameter box: the widest u window, then binade shells."""
+    """shell_u over a parameter box: the widest u window, split at u = 0."""
     return shell_u(box_u_at(box_consts, y_lo)[0],
                    box_u_at(box_consts, y_hi)[1], y_lo, y_hi)
 
@@ -568,17 +570,27 @@ def safe_box_name(n_lo, n_hi, p_lo, p_hi):
 
 
 # ---------------------------------------------------------------------------
-# Running one FPTaylor query per shell
+# Running one FPTaylor query per box
 # ---------------------------------------------------------------------------
 
 def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
-                  verbose, jobs):
+                  verbose, jobs, ratio_tol, bb_eval=False, x_abs_tol=None):
     """
     Run one FPTaylor query per box and return (max_error, n_boxes).
 
     `boxes` is a list of (label, stem, template_text): label goes in the log,
-    stem names the input/output files.  The queries are independent, so they run
-    on `jobs` worker threads (FPTaylor itself is single-threaded).
+    stem names the input/output files.
+
+    With bb_eval=False (default), queries run with the compiling --opt bb
+    (needed for --bb-split geometric), which compiles each query to OCaml
+    under a fixed filename relative to the working directory regardless of
+    --tmp-base-dir [FPTaylor/opt_basic_bb.ml], so concurrent bb queries race
+    and clobber each other's compiled program (observed as hung processes,
+    and in principle a bound reported for the wrong expression) -- `jobs` is
+    ignored and capped to 1 worker.  See dist_common.fptaylor_cmd.
+
+    With bb_eval=True, queries run with the interpreted --opt bb-eval
+    instead: no compile step, no race, so `jobs` workers run concurrently.
     """
     def one(box):
         label, stem, text = box
@@ -588,8 +600,9 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
         # each query gets its own scratch dir; see dist_common.fptaylor_cmd
         work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
         try:
-            code, output = run_command(fptaylor_cmd(fptaylor, in_path, work),
-                                       cwd=ROOT, env=env)
+            code, output = run_command(
+                fptaylor_cmd(fptaylor, in_path, work, ratio_tol, bb_eval, x_abs_tol),
+                cwd=ROOT, env=env)
         finally:
             shutil.rmtree(work, ignore_errors=True)
         out_path.write_text(output)
@@ -606,7 +619,7 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
                                f"see {out_path}")
         return errors[expr]
 
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
+    with ThreadPoolExecutor(max_workers=jobs if bb_eval else 1) as pool:
         errors = list(pool.map(one, boxes))
 
     worst = 0.0
@@ -628,8 +641,8 @@ def _shell_stem(prefix, fp, tag, index, sign):
 
 def _btrs_floor_boxes(n, p, fp, tag, consts):
     """
-    One box per binade shell of the u that btrs.c does not reject outright,
-    i.e. the u it maps to some k in [0, n]        [btrs.c:62-64].
+    One box per side of u = 0 that btrs.c does not reject outright, i.e. the u
+    it maps to some k in [0, n]        [btrs.c:62-64].
     """
     y_lo, y_hi = y_window(0.0, float(n))
     boxes = []
@@ -645,8 +658,8 @@ def _btrs_accept_boxes(n, p, fp, tag, consts, fast):
     Boxes covering the accept expression for every k in [0, n], in two parts:
 
       - k in [_K_STIRLING_LO, n - _K_STIRLING_HI_MARGIN]: both loggam arguments
-        are >= 7, so one query per binade shell of u covers a whole run of k,
-        with k tied to u by btrs_k_defs.
+        are >= 7, so one query per side of u = 0 covers a whole run of k, with
+        k tied to u by btrs_k_defs.
       - the twelve k outside that window: one query each, with k as a literal
         and random_loggam's argument reduction spelled out
         (make_btrs_accept_k_template).
@@ -671,31 +684,56 @@ def _btrs_accept_boxes(n, p, fp, tag, consts, fast):
     return boxes
 
 
-def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_min, args,
-               inputs_dir, outputs_dir, env):
+def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
+               args, inputs_dir, outputs_dir, env, ledger=False):
     """
     (eps_accept, tv, n_extra): fold the per-query maxima into the TV bound.
 
     eps_accept still owes -log(v), and with --fast the split-out -2*log(us) as
-    well; v and us are sampler variables, so both are shelled by binade like u.
-    args.u_trunc is the floor of log(v)'s domain (see dist_common.eps_logv).
+    well; v and us are sampler variables.  args.u_trunc is the nominal floor
+    of both the log(v) domain (see dist_common.eps_logv) and the u domain.
 
-    tv = 2*eps_floor*accept_iter + 2*eps_accept + u_trunc: one accepted draw
-    costs the floor error scaled by the per-iteration acceptance probability
-    plus the accept-test error, and the whole bound is inflated flat by
-    u_trunc to cover the v/u domain truncated below it.
+    us_lo = 0.5 + u_lo, us_hi = 0.5 - u_hi are how far short of the full u in
+    [-0.5, 0.5) the box's reachable [u_lo, u_hi] falls on each side (see
+    callers).  u_trunc is the u mass we are willing to call negligible; if a
+    side's box already reaches at least that far (us_lo/us_hi >= u_trunc) it
+    costs nothing, but if the box falls short, the real and FP samplers may
+    disagree on that shortfall of (uniform) u mass, so it is charged to TV
+    same as swapping in a sampler that disagrees on a positive-probability
+    event.
+
+    tv = 2*eps_floor*accept_iter + 2*eps_accept
+         + max(0, u_trunc - us_lo) + max(0, u_trunc - us_hi)
+    one accepted draw costs the floor error scaled by the per-iteration
+    acceptance probability plus the accept-test error, and each side's
+    shortfall below u_trunc (if any) is added on top.
+
+    ledger=True: -log(v) is charged directly via transcendental_error_bound
+    instead of a separate FPTaylor query, and -2*log(us) is not added here at
+    all.  Not used by any caller currently -- eps_accept and eps_logv/eps_logus
+    are inlined FPTaylor queries everywhere -- kept for a path that ledgers
+    log/exp rather than inlining them.
     """
-    logv, n_extra = eps_logv(fptaylor, fp, args.u_trunc, inputs_dir, outputs_dir,
-                             env, args.verbose, shells=True)
+    us_min = min(us_lo, us_hi)
+    if ledger:
+        logv = transcendental_error_bound("log", 1.0, fp)
+        n_extra = 0
+    else:
+        logv, n_extra = eps_logv(fptaylor, fp, args.u_trunc, inputs_dir, outputs_dir,
+                                 env, args.verbose, args.bb_geometric_ratio_tol,
+                                 args.bb_eval, args.opt_x_abs_tol)
     eps_accept = accept_raw + logv
-    if args.fast:
+    if args.fast and not ledger:
         # the -2*log(us) query only sees us, so the smallest reachable us (a
         # superset of every shell's us range) is the right bound to pass
         logus, n_logus = eps_logus(fptaylor, fp, us_min, inputs_dir,
-                                   outputs_dir, env, args.verbose, shells=True)
+                                   outputs_dir, env, args.verbose,
+                                   args.bb_geometric_ratio_tol,
+                                   args.bb_eval, args.opt_x_abs_tol)
         eps_accept += logus
         n_extra += n_logus
-    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + args.u_trunc
+    u_excess = max(0.0, args.u_trunc - us_lo) + max(0.0, args.u_trunc - us_hi)
+    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + u_excess
     return eps_accept, tv, n_extra
 
 
@@ -714,31 +752,33 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
     alpha  = (2.83 + 5.1 / b) * spq
     fy_lo, fy_hi = y_window(0.0, float(n))
     u_lo, u_hi = btrs_u_at(n, p, fy_lo, consts), btrs_u_at(n, p, fy_hi, consts)
-    us_min = min(0.5 - u_hi, 0.5 + u_lo)
+    us_lo, us_hi = 0.5 + u_lo, 0.5 - u_hi
     vprint(verbose, f"binomial BTRS n={n} p={p}",
            spq=spq, a=a, b=b, c=c, alpha=alpha,
-           u_lo=u_lo, u_hi=u_hi, us_min=us_min, u_trunc=args.u_trunc)
+           u_lo=u_lo, u_hi=u_hi, us_lo=us_lo, us_hi=us_hi, u_trunc=args.u_trunc)
 
     floor_boxes  = _btrs_floor_boxes(n, p, fp, tag, consts)
     accept_boxes = _btrs_accept_boxes(n, p, fp, tag, consts, args.fast)
 
-    # No u-tail probability to add, and no k-tail either: the shells cover the
-    # whole reachable u, and every u outside it is rejected by both the real and
-    # the FP sampler.
+    # k-tail (k outside [0, n]) is rejected identically by both samplers, so
+    # it costs nothing; but the u the boxes above don't reach beyond u_trunc
+    # on either side is charged to TV in combine_tv (see us_lo/us_hi there).
     floor_raw, n_floor = _fptaylor_max(
         fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
-        verbose, args.jobs)
+        verbose, args.jobs, args.bb_geometric_ratio_tol,
+        args.bb_eval, args.opt_x_abs_tol)
     eps_floor = 5 * floor_raw
 
     accept_raw, n_accept = _fptaylor_max(
         fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
-        verbose, args.jobs)
+        verbose, args.jobs, args.bb_geometric_ratio_tol,
+        args.bb_eval, args.opt_x_abs_tol)
 
     # btrs is renormalized by the modal pmf f(m) = B(m) ~ 1/(sqrt(2*pi)*spq),
     # so the per-iteration acceptance probability is 1/(alpha*f(m)).
     accept_iter = alpha / (math.sqrt(2 * math.pi) * spq)
     eps_accept, tv, n_extra = combine_tv(
-        fptaylor, fp, eps_floor, accept_raw, accept_iter, us_min, args,
+        fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi, args,
         inputs_dir, outputs_dir, env)
     vprint(verbose, f"binomial BTRS boxes n={n} p={p}",
            floor_boxes=n_floor, accept_boxes=n_accept, logv_boxes=n_extra,
@@ -749,11 +789,18 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
 
 def btrs_box_k_shells(n_iv, p_iv):
     """
-    (low, high): enclosures covering every k in [0, n] for every n in the box.
-    `low` encloses k, `high` the offset j = n - k; a k is covered if it appears
-    in either.  Each starts with the six degenerate shells random_loggam reduces
-    the argument for, then binade shells of x + 1 (the error runs through
-    1/(x+1) and log(x+1), so it shells like u).
+    (low, high): enclosures covering k in [_K_STIRLING_LO, n - _K_STIRLING_HI_MARGIN]
+    for every n in the box, i.e. the normal Stirling branch of random_loggam
+    (both loggam arguments >= 7).  `low` encloses k, `high` the offset
+    j = n - k; a k is covered if it appears in either.  Each is one query over
+    the whole range of x + 1 (the error runs through 1/(x+1) and log(x+1); the
+    conditioning is left to FPTaylor's own branch-and-bound splitting,
+    --opt bb --bb-split geometric).
+
+    The six degenerate k random_loggam reduces the argument for (the
+    argument-reduction branch, not Stirling) are NOT covered here -- tracked
+    separately in a ledger rather than via FPTaylor, same as the point-mode
+    sweep; see _btrs_accept_boxes.
 
     The halves must meet (k_mid + j_mid >= n_hi - 1) while both stay inside the
     Stirling domain of the other, n-dependent argument; if the box is too wide
@@ -769,9 +816,7 @@ def btrs_box_k_shells(n_iv, p_iv):
             f"{j_mid:.6g}, which do not meet; raise --split-depth")
 
     def shells(x_mid):
-        return ([(float(x), float(x)) for x in range(int(_K_STIRLING_LO))]
-                + [(lo - 1.0, hi - 1.0) for lo, hi in
-                   binade_shells(_K_STIRLING_LO + 1.0, x_mid + 1.0)])
+        return [(_K_STIRLING_LO, x_mid)]
 
     return shells(k_mid), shells(j_mid)
 
@@ -783,8 +828,8 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
     with n and p as FPTaylor variables and every u window widened to hold for
     every (n, p) in the sub-box.
 
-    The accept sweep is shelled in k (or in the offset n - k) rather than tied
-    to u, and each shell is paired with the binade shells of the u window that
+    The accept sweep is split in k (or in the offset n - k) rather than tied
+    to u, and each k range is paired with the u window (split at u = 0) that
     maps into it; see make_btrs_accept_box_template.
     """
     (n_lo, n_hi), (p_lo, p_hi) = n_iv, p_iv
@@ -866,26 +911,29 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
 
         floor_raw, n_floor = _fptaylor_max(
             fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
-            verbose, args.jobs)
+            verbose, args.jobs, args.bb_geometric_ratio_tol,
+            args.bb_eval, args.opt_x_abs_tol)
         accept_raw, n_accept = _fptaylor_max(
             fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
-            verbose, args.jobs)
+            verbose, args.jobs, args.bb_geometric_ratio_tol,
+            args.bb_eval, args.opt_x_abs_tol)
 
         eps_floor = max(eps_floor, 5 * floor_raw)
         eps_accept_raw = max(eps_accept_raw, accept_raw)
         n_boxes += n_floor + n_accept
 
-    # smallest us anywhere in the box, for the split-out -2*log(us) query
+    # widest u reached anywhere in the box, on each side, for the split-out
+    # -2*log(us) query and for the u_trunc excess in combine_tv
     consts = btrs_box_consts(n_iv, p_iv)
     fy_lo, fy_hi = y_window(0.0, n_hi)
-    us_min = 0.5 - max(abs(box_u_at(consts, fy_lo)[0]),
-                       abs(box_u_at(consts, fy_hi)[1]))
+    us_lo = 0.5 + box_u_at(consts, fy_lo)[0]
+    us_hi = 0.5 - box_u_at(consts, fy_hi)[1]
 
     # accept_iter = alpha / (sqrt(2*pi)*spq) = (2.83 + 5.1/b) / sqrt(2*pi):
     # spq cancels, so the worst case over the box is at b_lo.
     accept_iter = (2.83 + 5.1 / consts[2][0]) / math.sqrt(2 * math.pi)
     eps_accept, tv, n_extra = combine_tv(
-        fptaylor, fp, eps_floor, eps_accept_raw, accept_iter, us_min, args,
+        fptaylor, fp, eps_floor, eps_accept_raw, accept_iter, us_lo, us_hi, args,
         inputs_dir, outputs_dir, env)
     return eps_floor, eps_accept, tv, n_boxes + n_extra
 
@@ -1003,12 +1051,15 @@ def add_args(parser):
     parser.add_argument("--split-depth", type=int, default=1,
                         help="Interval mode: how many times to bisect each of "
                              "n and p at its midpoint, giving 4^DEPTH sub-boxes "
-                             "(default: 1). Variables (u, v) are shelled by "
-                             "binade instead; only the parameters are split.")
+                             "(default: 1). Sampler variables (u, v) are left "
+                             "to FPTaylor's own --bb-split geometric splitting "
+                             "instead; only the parameters are split here.")
     parser.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 1,
-                        help="BTRS only: FPTaylor queries to run concurrently, "
-                             "one per binade shell of u (default: number of "
-                             "CPUs)")
+                        help="Currently unused: FPTaylor queries always run "
+                             "with --opt bb, which is unsafe to run "
+                             "concurrently (see dist_common.fptaylor_cmd), so "
+                             "BTRS queries are forced to a single worker "
+                             "regardless of this value")
 
 
 def default_out_dir(args):

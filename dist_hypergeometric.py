@@ -9,12 +9,14 @@ Two regimes, matching numpy's dispatch:
                                     distributions/hypergeometric_hyp.c)
 """
 import math
+import shutil
+import tempfile
 from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
-    save_loglog_plot, loggam_defs, vprint,
+    save_loglog_plot, loggam_defs, vprint, fptaylor_cmd,
 )
 
 NAME = "hypergeometric"
@@ -296,7 +298,25 @@ def hrua_z_tail_prob(N, K, n):
     return tail
 
 
-def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env, verbose):
+def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
+                        bb_eval=False, x_abs_tol=None):
+    """Run one FPTaylor query and return output.
+
+    HRUA queries run one per call site, not concurrently, so the compile race
+    documented in dist_common.fptaylor_cmd does not apply here even with the
+    default --opt bb backend.
+    """
+    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
+    try:
+        return run_command(
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            cwd=ROOT, env=env)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
+                       verbose, ratio_tol=2.0, bb_eval=False, x_abs_tol=None):
     """Run both HRUA FPTaylor queries and return (eps_w, eps_accept, tv)."""
     xtail = 1e-4
 
@@ -304,7 +324,8 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
     w_output = outputs_dir / f"hypergeometric_hrua_w_{fp}_{tag}.out"
     w_input.write_text(make_hrua_w_template(N, K, n, fp, xtail))
 
-    code, output = run_command([fptaylor, str(w_input)], cwd=ROOT, env=env)
+    code, output = _run_fptaylor_query(fptaylor, w_input, outputs_dir, env,
+                                       ratio_tol, bb_eval, x_abs_tol)
     w_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor HRUA W (N={N} K={K} n={n}) ---\n{output}")
@@ -316,7 +337,8 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
     accept_output = outputs_dir / f"hypergeometric_hrua_accept_{fp}_{tag}.out"
     accept_input.write_text(make_hrua_accept_template(N, K, n, fp, xtail))
 
-    code, output = run_command([fptaylor, str(accept_input)], cwd=ROOT, env=env)
+    code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir, env,
+                                       ratio_tol, bb_eval, x_abs_tol)
     accept_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor HRUA accept (N={N} K={K} n={n}) ---\n{output}")
@@ -441,7 +463,8 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             if _use_hrua(N, K, n):
                 eps_w, eps_accept, tv = _run_hrua_fptaylor(
                     fptaylor, N, K, n, args.fp, tag, inputs_dir, outputs_dir,
-                    env, args.verbose,
+                    env, args.verbose, ratio_tol=args.bb_geometric_ratio_tol,
+                    bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
                 )
                 rows.append({
                     "N": N, "K": K, "n": n, "regime": "hrua",

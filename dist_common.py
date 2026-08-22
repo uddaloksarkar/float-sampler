@@ -8,9 +8,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import interval_error as ie
+from analyticError import FP_BETA
 
 ROOT = Path(__file__).resolve().parent
 
@@ -314,6 +316,26 @@ def add_common_args(parser):
                              "amount the reported TV is inflated by, e.g. "
                              "--u-trunc 1e-8 adds exactly 1e-8 to TV "
                              "(default: 2^-53).")
+    parser.add_argument("--bb-geometric-ratio-tol", type=float, default=2.0,
+                        help="FPTaylor's --bb-geometric-ratio-tol: how far "
+                             "(as a ratio) the branch-and-bound geometric "
+                             "splitter narrows a sub-domain before stopping. "
+                             "Must be > 1 (default: 2.0).")
+    parser.add_argument("--bb-eval", action="store_true",
+                        help="Use FPTaylor's interpreted --opt bb-eval "
+                             "backend instead of the default compiling "
+                             "--opt bb --bb-split geometric. No compile "
+                             "step, so queries can run concurrently (see "
+                             "--jobs) and there is no risk of the bb compile "
+                             "race, but bb-eval ignores --bb-split / "
+                             "--bb-geometric-ratio-tol entirely -- pair with "
+                             "--opt-x-abs-tol to control precision instead.")
+    parser.add_argument("--opt-x-abs-tol", type=float, default=1e-6,
+                        help="FPTaylor's --opt-x-abs-tol: domain-size "
+                             "termination tolerance for the optimizer "
+                             "(FPTaylor's own default is 0.01). Only passed "
+                             "to FPTaylor when --bb-eval is set (default "
+                             "here: 1e-6).")
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +462,90 @@ def loggam_defs(x_expr, prefix, rnd, shift=0):
     return lines, name
 
 
+TRANSCENDENTAL_BACKENDS = ("ieee", "crlibm", "rlibm")
+
+# PLACEHOLDER ledger: per-(backend, op) ULP bound k in the k * x * eps error
+# model below.  Every entry is currently the same guessed constant (10) that
+# transcendental_error_bound hardcoded for all ops and all backends before
+# this table existed -- none of these numbers have been pulled from the
+# actual accuracy guarantees each library documents yet:
+#   - "ieee": no correct-rounding guarantee for transcendentals in IEEE-754
+#     itself; treat as the conservative default until a real libm is named.
+#   - "crlibm": correctly-rounded libm (<= 0.5ulp) for every function it
+#     implements -- real entries should end up near 1, not 10.
+#   - "rlibm": accuracy varies by function and by RLIBM variant (RLIBM-ALL,
+#     RLIBM-FAST, ...); needs one entry per variant once real numbers land.
+# Replace op-by-op as each library's documented bound is looked up; until
+# then every backend behaves identically to the old flat placeholder.
+ULP_LEDGER = {
+    "ieee":   {"log": 10.0, "exp": 10.0, "sin": 10.0, "cos": 10.0, "lgamma": 10.0},
+    "crlibm": {"log": 10.0, "exp": 10.0, "sin": 10.0, "cos": 10.0, "lgamma": 10.0},
+    "rlibm":  {"log": 10.0, "exp": 10.0, "sin": 10.0, "cos": 10.0, "lgamma": 10.0},
+}
+
+
+def transcendental_error_bound(op, x, fp, backend="ieee"):
+    """
+    Upper bound on the absolute error of one call to a non-elementary math
+    function (log, exp, lgamma/random_loggam, ...) at argument x, standing in
+    for whatever the actual backend library (CoreMath's correctly-rounded
+    implementations, crlibm, RLIBM, the platform's standard libm, ...)
+    guarantees for that op.  `backend` selects the row of ULP_LEDGER (see
+    there); its entries are still placeholders, not real per-library figures.
+
+    The point of having any such bound, even a placeholder one: FPTaylor
+    otherwise assumes every log/exp/etc. call it evaluates is correctly
+    rounded to 0.5ulp, which need not hold for the library actually linked
+    at runtime.  Supplying the bound externally (as the `+/- uncertainty` on
+    an FPTaylor Variable -- REFERENCE.md "type var in [low, high] +/-
+    uncertainty") means FPTaylor only has to propagate a number we hand it,
+    not assume its own rounding model for that op; the op itself is then an
+    opaque call charged this additive error, not inlined and analysed by
+    FPTaylor at all (see log_ie/exp_ie/lgamma_ie for the paired true-value
+    enclosure).
+    """
+    eps = 2.0 ** -FP_BETA[fp]
+    k = ULP_LEDGER[backend][op]
+    return k * x * eps
+
+
+def loggam_error_bound(x, fp, backend="ieee"):
+    """random_loggam's case of transcendental_error_bound; see there."""
+    return transcendental_error_bound("lgamma", x, fp, backend=backend)
+
+
+def log_ie(x_lo, x_hi):
+    """Enclosure of math.log(x) for x in [x_lo, x_hi], x_lo > 0: log is
+    monotone increasing on (0, inf), so the endpoints bound it."""
+    return math.log(x_lo), math.log(x_hi)
+
+
+def exp_ie(x_lo, x_hi):
+    """Enclosure of math.exp(x) for x in [x_lo, x_hi]: exp is monotone
+    increasing everywhere, so the endpoints bound it."""
+    return math.exp(x_lo), math.exp(x_hi)
+
+
+_LGAMMA_ARGMIN = 1.4616321449683623  # where lgamma is smallest on (0, inf)
+
+
+def lgamma_ie(x_lo, x_hi):
+    """
+    Enclosure (lo, hi) of the exact math.lgamma(x) for x in [x_lo, x_hi],
+    x_lo >= 1: what an uncertain FPTaylor Variable for random_loggam's true
+    value needs as its declared range (paired with loggam_error_bound as its
+    +/- uncertainty).  lgamma is convex on (0, inf) with a single minimum at
+    _LGAMMA_ARGMIN, so it is monotone on each side of that point: the
+    enclosure is the two endpoint values, plus the minimum itself if it
+    falls inside [x_lo, x_hi].
+    """
+    lo = min(math.lgamma(x_lo), math.lgamma(x_hi))
+    if x_lo < _LGAMMA_ARGMIN < x_hi:
+        lo = min(lo, math.lgamma(_LGAMMA_ARGMIN))
+    hi = max(math.lgamma(x_lo), math.lgamma(x_hi))
+    return lo, hi
+
+
 def loggam_ie(x, shift=0):
     """
     random_loggam(x) in (enclosure, error) interval arithmetic -- the same
@@ -478,55 +584,53 @@ def loggam_ie(x, shift=0):
     return gl
 
 
-def fptaylor_cmd(fptaylor, input_path, work_dir):
+def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
+                 x_abs_tol=None):
     """
     argv for one FPTaylor query, with its own temporary and log directories.
 
-    Two things are pinned here, both needed to run queries concurrently.
+    Default: the compiling `bb` optimizer with geometric branch-and-bound
+    splitting (--bb-split geometric, --bb-geometric-ratio-tol) instead of
+    Python-side binade shelling of u/v/k -- FPTaylor's own splitter handles
+    the 1/us and log(us)-style conditioning that used to be pre-shelled.
 
-    The optimizer is forced to `bb-eval` rather than left at `auto`, which picks
-    the compiling `bb` backend for the larger problems.  `bb` writes a generated
-    OCaml program to tmp-base-dir under fixed names -- tmp/bb_1.ml, tmp/bb
-    [FPTaylor/default.cfg:141, FPTaylor/b_and_b/compile.sh] -- and runs it by a
-    path relative to the working directory, so concurrent queries overwrite each
-    other's program and run whichever binary won (observed as a pair of FPTaylor
-    processes hanging indefinitely, and in principle a bound reported for the
-    wrong expression).  It is also fragile on the expressions here: the deeper
-    box templates make it emit OCaml that does not parse ("Syntax error" on a
-    line of 81 closing parentheses), after which FPTaylor dies with Not_found.
-    bb-eval interprets instead of compiling, so it has neither problem.
+    `bb` writes its generated OCaml program to tmp-base-dir under fixed names
+    -- tmp/bb_1.ml, tmp/bb [FPTaylor/default.cfg:141,
+    FPTaylor/b_and_b/compile.sh] -- and runs it by a path relative to the
+    working directory regardless of --tmp-base-dir, so concurrent bb queries
+    race and clobber each other's compiled program (observed as hung
+    processes, and in principle a bound reported for the wrong expression).
+    Callers MUST run these serially (max_workers=1) when bb_eval=False; see
+    dist_binomial._fptaylor_max.  `bb` has also been observed to emit OCaml
+    that does not parse ("Syntax error" on a line of 81 closing parentheses)
+    on some deeply-nested box-mode templates, after which FPTaylor dies with
+    Not_found -- if that happens on a particular query, that query's template
+    needs hand-splitting; there is no blanket workaround here.
+
+    bb_eval=True switches to the interpreted `bb-eval` optimizer instead
+    (--opt bb-eval): no compile step, so no compile race and safe to run
+    concurrently, at the cost of the geometric splitter (bb-eval ignores
+    --bb-split / --bb-geometric-ratio-tol entirely -- see
+    FPTaylor/opt_bb_eval.ml, which calls Opt0.opt without them).  x_abs_tol,
+    if given, is passed as --opt-x-abs-tol to tighten (or loosen) the
+    domain-size termination tolerance both backends read
+    (FPTaylor/opt_common.ml); FPTaylor's own default is 0.01.
 
     Each query still gets its own temporary and log directory, so nothing in
-    FPTaylor's scratch space is shared between concurrent runs.
+    FPTaylor's scratch space is shared between runs.
     """
-    return [fptaylor, "--opt", "bb-eval",
+    if bb_eval:
+        argv = [fptaylor, "--opt", "bb-eval"]
+        if x_abs_tol is not None:
+            argv += ["--opt-x-abs-tol", f"{x_abs_tol:.17g}"]
+    else:
+        argv = [fptaylor, "--opt", "bb",
+               "--bb-split", "geometric",
+               "--bb-geometric-ratio-tol", f"{ratio_tol:.17g}"]
+    return argv + [
             "--tmp-base-dir", str(work_dir / "tmp"),
             "--log-base-dir", str(work_dir / "log"),
             str(input_path)]
-
-
-def binade_shells(lo, hi):
-    """
-    Cover [lo, hi] (0 < lo <= hi) by binades [2^j, 2^(j+1)], clipped at both
-    ends: the logarithmic shelling every 1/x- and log(x)-shaped term wants.
-
-    Returned smallest-first, and the union is exactly [lo, hi] -- no gaps, so a
-    max over the shells is a bound over the whole range.  Inside one shell the
-    exponent of x is fixed, so 1/x varies by a factor of 2 and log(x) by one
-    ulp of its exponent: an interval bound on either is then tight to within
-    that factor, instead of being pinned to the worst end of the whole range.
-    """
-    if not 0.0 < lo <= hi:
-        raise ValueError(f"binade_shells needs 0 < {lo:.6g} <= {hi:.6g}")
-
-    edges = [lo]
-    j = math.floor(math.log2(lo)) + 1        # smallest binade edge above lo
-    while 2.0 ** j < hi:
-        edges.append(2.0 ** j)
-        j += 1
-    edges.append(hi)
-    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)
-            if edges[i] < edges[i + 1]]
 
 
 def _fp_var_type(fp):
@@ -567,36 +671,40 @@ _LOGV_EPS_CACHE = {}
 
 
 def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
-             shells=False):
+             ratio_tol=2.0, bb_eval=False, x_abs_tol=None):
     """
     Absolute error of -log(v) over v in [vtail, 1]; same for every distribution
     parameter, so cache it.  Returns (error, n_boxes).
 
-    With shells=True the range is covered binade by binade (see binade_shells)
-    and the max is taken, one FPTaylor query per binade instead of one for the
-    whole range.
+    One query over the whole range: the 1/v conditioning near vtail is left to
+    FPTaylor's own branch-and-bound splitting (--opt bb --bb-split geometric,
+    see fptaylor_cmd) instead of being pre-shelled by binade in Python.
+    bb_eval/x_abs_tol switch to the --opt bb-eval backend instead.
     """
-    key = (fp, vtail, shells)
+    key = (fp, vtail, ratio_tol, bb_eval, x_abs_tol)
     if key in _LOGV_EPS_CACHE:
         return _LOGV_EPS_CACHE[key]
 
-    ranges = binade_shells(vtail, 1.0) if shells else [(vtail, 1.0)]
-    worst = 0.0
-    for v_lo, v_hi in ranges:
-        stem = f"logv_{fp}_{v_lo:.3e}_{v_hi:.3e}"
-        input_path = inputs_dir  / f"{stem}.txt"
-        out_path   = outputs_dir / f"{stem}.out"
-        input_path.write_text(make_logv_template(fp, v_lo, v_hi))
+    stem = f"logv_{fp}_{vtail:.3e}"
+    input_path = inputs_dir  / f"{stem}.txt"
+    out_path   = outputs_dir / f"{stem}.out"
+    input_path.write_text(make_logv_template(fp, vtail, 1.0))
 
-        code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
-        out_path.write_text(output)
-        if verbose >= 2:
-            print(f"--- FPTaylor log(v) on [{v_lo:.3e}, {v_hi:.3e}] ---\n{output}")
-        if code != 0:
-            raise RuntimeError(f"FPTaylor log(v) failed; see {out_path}")
-        worst = max(worst, extract_abs_errors_by_problem(output)["eps_logv"])
+    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
+    try:
+        code, output = run_command(
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            cwd=ROOT, env=env)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    out_path.write_text(output)
+    if verbose >= 2:
+        print(f"--- FPTaylor log(v) on [{vtail:.3e}, 1.0] ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor log(v) failed; see {out_path}")
+    worst = extract_abs_errors_by_problem(output)["eps_logv"]
 
-    result = (worst, len(ranges))
+    result = (worst, 1)
     _LOGV_EPS_CACHE[key] = result
     return result
 
@@ -638,32 +746,38 @@ _LOGUS_EPS_CACHE = {}
 
 
 def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
-              shells=False):
+              ratio_tol=2.0, bb_eval=False, x_abs_tol=None):
     """
     Absolute error of -2*log(us_) over us_ in [utail, 0.5]; same for every
-    distribution parameter, so cache it.  Returns (error, n_boxes); shells=True
-    covers the range binade by binade (see binade_shells).
+    distribution parameter, so cache it.  Returns (error, n_boxes).
+
+    One query over the whole range: the 1/us conditioning near utail is left
+    to FPTaylor's own branch-and-bound splitting (see eps_logv, fptaylor_cmd).
+    bb_eval/x_abs_tol switch to the --opt bb-eval backend instead.
     """
-    key = (fp, utail, shells)
+    key = (fp, utail, ratio_tol, bb_eval, x_abs_tol)
     if key in _LOGUS_EPS_CACHE:
         return _LOGUS_EPS_CACHE[key]
 
-    ranges = binade_shells(utail, 0.5) if shells else [(utail, 0.5)]
-    worst = 0.0
-    for us_lo, us_hi in ranges:
-        stem = f"logus_{fp}_{us_lo:.3e}_{us_hi:.3e}"
-        input_path = inputs_dir  / f"{stem}.txt"
-        out_path   = outputs_dir / f"{stem}.out"
-        input_path.write_text(make_logus_template(fp, us_lo, us_hi))
+    stem = f"logus_{fp}_{utail:.3e}"
+    input_path = inputs_dir  / f"{stem}.txt"
+    out_path   = outputs_dir / f"{stem}.out"
+    input_path.write_text(make_logus_template(fp, utail, 0.5))
 
-        code, output = run_command([fptaylor, str(input_path)], cwd=ROOT, env=env)
-        out_path.write_text(output)
-        if verbose >= 2:
-            print(f"--- FPTaylor log(us) on [{us_lo:.3e}, {us_hi:.3e}] ---\n{output}")
-        if code != 0:
-            raise RuntimeError(f"FPTaylor log(us) failed; see {out_path}")
-        worst = max(worst, extract_abs_errors_by_problem(output)["eps_logus"])
+    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
+    try:
+        code, output = run_command(
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            cwd=ROOT, env=env)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    out_path.write_text(output)
+    if verbose >= 2:
+        print(f"--- FPTaylor log(us) on [{utail:.3e}, 0.5] ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor log(us) failed; see {out_path}")
+    worst = extract_abs_errors_by_problem(output)["eps_logus"]
 
-    result = (worst, len(ranges))
+    result = (worst, 1)
     _LOGUS_EPS_CACHE[key] = result
     return result
