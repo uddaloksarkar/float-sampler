@@ -163,7 +163,8 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     -lambda + k*log(lambda) - loggam(k+1) - log(invalpha) + log(a/us^2 + b),
     with us = 0.5 - |u|   [random_poisson_ptrs.c lines 98-99, rearranged so
     that log(v) is alone on the left-hand side].
-    lgamma is approximated by inlining random_loggam's x>=7 Stirling branch.
+    loggam is random_loggam's x>=7 Stirling branch, computed via FPTaylor's
+    native lgamma(x) operator (loggam_defs, dist_common.py).
     log(a/us^2 + b) is rewritten as log(a + b*us^2) - 2*log(us) to avoid
     forming 1/us^2 directly when us is small (see dist_binomial.py).
 

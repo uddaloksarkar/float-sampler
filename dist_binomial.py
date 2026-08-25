@@ -16,6 +16,7 @@ import shutil
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
 from dist_common import (
@@ -112,14 +113,20 @@ def btrs_u_at(n, p, y, consts=None):
 
 _K_SLACK = 1.0            # floor can disagree by one integer: y in [k-1, k+2]
 
-# random_loggam is straight-line (Stirling) iff its argument is >= 7
-# [random_poisson_ptrs.c:44], i.e. k in [6, n-6]; the twelve k outside that
-# window take random_loggam's argument-reduction branch instead and are
-# tracked separately in a ledger rather than analysed here (see
-# _btrs_accept_boxes; make_btrs_accept_k_template still builds their template
-# for reference/reuse, it just isn't called from the accept sweep).
-_K_STIRLING_LO = 6.0
-_K_STIRLING_HI_MARGIN = 6.0
+# make_btrs_accept_template ties k to u via k_ = y_ - f (btrs_k_defs /
+# hormann_k_defs), f in [0, 1] -- see hormann_k_defs's docstring.  A shell
+# declared to cover k in [k_lo, ...] has y_window widen its low edge to
+# k_lo - _K_SLACK, so k1_ = k_ + 1 = (y_ - f) + 1 can reach as low as
+# (k_lo - _K_SLACK) - 1 + 1 = k_lo - _K_SLACK at the shell's low corner
+# (y_ at its widened minimum, f at its max).  FPTaylor's native lgamma
+# requires its argument > 0 (see FPTaylor/func.ml:lgamma_I), so k_lo must
+# exceed _K_SLACK; nk1_ mirrors this at the high (k near n) end.  This has
+# nothing to do with lgamma's own domain (it is rigorous for every x > 0) --
+# it is purely _K_SLACK and f's range pushing the *enclosure* below zero.
+# The extra 1.0 beyond _K_SLACK is headroom (the break-even point is exactly
+# _K_SLACK), confirmed empirically to clear FPTaylor's interval enclosure.
+_K_BOUNDARY_MARGIN = _K_SLACK + 1.0
+
 
 def y_window(k_lo, k_hi, slack=_K_SLACK):
     """
@@ -203,6 +210,38 @@ def _ivar(name, lo, hi, kind="real"):
     return f"  {kind} {name} in [{lo:.20e}, {hi:.20e}]"
 
 
+_EXACT_DIGITS = 25   # far below FPTaylor's own error-bound precision (~1e-16)
+
+
+def _exact_bracket(x, digits=_EXACT_DIGITS):
+    """
+    (lo, hi) exact finite-decimal strings with lo <= x <= hi, rounded outward
+    to `digits` significant digits.  FPTaylor's parser reads a Variables
+    literal as an exact rational (see input_parser_env.ml:add_variable_with_
+    uncertainty), so writing a value like p to only ~20 significant digits
+    (round-trip-safe for re-parsing to the same double, but not its true
+    exact decimal expansion) would silently analyse a slightly different
+    real number than the actual fp64 value.  Rounding outward instead of
+    guessing a single "close enough" literal keeps the query sound: x is
+    guaranteed to sit between the two points, whether or not x itself has a
+    short exact decimal (an integer n collapses to lo == hi automatically;
+    p in general does not).
+    """
+    d = Decimal(x) if isinstance(x, int) else Decimal(float(x))
+    if d == 0:
+        return "0", "0"
+    quant = Decimal(1).scaleb(d.adjusted() - digits + 1)
+    lo = d.quantize(quant, rounding=ROUND_FLOOR)
+    hi = d.quantize(quant, rounding=ROUND_CEILING)
+    return format(lo, "f"), format(hi, "f")
+
+
+def _point_ivar(name, value, kind="real"):
+    """Like _ivar, but for a single point value: see _exact_bracket."""
+    lo, hi = _exact_bracket(value)
+    return f"  {kind} {name} in [{lo}, {hi}]"
+
+
 def _template(var_lines, def_lines, expr):
     """Assemble one query; the last Variable and Definition get their ';'."""
     return ("Variables\n" + ",\n".join(var_lines) + ";\n\n"
@@ -251,9 +290,14 @@ def make_accept_template(fp, var_lines, n_expr, p_expr, mid, name_k, name_nk,
 
 
 def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
-    """Point form: only u is free; a, b, c are expressions in literal n and p."""
-    return make_floor_template(fp, [_ivar("u", u_lo, u_hi)],
-                               f"{float(n):.1f}", f"{p:.20e}")
+    """
+    Point form: only u varies; n and p are declared as Variables bracketing
+    the exact n, p (see _exact_bracket) so a, b, c reference them by name
+    instead of embedding the literal expression at every occurrence.
+    """
+    return make_floor_template(
+        fp, [_ivar("u", u_lo, u_hi), _point_ivar("n", n), _point_ivar("p", p)],
+        "n", "p")
 
 
 def _point_hm_defs(n, p, rnd):
@@ -270,43 +314,37 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
     Point form, k tied to u: free inputs are u and f only (btrs_k_defs), and
     sign selects the side of u = 0 that k's definition needs.
 
-    Valid only where both loggam arguments take random_loggam's x >= 7 Stirling
-    branch, i.e. k in [_K_STIRLING_LO, n - _K_STIRLING_HI_MARGIN]; the k outside
-    it go one at a time through make_btrs_accept_k_template.
+    Valid for k in [_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN]: FPTaylor's
+    native lgamma(x) is itself rigorous for every x > 0 (see
+    FPTaylor/func.ml:lgamma_I), but k1_ = k_ + 1's *enclosure* dips to <= 0
+    closer than that to either end (see _K_BOUNDARY_MARGIN) -- the k outside
+    that window go one at a time through make_btrs_accept_k_template.
+
+    n and p are declared as Variables bracketing the exact n, p (see
+    _exact_bracket); every Definition that needs them (btrs_k_defs, nk1_, and
+    via make_accept_template the shared setup block) references them by name
+    instead of embedding the literal expression at every occurrence.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
-    n_expr, p_expr = f"{float(n):.1f}", f"{p:.20e}"
     defs_k,  name_k  = loggam_defs("k1_",  "lgk",  rnd)
     defs_nk, name_nk = loggam_defs("nk1_", "lgnk", rnd)
 
     mid = (_point_hm_defs(n, p, rnd)
            + [f"  us_    {rnd}= 0.5 - abs(u),"]
-           + btrs_k_defs(sign, n_expr, p_expr)
-           + [f"  nk1_   = {n_expr} - k_ + 1.0,"]
+           + btrs_k_defs(sign, "n", "p")
+           + ["  nk1_   = n - k_ + 1.0,"]
            + defs_k + defs_nk)
     return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi), "  real f in [0.0, 1.0]"],
-        n_expr, p_expr, mid, name_k, name_nk, fast)
-
-
-def loggam_int_defs(x, prefix, rnd):
-    """
-    random_loggam(x) for an exact integer x >= 1, including the two branches the
-    Stirling form cannot take: the x in {1, 2} early return
-    [random_poisson_ptrs.c:41] and the x < 7 argument reduction.
-    Returns (lines, result_name) like loggam_defs.
-    """
-    if x in (1.0, 2.0):
-        return [f"  {prefix}_gl = 0.0,"], f"{prefix}_gl"
-    shift = int(7.0 - x) if x < 7.0 else 0
-    return loggam_defs(f"{x:.1f}", prefix, rnd, shift=shift)
+        fp, [_ivar("u", u_lo, u_hi), _point_ivar("n", n), _point_ivar("p", p),
+             "  real f in [0.0, 1.0]"],
+        "n", "p", mid, name_k, name_nk, fast)
 
 
 def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
     """
-    Point form for one integer k, for the k the Stirling shells cannot cover:
-    there random_loggam reduces its argument by an amount that depends on k, so
-    k cannot be a variable.
+    Point form for one integer k, for the k the margin sweep cannot cover
+    (see _K_BOUNDARY_MARGIN): tying k to u via k_ = y_ - f there would let
+    k1_ or nk1_'s enclosure reach <= 0, so k is a literal instead.
 
     k as a literal is how btrs.c feeds it: k and n - k + 1 are formed in integer
     arithmetic and cast, so both are error-free doubles.  This gives up the
@@ -322,8 +360,22 @@ def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
            + [f"  us_    {rnd}= 0.5 - abs(u),"]
            + defs_k + defs_nk)
     return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi)],
-        f"{float(n):.1f}", f"{p:.20e}", mid, name_k, name_nk, fast)
+        fp, [_ivar("u", u_lo, u_hi), _point_ivar("n", n), _point_ivar("p", p)],
+        "n", "p", mid, name_k, name_nk, fast)
+
+
+def loggam_int_defs(x, prefix, rnd):
+    """
+    random_loggam(x) for an exact integer x >= 1.  random_loggam itself only
+    takes lgamma(x) directly for x >= 7 -- below that it either early-returns
+    0 for x in {1, 2} [random_poisson_ptrs.c:41] or reduces the argument up
+    to x >= 7 first -- because its own Stirling series isn't valid below 7.
+    FPTaylor's native lgamma(x) has no such restriction (rigorous for every
+    x > 0, see FPTaylor/func.ml:lgamma_I), so there is nothing to special-case
+    here: call it directly at x itself.
+    Returns (lines, result_name) like loggam_defs.
+    """
+    return loggam_defs(f"{x:.1f}", prefix, rnd)
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +468,10 @@ def make_btrs_floor_box_template(box, fp):
 def btrs_box_hm(n_iv, p_iv):
     """
     (h, m) enclosures for btrs.c's once-per-(n,p) constants [btrs.c:75-76]:
-    m = floor((n+1)*p), h = lgamma(m+1) + lgamma(n-m+1).  lgamma is increasing
-    on [7, inf), so each end comes from the corresponding corner.
+    m = floor((n+1)*p), h = lgamma(m+1) + lgamma(n-m+1) = ln(m!) + ln((n-m)!).
+    ln(k!) is non-decreasing over integer k >= 0 (trivially, since k! is), so
+    each end comes from the corresponding corner regardless of how small m or
+    n - m gets.
 
     Both stay outside the accept query: inlining loggam for m and n - m would
     add two Horner chains and a dimension to the search, taking FPTaylor from
@@ -441,19 +495,19 @@ def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
         low=True   x = k,      k + 1 = x + 1,  n - k + 1 = n - x + 1
         low=False  x = n - k,  k + 1 = n - x + 1,  n - k + 1 = x + 1
 
-    That choice is what makes a box in n analysable at all.  Both loggam
-    arguments have to stay positive under interval arithmetic, and the one
+    That choice is what makes a box in n analysable at all.  The argument
     written as n - x + 1 carries the full width of the box (n and x cannot
     cancel); parametrizing by the small side keeps that wide argument on the
-    large loggam, where the width is harmless, and leaves the small argument --
-    the one that gets near loggam's domain edge -- exact.  The point templates
-    do not need this: with n a literal, n - k + 1 is exact either way.
+    large loggam, where the width is harmless, and leaves the small argument
+    exact.  The point templates do not need this: with n a literal,
+    n - k + 1 is exact either way.
 
-    x_iv is x's enclosure over this box.  A degenerate (v, v) with v < 7 is
-    emitted as a literal, so random_loggam's argument reduction can be spelled
-    out (loggam_int_defs); otherwise x is an FPTaylor variable and both loggam
-    arguments take the Stirling branch, which the caller guarantees by keeping
-    x_iv inside [_K_STIRLING_LO, n_lo - _K_STIRLING_HI_MARGIN].
+    x_iv is x's enclosure over this box.  A degenerate (v, v) is emitted as a
+    literal (loggam_int_defs), avoiding an unnecessary FPTaylor variable;
+    otherwise x is an FPTaylor variable ranging over the box.  FPTaylor's
+    native lgamma(x) is rigorous for every x > 0 (see
+    FPTaylor/func.ml:lgamma_I), so there is no Stirling-branch window x_iv
+    needs to stay inside.
 
     Unlike the point form, k is not tied to u here (there is no f): the caller
     pairs an x enclosure with the u window that maps into it, and the resulting
@@ -461,7 +515,7 @@ def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     x_lo, x_hi = x_iv
-    literal = x_lo == x_hi and x_lo < 7.0
+    literal = x_lo == x_hi
     x_ref = "x_" if literal else "x"
     small = f"{x_ref} + 1.0"
 
@@ -657,23 +711,23 @@ def _btrs_accept_boxes(n, p, fp, tag, consts, fast):
     """
     Boxes covering the accept expression for every k in [0, n], in two parts:
 
-      - k in [_K_STIRLING_LO, n - _K_STIRLING_HI_MARGIN]: both loggam arguments
-        are >= 7, so one query per side of u = 0 covers a whole run of k, with
-        k tied to u by btrs_k_defs.
-      - the twelve k outside that window: one query each, with k as a literal
-        and random_loggam's argument reduction spelled out
-        (make_btrs_accept_k_template).
+      - k in [_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN]: one query per side
+        of u = 0 covers a whole run of k, with k tied to u by btrs_k_defs.
+      - the boundary k outside that window (k1_ or nk1_'s enclosure would
+        dip to <= 0 there, see _K_BOUNDARY_MARGIN): one query each, with k
+        as a literal (make_btrs_accept_k_template).
     """
     boxes = []
-    y_lo, y_hi = y_window(_K_STIRLING_LO, n - _K_STIRLING_HI_MARGIN)
+    margin = _K_BOUNDARY_MARGIN
+    y_lo, y_hi = y_window(margin, n - margin)
     for i, (sign, u_lo, u_hi) in enumerate(u_shells(n, p, y_lo, y_hi, consts)):
         boxes.append((f"accept {_shell_label(sign, u_lo, u_hi)}",
                       _shell_stem("binomial_btrs_accept", fp, tag, i, sign),
                       make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign,
                                                 fast=fast)))
 
-    for k in (list(range(int(_K_STIRLING_LO)))
-              + [n - j for j in range(int(_K_STIRLING_HI_MARGIN))]):
+    edge = math.ceil(margin)
+    for k in (list(range(edge)) + [n - j for j in range(edge)]):
         ky_lo, ky_hi = y_window(k, k)
         u_lo = btrs_u_at(n, p, ky_lo, consts)
         u_hi = btrs_u_at(n, p, ky_hi, consts)
@@ -745,10 +799,10 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
         raise ValueError(f"BTRS shape constant a = {a:.6g} <= 0 "
                          f"(n*p*q = {n * p * (1.0 - p):.6g} too small); "
                          "the reachable u range is not a single interval")
-    if n < _K_STIRLING_LO + _K_STIRLING_HI_MARGIN:
-        raise ValueError(f"n = {n} leaves no k with both loggam arguments >= 7, "
-                         "so there is no Stirling window to shell")
-
+    if n < 2 * _K_BOUNDARY_MARGIN:
+        raise ValueError(f"n = {n} is too small to leave any k in "
+                         f"[_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN] "
+                         "for the accept margin sweep to cover")
     alpha  = (2.83 + 5.1 / b) * spq
     fy_lo, fy_hi = y_window(0.0, float(n))
     u_lo, u_hi = btrs_u_at(n, p, fy_lo, consts), btrs_u_at(n, p, fy_hi, consts)
@@ -789,34 +843,30 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
 
 def btrs_box_k_shells(n_iv, p_iv):
     """
-    (low, high): enclosures covering k in [_K_STIRLING_LO, n - _K_STIRLING_HI_MARGIN]
-    for every n in the box, i.e. the normal Stirling branch of random_loggam
-    (both loggam arguments >= 7).  `low` encloses k, `high` the offset
-    j = n - k; a k is covered if it appears in either.  Each is one query over
-    the whole range of x + 1 (the error runs through 1/(x+1) and log(x+1); the
+    (low, high): enclosures covering every k in [0, n] for every n in the box.
+    `low` encloses k, `high` the offset j = n - k; a k is covered if it
+    appears in either.  Each is one query over the whole range of x + 1 (the
+    error runs through 1/(x+1) and log(x+1); FPTaylor's native lgamma(x) is
+    rigorous for every x > 0, so x + 1 never leaves its domain, and the
     conditioning is left to FPTaylor's own branch-and-bound splitting,
     --opt bb --bb-split geometric).
 
-    The six degenerate k random_loggam reduces the argument for (the
-    argument-reduction branch, not Stirling) are NOT covered here -- tracked
-    separately in a ledger rather than via FPTaylor, same as the point-mode
-    sweep; see _btrs_accept_boxes.
-
-    The halves must meet (k_mid + j_mid >= n_hi - 1) while both stay inside the
-    Stirling domain of the other, n-dependent argument; if the box is too wide
-    the caller is told to raise --split-depth.
+    The halves must meet (k_mid + j_mid >= n_hi - 1); if the box is too wide
+    the caller is told to raise --split-depth.  A half that collapses to an
+    empty range (e.g. a box narrow enough in n that the other half alone
+    already reaches down to k = 0) is simply omitted.
     """
     n_lo, n_hi = n_iv
-    j_mid = n_lo - _K_STIRLING_HI_MARGIN
+    j_mid = n_lo
     k_mid = min(j_mid, n_hi - 1.0 - j_mid)
-    if k_mid < _K_STIRLING_LO or k_mid + j_mid < n_hi - 1.0:
+    if k_mid + j_mid < n_hi - 1.0:
         raise ValueError(
             f"n in [{n_lo:.6g}, {n_hi:.6g}] is too wide to cover k in [0, n]: "
             f"the low half reaches k = {k_mid:.6g} and the high half n - k = "
             f"{j_mid:.6g}, which do not meet; raise --split-depth")
 
     def shells(x_mid):
-        return [(_K_STIRLING_LO, x_mid)]
+        return [(0.0, x_mid)] if x_mid > 0.0 else []
 
     return shells(k_mid), shells(j_mid)
 
@@ -839,13 +889,6 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
         raise ValueError(f"BTRS shape constant a reaches {a[0]:.6g} <= 0 at the "
                          f"low corner of n in [{n_lo:.6g}, {n_hi:.6g}], "
                          f"p in [{p_lo:.6g}, {p_hi:.6g}]")
-    m_lo = math.floor((n_lo + 1.0) * p_lo)
-    m_hi = math.floor((n_hi + 1.0) * p_hi)
-    for name, lo in (("m", m_lo), ("n - m", n_lo - m_hi)):
-        if lo < _K_STIRLING_LO:
-            raise ValueError(f"{name} reaches {lo:.6g} over the box, below the "
-                             "x >= 7 domain of the inlined loggam in h")
-
     h_iv, m_iv = btrs_box_hm(n_iv, p_iv)
     sub = safe_box_name(n_lo, n_hi, p_lo, p_hi)
     floor_boxes, accept_boxes = [], []
@@ -890,10 +933,7 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
     is the bound for the whole box.
     """
     fp, verbose = args.fp, args.verbose
-    (n_lo, n_hi), (p_lo, p_hi) = n_iv, p_iv
-    if n_lo < _K_STIRLING_LO + _K_STIRLING_HI_MARGIN:
-        raise ValueError(f"n reaches {n_lo:.6g}, leaving no k with both loggam "
-                         "arguments >= 7, so there is no Stirling window to shell")
+    _, n_hi = n_iv
 
     sub_boxes = split_box(n_iv, p_iv, args.split_depth)
     vprint(verbose, f"binomial BTRS box {_box_label({'n': n_iv, 'p': p_iv})}",
@@ -1170,23 +1210,8 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 print(f"n={n} p={p} [BTRS] boxes={n_boxes}"
                       f" eps_floor={eps_floor:.6e}"
                       f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
-            elif args.backend == "cire":
-                # ---- inversion regime, CIRE ----
-                qn, z_lo, x_hi = inversion_params(n, p)
-                bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
-                vprint(args.verbose, f"binomial inversion n={n} p={p}",
-                       qn=qn, z_lo=z_lo, x_hi=x_hi, bound=bound)
-                eps0, eps1, eps2 = _run_cire(fptaylor, n, p, args, inputs_dir, outputs_dir)
-                tv = 0.5 * (eps0 + eps1 * p + eps2 * bound)
-                rows.append({
-                    "n": n, "p": f"{p:.17g}", "regime": "inversion",
-                    "eps0": f"{eps0:.17e}", "eps1": f"{eps1:.17e}", "eps2": f"{eps2:.17e}",
-                    "eps_floor": "nan", "eps_accept": "nan",
-                    "tv": f"{tv:.17e}", "n_boxes": 1,
-                })
-                print(f"n={n} p={p} eps0={eps0:.6e} eps1={eps1:.6e} eps2={eps2:.6e} TV={tv:.6e}")
             else:
-                # ---- inversion regime, FPTaylor ----
+                # ---- inversion regime, (FPTaylor only; CIRE not yet supported) ----
                 qn, z_lo, x_hi = inversion_params(n, p)
                 bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
                 vprint(args.verbose, f"binomial inversion n={n} p={p}",

@@ -236,9 +236,11 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
                                    + loggam(m-Z+1) + loggam(maxgoodbad-m+Z+1))
                                              [hypergeometric_hrua.c line 117]
 
-    lgamma is approximated by inlining random_loggam's x >= 7 Stirling
-    branch, so Z is restricted to the range where all four arguments are
-    >= 7 (same restriction as the BTRS/PTRS analyses).
+    loggam is random_loggam's x >= 7 Stirling branch, computed via
+    FPTaylor's native lgamma(x) operator (loggam_defs, dist_common.py), so
+    Z is restricted to the range where all four arguments are >= 7 (same
+    restriction as the BTRS/PTRS analyses, matching random_loggam's own
+    branch selection).
     """
     c   = _hrua_constants(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]

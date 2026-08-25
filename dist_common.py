@@ -435,24 +435,15 @@ def loggam_defs(x_expr, prefix, rnd, shift=0):
     with `gl -= log(x0 - 1)` [random_poisson_ptrs.c:58-61].  x0 and the x0 - i it
     steps through are exact whenever x_expr is an exact integer, which is the
     only way the sampler reaches that branch, so they are written as literals.
+
+    The Stirling series itself is FPTaylor's native lgamma(x) operator (a
+    rigorous enclosure of the true value, valid for every x > 0 -- see
+    FPTaylor/func.ml:lgamma_I), so shift is kept only to mirror
+    random_loggam's own recurrence and is no longer needed to keep x0 in a
+    Stirling-valid range.
     """
-    a = LOGGAM_A
     x0 = f"({x_expr} + {float(shift):.1f})" if shift else f"({x_expr})"
-    lines = []
-    # x2 = (1/x)*(1/x)
-    lines.append(f"  {prefix}_x2 {rnd}= (1.0 / {x0}) * (1.0 / {x0}),")
-    # Horner from a[9] down to a[0]
-    lines.append(f"  {prefix}_h9 = {a[9]:.20e},")
-    for i in range(8, -1, -1):
-        lines.append(
-            f"  {prefix}_h{i} {rnd}= {prefix}_h{i+1} * {prefix}_x2 + {a[i]:.20e},"
-        )
-    # gl = h0/x0 + 0.5*log(2pi) + (x0-0.5)*log(x0) - x0
-    lines.append(
-        f"  {prefix}_gl {rnd}= {prefix}_h0 / {x0}"
-        f" + {0.5 * LOGGAM_LG2PI:.20e}"
-        f" + ({x0} - 0.5) * log{x0} - {x0},"
-    )
+    lines = [f"  {prefix}_gl {rnd}= lgamma{x0},"]
     # ... then gl -= log(x0 - 1) once per shifted factor, x0 walking back down
     name = f"{prefix}_gl"
     for i in range(1, shift + 1):
