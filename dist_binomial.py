@@ -1,15 +1,5 @@
-"""
-Binomial sampler FP-error analysis: legacy inversion for n*p < _BTRS_SWITCH,
-BTRS (Hormann transformed rejection, distributions/btrs.c) above it.
-
-The BTRS bound covers the whole reachable u -- from u_lo, the u that maps to
-k = 0, up to u_hi, the u that maps to k = n -- with one FPTaylor query per
-side of u = 0 (see the "Sign-splitting of u" section); the 1/us conditioning
-within a side is left to FPTaylor's own branch-and-bound splitting
-(--opt bb --bb-split geometric, see dist_common.fptaylor_cmd).
-
-Follows the pattern in dist_geometric.py; called by main.py.
-"""
+"""Binomial sampler FP-error analysis: legacy inversion for n*p < _BTRS_SWITCH,
+BTRS (Hormann transformed rejection, distributions/btrs.c) above it."""
 import math
 import os
 import shutil
@@ -22,7 +12,6 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     loggam_defs, eps_logv, eps_logus,
-    transcendental_error_bound,
     vprint,
     fptaylor_cmd,
     us_root, hormann_u_at, hormann_k_defs,
@@ -38,10 +27,6 @@ CSV_FIELDS = ["n", "p", "n_lo", "n_hi", "p_lo", "p_hi", "regime",
 _BTRS_SWITCH = 30.0   # n*p threshold: inversion below, BTRS above
 
 
-# ---------------------------------------------------------------------------
-# FPTaylor template
-# ---------------------------------------------------------------------------
-
 def inversion_params(n, p):
     """(qn, z_lo, x_hi): the interval bounds the inversion templates use."""
     q = 1.0 - p
@@ -54,12 +39,8 @@ def inversion_params(n, p):
 
 
 def make_template(n, p, fp):
-    """
-    One query per elementary FP op in legacy_random_binomial_inversion's loop
-    (distributions/binomial_legacy_inversion.c):
-      eps0 = qn = exp(n*log(q)), q = 1-p       eps1 = px = z*(n-X+1)*p/(X*q)
-      eps2 = sum + prod  (sum in [qn,1], prod in [0,1])
-    """
+    """One query per FP op in legacy_random_binomial_inversion's loop
+    (distributions/binomial_legacy_inversion.c): eps0=qn, eps1=px, eps2=sum+prod."""
     qn, z_lo, x_hi = inversion_params(n, p)
     rnd = FP_TO_FPTAYLOR_RND[fp]
 
@@ -83,10 +64,6 @@ def make_template(n, p, fp):
     )
 
 
-# ---------------------------------------------------------------------------
-# BTRS FPTaylor template  (n*p >= _BTRS_SWITCH)
-# ---------------------------------------------------------------------------
-
 def btrs_consts(n, p):
     """(spq, a, b, c): the setup constants btrs.c computes once per (n, p)."""
     spq = math.sqrt(n * p * (1.0 - p))
@@ -101,42 +78,19 @@ def btrs_u_at(n, p, y, consts=None):
     return hormann_u_at(a, b, c, y)
 
 
-# ---------------------------------------------------------------------------
-# Sign-splitting of u
-# ---------------------------------------------------------------------------
-# btrs.c reaches u only through us = 0.5 - |u|, so u = 0 is a fold point where
-# neither the accept template's sign-dependent k definition (btrs_k_defs) nor
-# us itself is one-to-one.  Each side of u = 0 is therefore its own query; the
-# 1/us blow-up as us -> 0 within a side is left to FPTaylor's own
-# branch-and-bound splitting (--opt bb --bb-split geometric) rather than
-# pre-shelled by binade in Python.
-
 _K_SLACK = 1.0            # floor can disagree by one integer: y in [k-1, k+2]
-
-# k1_ = k_ + 1 = (y_ - f) + 1 (btrs_k_defs) can enclose down to k_lo - _K_SLACK
-# at a shell's low corner (y_'s slack-widened minimum, f at its max), which
-# must stay > 0 for FPTaylor's lgamma; not a domain issue, just _K_SLACK/f
-# pushing the enclosure below zero.  +1.0 is headroom past the break-even
-# point (empirically sufficient); nk1_ mirrors this at the k-near-n end.
-_K_BOUNDARY_MARGIN = _K_SLACK + 1.0
+_K_BOUNDARY_MARGIN = _K_SLACK + 1.0    # keeps k1_/nk1_ > 0 at a shell's edge
 
 
 def y_window(k_lo, k_hi, slack=_K_SLACK):
-    """
-    The y range that covers every u the program can map to a k in [k_lo, k_hi].
-    floor(y) = k means y in [k, k + 1), widened by `slack` on each side for the
-    floor disagreement (see _K_SLACK).
-    """
+    """y range covering every u mapping to a k in [k_lo, k_hi] (floor(y)=k
+    means y in [k, k+1)), widened by `slack` for floor disagreement."""
     return k_lo - slack, k_hi + 1.0 + slack
 
 
 def shell_u(u_lo, u_hi, y_lo, y_hi):
-    """
-    Split [u_lo, u_hi] at u = 0 into (sign, lo, hi) pieces, one per side that
-    is non-empty.  us = 0.5 - |u| is not one-to-one across u = 0, and the
-    accept template needs the sign anyway (btrs_k_defs).  y_lo/y_hi are only
-    for the error message.
-    """
+    """Split [u_lo, u_hi] at u=0 (us=0.5-|u| isn't 1:1 across it, and
+    btrs_k_defs needs the sign); y_lo/y_hi only for the error message."""
     if u_lo > u_hi:
         raise ValueError(f"empty u window for y in [{y_lo:.6g}, {y_hi:.6g}]")
     shells = []
@@ -147,24 +101,38 @@ def shell_u(u_lo, u_hi, y_lo, y_hi):
     return shells
 
 
-def u_shells(n, p, y_lo, y_hi, consts=None):
-    """shell_u at a literal (n, p); y is increasing in u, so the window inverts."""
+def clip_u_trunc(u_lo, u_hi, u_trunc):
+    """Clip [u_lo, u_hi] so us=0.5-|u| never dips below u_trunc; return
+    (u_lo, u_hi, excess), excess being the trimmed u-probability mass
+    (charged to TV by the caller, like v_trunc).  A box entirely beyond the
+    boundary clips to empty (u_lo > u_hi); callers must skip that query."""
+    excess = 0.0
+    lo_edge = u_trunc - 0.5
+    if u_lo < lo_edge:
+        excess += min(u_hi, lo_edge) - u_lo
+        u_lo = lo_edge
+    hi_edge = 0.5 - u_trunc
+    if u_hi > hi_edge:
+        excess += u_hi - max(u_lo, hi_edge)
+        u_hi = hi_edge
+    return u_lo, u_hi, excess
+
+
+def u_shells(n, p, y_lo, y_hi, consts=None, u_trunc=0.0):
+    """shell_u at a literal (n, p); y is increasing in u, so it inverts.
+    Returns (shells, excess); see clip_u_trunc."""
     consts = consts or btrs_consts(n, p)
-    return shell_u(btrs_u_at(n, p, y_lo, consts),
-                   btrs_u_at(n, p, y_hi, consts), y_lo, y_hi)
+    u_lo, u_hi, excess = clip_u_trunc(
+        btrs_u_at(n, p, y_lo, consts), btrs_u_at(n, p, y_hi, consts), u_trunc)
+    if u_lo > u_hi:
+        return [], excess
+    return shell_u(u_lo, u_hi, y_lo, y_hi), excess
 
 
 def btrs_setup_defs(rnd, n_expr, p_expr, accept=False):
-    """
-    btrs.c's setup block [lines 48-51, 72-76] as FPTaylor Definitions.
-
-    These are *derived* from n and p, not free inputs, so they have to be
-    written as expressions: it keeps them correlated with each other and with
-    u, and it charges the rounding of the setup arithmetic itself -- what
-    dist_poisson_stable.py has to add by hand as _const_err.
-
-    n_expr / p_expr are the FPTaylor source for n and p (literals here).
-    """
+    """btrs.c's setup block [lines 48-51, 72-76] as FPTaylor Definitions --
+    kept as expressions (not free inputs) so their own rounding is charged
+    and they stay correlated with u and each other."""
     d = [f"  spq_   {rnd}= sqrt({n_expr} * {p_expr} * (1.0 - {p_expr})),",
          f"  b_     {rnd}= 1.15 + 2.53 * spq_,",
          f"  a_     {rnd}= -0.0873 + 0.0248 * b_ + 0.01 * {p_expr},",
@@ -186,13 +154,6 @@ def btrs_k_defs(sign, n_expr, p_expr):
         "cx_")
 
 
-# --- template assembly -----------------------------------------------------
-#
-# Every BTRS query is one of two expressions -- eps_floor or eps_accept -- over
-# some set of free inputs.  The point, per-k and interval-parameter forms differ
-# only in which inputs are free and how k, m and h are spelled, so the two
-# expressions are built once here and the callers supply just those pieces.
-
 def _ivar(name, lo, hi, kind="real"):
     return f"  {kind} {name} in [{lo:.20e}, {hi:.20e}]"
 
@@ -205,11 +166,7 @@ def _template(var_lines, def_lines, expr):
 
 
 def make_floor_template(fp, var_lines, n_expr, p_expr):
-    """
-    eps_floor: absolute error of y = (2*a/us + b)*u + c, us = 0.5 - |u|
-    [btrs.c:60-61].  a, b, c stay expressions in n and p so they remain
-    correlated with each other and with u, and their own rounding is charged.
-    """
+    """eps_floor: absolute error of y=(2*a/us+b)*u+c, us=0.5-|u| [btrs.c:60-61]."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
     floor_defs = [f"  us_    {rnd}= 0.5 - abs(u),",
                   f"  y_     {rnd}= (2.0 * a_ / us_ + b_) * u + c_,"]
@@ -220,20 +177,12 @@ def make_floor_template(fp, var_lines, n_expr, p_expr):
 
 def make_accept_template(fp, var_lines, n_expr, p_expr, mid, name_k, name_nk,
                          fast=False):
-    """
-    eps_accept: absolute error of
-      h - loggam(k+1) - loggam(n-k+1) + (k-m)*lpq - log(alpha)
-        + log(a + b*us^2) - 2*log(us)                          [btrs.c:85]
-    excluding -log(v), which make_logv_template covers.
-
-    `mid` supplies the variant-specific Definitions (us_, k, m, h and the two
-    inlined random_loggam chains) between the shared setup block and the shared
-    tail; name_k / name_nk name the two loggam results.
-
-    With fast, -2*log(us) is dropped here and bounded by a separate eps_logus
-    query.  That drops u as a variable shared between the two terms, so the sum
-    may be looser.
-    """
+    """eps_accept: absolute error of h - loggam(k+1) - loggam(n-k+1)
+    + (k-m)*lpq - log(alpha) + log(a+b*us^2) - 2*log(us) [btrs.c:85],
+    excluding -log(v) (make_logv_template).  `mid` supplies the
+    variant-specific Definitions between the shared setup and tail; with
+    fast, -2*log(us) is dropped here for a separate (cheaper, looser)
+    eps_logus query instead."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return _template(
         var_lines,
@@ -247,37 +196,20 @@ def make_accept_template(fp, var_lines, n_expr, p_expr, mid, name_k, name_nk,
 
 
 def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
-    """
-    Point form: only u varies; n and p are declared as Variables bracketing
-    the exact n, p (see dist_common.exact_bracket) so a, b, c reference them by name
-    instead of embedding the literal expression at every occurrence.
-    """
+    """Point form: only u varies; n, p are Variables bracketing the exact
+    values (dist_common.exact_bracket), referenced by name."""
     return make_floor_template(
         fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p)],
         "n", "p")
 
 
 def _point_hm_defs(rnd):
-    """
-    m tied to (n, p) via a floor-encoding fm, exactly like k_ = y_ - f (see
-    make_btrs_accept_template): m_ = (n+1)*p - fm, fm in [0, 1), computed
-    entirely inside FPTaylor rather than precomputed via Python's own
-    (n+1)*p, which is not guaranteed to reproduce whatever rounding the
-    actual compiled sampler's multiply performs bit-for-bit.  h =
-    lgamma(m+1) + lgamma(n-m+1) [btrs.c:77] is two independently-rounded
-    lgamma calls plus a rounded addition -- what btrs.c does at runtime --
-    computed from m_ inside the query (loggam_defs), same as k1_/nk1_.
-    Precomputing lgamma(m+1)/lgamma(n-m+1) and charging only the addition's
-    rounding would assume each lgamma() call is exact, which for m in the
-    thousands is routinely on the order of the whole eps_accept bound.
-
-    Note: measured ~4.7x slower per iteration than a precomputed literal m
-    in queries whose u range already reaches near us -> 0 (fm adds a
-    permanent width-1 dimension that compounds with the splitting u already
-    needs there) -- reinstated anyway per explicit request; see git history
-    for the literal-m version if that cost matters more than the rigor gain
-    in a given use case.
-    """
+    """m tied to (n, p) via a floor-encoding fm (m_=(n+1)*p-fm, fm in [0,1)),
+    computed inside FPTaylor rather than precomputed in Python, which can't
+    guarantee matching the compiled sampler's rounding bit-for-bit; h =
+    lgamma(m+1)+lgamma(n-m+1) [btrs.c:77] is likewise derived from m_ inside
+    the query rather than precomputed, since each lgamma() call's own error
+    can be as large as the whole eps_accept bound for m in the thousands."""
     defs_hm,  name_hm  = loggam_defs("m_ + 1.0", "hm", rnd)
     defs_hnm, name_hnm = loggam_defs("n - m_ + 1.0", "hnm", rnd)
     return (["  m_     = (n + 1.0) * p - fm,"]
@@ -286,19 +218,10 @@ def _point_hm_defs(rnd):
 
 
 def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
-    """
-    Point form, k tied to u: free inputs are u and f only (btrs_k_defs), and
-    sign selects the side of u = 0 that k's definition needs.
-
-    Valid for k in [_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN]: lgamma(x)
-    is rigorous for every x > 0, but k1_ = k_ + 1's *enclosure* dips to <= 0
-    closer than that to either end (see _K_BOUNDARY_MARGIN); the k outside
-    that window go one at a time through make_btrs_accept_k_template.
-
-    n and p are declared as Variables bracketing the exact n, p (see
-    dist_common.exact_bracket) and referenced by name rather than re-embedded as
-    literals at every occurrence.
-    """
+    """Point form, k tied to u (free inputs: u, f; sign picks the u=0 side).
+    Valid only for k in [_K_BOUNDARY_MARGIN, n-_K_BOUNDARY_MARGIN] -- outside
+    that, k1_/nk1_'s enclosure dips to <= 0, so those k go one at a time
+    through make_btrs_accept_k_template instead."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
     defs_k,  name_k  = loggam_defs("k1_",  "lgk",  rnd)
     defs_nk, name_nk = loggam_defs("nk1_", "lgnk", rnd)
@@ -315,14 +238,9 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
 
 
 def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
-    """
-    Point form for one integer k, for the k the margin sweep can't cover (see
-    _K_BOUNDARY_MARGIN): tying k to u via k_ = y_ - f would let k1_/nk1_'s
-    enclosure reach <= 0, so k is a literal instead -- error-free, since k
-    and n - k + 1 are formed in integer arithmetic and cast, same as btrs.c.
-    This gives up btrs_k_defs's k-to-u coupling (u only ranges over the shell
-    for this k); the error in *choosing* k is eps_floor's job either way.
-    """
+    """Point form for one boundary k (see _K_BOUNDARY_MARGIN): k is a
+    literal instead of tied to u, since integer k/n-k+1 need no slack and
+    stay exact; the error in *choosing* k is eps_floor's job either way."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
     defs_k,  name_k  = loggam_int_defs(float(k) + 1.0,     "lgk",  rnd)
     defs_nk, name_nk = loggam_int_defs(float(n - k) + 1.0, "lgnk", rnd)
@@ -338,37 +256,16 @@ def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
 
 
 def loggam_int_defs(x, prefix, rnd):
-    """
-    random_loggam(x) for an exact integer x >= 1.  random_loggam itself only
-    takes lgamma(x) directly for x >= 7 -- below that it either early-returns
-    0 for x in {1, 2} [random_poisson_ptrs.c:41] or reduces the argument up
-    to x >= 7 first -- because its own Stirling series isn't valid below 7.
-    FPTaylor's native lgamma(x) has no such restriction (rigorous for every
-    x > 0, see FPTaylor/func.ml:lgamma_I), so there is nothing to special-case
-    here: call it directly at x itself.
-    Returns (lines, result_name) like loggam_defs.
-    """
+    """random_loggam(x) for an exact integer x >= 1: FPTaylor's own lgamma
+    is rigorous for every x > 0 (FPTaylor/func.ml:lgamma_I), unlike
+    random_loggam's own restriction to x >= 7, so call it directly at x.
+    Returns (lines, result_name) like loggam_defs."""
     return loggam_defs(f"{x:.1f}", prefix, rnd)
 
 
-# ---------------------------------------------------------------------------
-# Interval-parameter mode:  midpoint splitting of the (n, p) box
-# ---------------------------------------------------------------------------
-# Nothing is singular in n and p, so they get midpoint bisection into a grid of
-# sub-boxes rather than binade shells; the bound is the max over sub-boxes.
-# Within a sub-box they are FPTaylor variables, which costs correlation between
-# their repeated occurrences.  The slop lands hardest on n - k + 1, which the
-# inlined loggam needs a reciprocal and a logarithm of; naively it straddles
-# zero once the box is wider than n - k and FPTaylor rejects the query.  Kept in
-# check by (most important first) parametrizing each accept query by whichever
-# of k and n - k is small (make_btrs_accept_box_template), minimising the
-# occurrences of n and p, and --split-depth.
-
 def split_box(n_iv, p_iv, depth):
-    """
-    The 4^depth sub-boxes of [n_lo, n_hi] x [p_lo, p_hi] obtained by bisecting
-    each axis at its midpoint `depth` times.  Returned as (n_iv, p_iv) pairs.
-    """
+    """The 4^depth (n_iv, p_iv) sub-boxes from bisecting each axis at its
+    midpoint `depth` times."""
     boxes = [(n_iv, p_iv)]
     for _ in range(depth):
         boxes = [(sub_n, sub_p)
@@ -385,12 +282,9 @@ def _bisect(iv):
 
 
 def btrs_box_consts(n_iv, p_iv):
-    """
-    Enclosures of btrs_consts over the box, as (lo, hi) pairs, from the
-    monotonicity of each quantity: spq and b are increasing in n and in
-    p*(1-p) (which peaks at p = 1/2), a is increasing in b and in p, and
-    c = n*p + 0.5 is increasing in both.
-    """
+    """Enclosures of btrs_consts over the box, from the monotonicity of
+    each quantity (spq, b increasing in n and p*(1-p); a increasing in b, p;
+    c=n*p+0.5 increasing in both)."""
     (n_lo, n_hi), (p_lo, p_hi) = n_iv, p_iv
     pq_ends = (p_lo * (1.0 - p_lo), p_hi * (1.0 - p_hi))
     pq_lo   = min(pq_ends)
@@ -405,13 +299,9 @@ def btrs_box_consts(n_iv, p_iv):
 
 
 def box_u_at(box_consts, y):
-    """
-    Enclosure of {u : y_{n,p}(u) = y} over the box: the union of btrs_u_at's
-    single root at each (n, p).  us_root grows with a and b and shrinks with
-    gamma = |y - c|, c = n*p + 0.5, so the widest u comes from (a_lo, b_lo,
-    gamma_hi).  Which side of u = 0 depends on where y falls relative to c;
-    inside the enclosure of c the union straddles it.
-    """
+    """Enclosure of {u : y_{n,p}(u) = y} over the box: the union of
+    btrs_u_at's root at each (n, p); widest u comes from (a_lo, b_lo,
+    gamma_hi) since us_root grows with a, b and shrinks with gamma=|y-c|."""
     _, a, b, c = box_consts
     if y >= c[1]:                                  # above c for every (n, p)
         gam = (y - c[1], y - c[0])
@@ -426,10 +316,14 @@ def box_u_at(box_consts, y):
     return (-(0.5 - t), 0.5 - t)
 
 
-def box_u_shells(box_consts, y_lo, y_hi):
-    """shell_u over a parameter box: the widest u window, split at u = 0."""
-    return shell_u(box_u_at(box_consts, y_lo)[0],
-                   box_u_at(box_consts, y_hi)[1], y_lo, y_hi)
+def box_u_shells(box_consts, y_lo, y_hi, u_trunc=0.0):
+    """shell_u over a parameter box: the widest u window, split at u=0.
+    Returns (shells, excess); see clip_u_trunc."""
+    u_lo, u_hi, excess = clip_u_trunc(
+        box_u_at(box_consts, y_lo)[0], box_u_at(box_consts, y_hi)[1], u_trunc)
+    if u_lo > u_hi:
+        return [], excess
+    return shell_u(u_lo, u_hi, y_lo, y_hi), excess
 
 
 def make_btrs_floor_box_template(box, fp):
@@ -439,45 +333,14 @@ def make_btrs_floor_box_template(box, fp):
 
 
 def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
-    """
-    Interval-parameter form of the accept template, parametrized by whichever
-    of k and j = n - k is the *small* one:
-
-        low=True   x = k,      k + 1 = x + 1,  n - k + 1 = n - x + 1
-        low=False  x = n - k,  k + 1 = n - x + 1,  n - k + 1 = x + 1
-
-    n - x + 1 carries the full width of the box (n and x can't cancel);
-    parametrizing by the small side keeps that wide argument on the large
-    loggam (harmless there) and leaves the small argument exact.  Point mode
-    doesn't need this since n is a literal.
-
-    x_iv is x's enclosure; a degenerate (v, v) is emitted as a literal
-    (loggam_int_defs) rather than an FPTaylor variable.  Unlike the point
-    form, k is not tied to u here (no f): the caller pairs an x enclosure
-    with the u window mapping into it, a sound over-approximation of the
-    reachable (x, u) curve.  Tying k to u live via btrs_k_defs instead (as
-    the point form does) forces FPTaylor to re-derive a division (a/us)
-    with n, p *as ranges* inside the query; division amplifies interval
-    width multiplicatively, and the resulting margin needed to keep k1_/
-    nk1_ positive explodes non-linearly with the box's width (measured:
-    2.6 -> 9.65 -> 78.7 -> 642 -> unsatisfiable as p's width alone grew
-    from 0 to 0.01) rather than scaling gently -- so this shelled form,
-    which never lets u and n/p interact through that division inside the
-    query, is the one that actually works for a box wide enough to matter.
-
-    m is tied to (n, p) the same way k is tied to u: m_ = (n+1)*p - fm,
-    fm in [0, 1), encoding floor((n+1)*p) exactly (m is one integer, computed
-    once, same as k_ and j_ above -- no rounding).  This is safe where tying
-    k to u was not: (n+1)*p is a product of two *positive* ranges, which
-    interval arithmetic bounds exactly (no amplification), unlike a/us's
-    division by something that can shrink toward zero.  It also means m_
-    never appears in FPTaylor's own per-variable domain-size check (only
-    declared Variables do) -- fm in [0,1) is narrow regardless of the box's
-    width, whereas m_ declared directly could be thousands wide, so this
-    removes what was often the single most expensive dimension to narrow.
-    h = lgamma(m+1) + lgamma(n-m+1) is computed from m *inside* the query
-    (loggam_defs), same as before.
-    """
+    """Interval-parameter accept form, parametrized by whichever of k and
+    j=n-k is small (low=True: x=k; low=False: x=n-k) so the box-width-sized
+    argument n-x+1 lands on the large loggam and the small one stays exact.
+    k is not tied to u here (unlike the point form): the caller instead
+    pairs an x enclosure with the u window mapping into it, since deriving
+    k live via a/us with n, p as ranges makes the k1_/nk1_ margin explode
+    non-linearly with box width.  m is tied to (n,p) via m_=(n+1)*p-fm
+    (safe: a product of positive ranges, unlike a/us's division)."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
     x_lo, x_hi = x_iv
     literal = x_lo == x_hi
@@ -558,27 +421,34 @@ def inversion_box_params(n_lo, n_hi, p_lo, p_hi):
     }
 
 
+def _run_inversion_fptaylor(fptaylor, template, label, tag, args,
+                            inputs_dir, outputs_dir, env, p_bound, bound):
+    """Run one inversion-regime FPTaylor query; return (eps0, eps1, eps2, tv),
+    tv = 0.5*(eps0 + eps1*p_bound + eps2*bound)."""
+    input_path = inputs_dir / f"binomial_inversion_{args.fp}_{tag}.txt"
+    input_path.write_text(template)
+    code, output = run_command(
+        [fptaylor, "--rel-error", "true", str(input_path)], cwd=ROOT, env=env)
+    out_path = outputs_dir / f"binomial_inversion_{args.fp}_{tag}.out"
+    out_path.write_text(output)
+    if args.verbose >= 2:
+        print(f"--- FPTaylor binomial_inversion {label} ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor failed for {label}; see {out_path}")
+
+    deltas = extract_deltas_by_problem(output, label)
+    eps0, eps1, eps2 = deltas["eps0"], deltas["eps1"], deltas["eps2"]
+    tv = 0.5 * (eps0 + eps1 * p_bound + eps2 * bound)
+    return eps0, eps1, eps2, tv
+
+
 def _run_inversion_box(fptaylor, box, args, tag, inputs_dir, outputs_dir, env):
     """(eps0, eps1, eps2, tv) valid for every (n, p) in the box."""
     vprint(args.verbose, f"binomial inversion box {_box_label(box)}",
            **{k: f"[{v[0]:.10g}, {v[1]:.10g}]" for k, v in box.items()})
-
-    input_path = inputs_dir / f"binomial_inversion_{args.fp}_{tag}.txt"
-    input_path.write_text(make_inversion_box_template(box, args.fp))
-    code, output = run_command(
-        [fptaylor, "--rel-error", "true", str(input_path)], cwd=ROOT, env=env,
-    )
-    out_path = outputs_dir / f"binomial_inversion_{args.fp}_{tag}.out"
-    out_path.write_text(output)
-    if args.verbose >= 2:
-        print(f"--- FPTaylor binomial_inversion box ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor failed for the box; see {out_path}")
-
-    deltas = extract_deltas_by_problem(output, _box_label(box))
-    eps0, eps1, eps2 = deltas["eps0"], deltas["eps1"], deltas["eps2"]
-    tv = 0.5 * (eps0 + eps1 * box["p"][1] + eps2 * box["bound"][1])
-    return eps0, eps1, eps2, tv
+    return _run_inversion_fptaylor(
+        fptaylor, make_inversion_box_template(box, args.fp), _box_label(box),
+        tag, args, inputs_dir, outputs_dir, env, box["p"][1], box["bound"][1])
 
 
 def _box_label(box):
@@ -586,41 +456,28 @@ def _box_label(box):
     return f"n in [{n_lo:.10g}, {n_hi:.10g}] p in [{p_lo:.10g}, {p_hi:.10g}]"
 
 
+def _fmt_signed(v):
+    return f"{v:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
+
+
 def safe_box_name(n_lo, n_hi, p_lo, p_hi):
-    def fmt(v):
-        return f"{v:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
-    return f"box_n{fmt(n_lo)}_{fmt(n_hi)}_p{fmt(p_lo)}_{fmt(p_hi)}"
+    return (f"box_n{_fmt_signed(n_lo)}_{_fmt_signed(n_hi)}"
+            f"_p{_fmt_signed(p_lo)}_{_fmt_signed(p_hi)}")
 
-
-# ---------------------------------------------------------------------------
-# Running one FPTaylor query per box
-# ---------------------------------------------------------------------------
 
 def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
                   verbose, jobs, ratio_tol, bb_eval=False, x_abs_tol=None,
                   x_abs_tol_vars=None):
-    """
-    Run one FPTaylor query per box and return (max_error, n_boxes).
-
-    `boxes` is a list of (label, stem, template_text): label goes in the log,
-    stem names the input/output files.
-
-    bb_eval=False (default) compiles each query with --opt bb under a fixed
-    filename relative to the working directory regardless of --tmp-base-dir
-    [FPTaylor/opt_basic_bb.ml], so concurrent bb queries race and clobber
-    each other's compiled program -- `jobs` is capped to 1 worker.
-    bb_eval=True uses the interpreted --opt bb-eval instead: no compile step,
-    no race, `jobs` workers run concurrently.
-
-    x_abs_tol/x_abs_tol_vars are forwarded to fptaylor_cmd unchanged (see
-    dist_common.fptaylor_cmd for how they interact with --bb-split midpoint).
-    """
+    """Run one FPTaylor query per (label, stem, template_text) box; return
+    (max_error, n_boxes).  bb_eval=False compiles under a fixed filename
+    regardless of --tmp-base-dir, so concurrent queries race -- jobs is
+    capped to 1; bb_eval=True (interpreted, no compile step) runs `jobs`
+    concurrently."""
     def one(box):
         label, stem, text = box
         in_path  = inputs_dir  / f"{stem}.txt"
         out_path = outputs_dir / f"{stem}.out"
         in_path.write_text(text)
-        # each query gets its own scratch dir; see dist_common.fptaylor_cmd
         work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
         try:
             code, output = run_command(
@@ -636,9 +493,8 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
             raise RuntimeError(f"FPTaylor failed on {label}; see {out_path}")
         errors = extract_abs_errors_by_problem(output)
         if expr not in errors:
-            # FPTaylor exits 0 but reports nothing when the box leaves the
-            # domain of a subexpression (a log or a division by an interval
-            # straddling zero), so a missing bound has to be an error too
+            # FPTaylor exits 0 but reports nothing if the box leaves a
+            # subexpression's domain (log/division straddling zero)
             raise RuntimeError(f"FPTaylor reported no {expr} bound on {label}; "
                                f"see {out_path}")
         return errors[expr]
@@ -663,34 +519,39 @@ def _shell_stem(prefix, fp, tag, index, sign):
     return f"{prefix}_{fp}_{tag}_{'m' if sign < 0 else 'p'}{index:02d}"
 
 
-def _btrs_floor_boxes(n, p, fp, tag, consts):
-    """
-    One box per side of u = 0 that btrs.c does not reject outright, i.e. the u
-    it maps to some k in [0, n]        [btrs.c:62-64].
-    """
+def _floor_shell_boxes(shells, fp, tag, template_fn):
+    """(label, stem, template) triples, one per u=0 side, from `shells`;
+    template_fn(u_lo, u_hi) builds the query text for one side."""
+    return [(f"floor {_shell_label(sign, u_lo, u_hi)}",
+            _shell_stem("binomial_btrs_floor", fp, tag, i, sign),
+            template_fn(u_lo, u_hi))
+            for i, (sign, u_lo, u_hi) in enumerate(shells)]
+
+
+def _btrs_floor_boxes(n, p, fp, tag, consts, u_trunc=0.0):
+    """One box per side of u=0 covering every k in [0, n] [btrs.c:62-64];
+    --u-trunc clips each outer edge (clip_u_trunc). Returns (boxes, excess)."""
     y_lo, y_hi = y_window(0.0, float(n))
+    shells, excess = u_shells(n, p, y_lo, y_hi, consts, u_trunc)
+    boxes = _floor_shell_boxes(
+        shells, fp, tag,
+        lambda u_lo, u_hi: make_btrs_floor_template(n, p, fp, u_lo, u_hi))
+    return boxes, excess
+
+
+def _btrs_accept_boxes(n, p, fp, tag, consts, fast, u_trunc=0.0):
+    """Boxes covering the accept expression for every k in [0, n]: a
+    margin-tied shell for k in [_K_BOUNDARY_MARGIN, n-_K_BOUNDARY_MARGIN],
+    plus one literal-k query each for the boundary k outside it (see
+    _K_BOUNDARY_MARGIN).  --u-trunc clips or drops each; returns
+    (boxes, excess)."""
     boxes = []
-    for i, (sign, u_lo, u_hi) in enumerate(u_shells(n, p, y_lo, y_hi, consts)):
-        boxes.append((f"floor {_shell_label(sign, u_lo, u_hi)}",
-                      _shell_stem("binomial_btrs_floor", fp, tag, i, sign),
-                      make_btrs_floor_template(n, p, fp, u_lo, u_hi)))
-    return boxes
-
-
-def _btrs_accept_boxes(n, p, fp, tag, consts, fast):
-    """
-    Boxes covering the accept expression for every k in [0, n], in two parts:
-
-      - k in [_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN]: one query per side
-        of u = 0 covers a whole run of k, with k tied to u by btrs_k_defs.
-      - the boundary k outside that window (k1_ or nk1_'s enclosure would
-        dip to <= 0 there, see _K_BOUNDARY_MARGIN): one query each, with k
-        as a literal (make_btrs_accept_k_template).
-    """
-    boxes = []
+    excess = 0.0
     margin = _K_BOUNDARY_MARGIN
     y_lo, y_hi = y_window(margin, n - margin)
-    for i, (sign, u_lo, u_hi) in enumerate(u_shells(n, p, y_lo, y_hi, consts)):
+    shells, shell_excess = u_shells(n, p, y_lo, y_hi, consts, u_trunc)
+    excess += shell_excess
+    for i, (sign, u_lo, u_hi) in enumerate(shells):
         boxes.append((f"accept {_shell_label(sign, u_lo, u_hi)}",
                       _shell_stem("binomial_btrs_accept", fp, tag, i, sign),
                       make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign,
@@ -699,58 +560,33 @@ def _btrs_accept_boxes(n, p, fp, tag, consts, fast):
     edge = math.ceil(margin)
     for k in (list(range(edge)) + [n - j for j in range(edge)]):
         ky_lo, ky_hi = y_window(k, k)
-        u_lo = btrs_u_at(n, p, ky_lo, consts)
-        u_hi = btrs_u_at(n, p, ky_hi, consts)
+        u_lo, u_hi, k_excess = clip_u_trunc(
+            btrs_u_at(n, p, ky_lo, consts), btrs_u_at(n, p, ky_hi, consts),
+            u_trunc)
+        excess += k_excess
+        if u_lo > u_hi:
+            continue    # k=k's whole u range lies beyond the truncation edge
         boxes.append((f"accept k={k}",
                       f"binomial_btrs_accept_{fp}_{tag}_k{k}",
                       make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k,
                                                   fast=fast)))
-    return boxes
+    return boxes, excess
 
 
 def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
-               args, inputs_dir, outputs_dir, env, ledger=False):
-    """
-    (eps_accept, tv, n_extra): fold the per-query maxima into the TV bound.
-
-    eps_accept still owes -log(v) (and, with --fast, the split-out
-    -2*log(us)) before it's complete.  v realizes any value in (0,1),
-    including values arbitrarily close to 0 where log(v) has no finite
-    rigorous bound, so -log(v) is only certified down to args.v_trunc; the
-    region of v mass below that is charged to TV directly (real and FP
-    samplers may disagree on it, same as a sampler that disagrees on a
-    positive-probability event):
-
-        tv = 2*eps_floor*accept_iter + 2*eps_accept + v_trunc
-
-    us_lo/us_hi, by contrast, are the smallest us = 0.5 - |u| the sampler's
-    own reachable-k boundary (k=0, k=n) ever reaches for this (n, p) -- u is
-    bounded away from 0 there by construction (a discrete k boundary, not an
-    infimum like v's), so unlike v_trunc this is not a precision/TV
-    tradeoff: if either dips below args.u_trunc it means this (n, p) reaches
-    a domain edge we don't trust FPTaylor's bound to be meaningful over, and
-    that is raised as an error rather than silently absorbed into TV.
-
-    ledger=True charges -log(v) via transcendental_error_bound instead of a
-    query, and skips -2*log(us) entirely; unused by any current caller, kept
-    for a path that ledgers log/exp rather than inlining them.
-    """
-    if us_lo < args.u_trunc:
-        raise ValueError(f"reachable us at the k=0 boundary ({us_lo:.3e}) is "
-                         f"below --u-trunc ({args.u_trunc:.3e})")
-    if us_hi < args.u_trunc:
-        raise ValueError(f"reachable us at the k=n boundary ({us_hi:.3e}) is "
-                         f"below --u-trunc ({args.u_trunc:.3e})")
+               u_excess, args, inputs_dir, outputs_dir, env):
+    """(eps_accept, tv, n_extra): fold the per-query maxima into
+    tv = 2*eps_floor*accept_iter + 2*eps_accept + v_trunc + u_excess.
+    v_trunc/u_excess charge the -log(v) and u-domain regions each query
+    declines to certify near their respective singularities (see
+    clip_u_trunc); us_lo/us_hi are the smallest us reached by any query
+    after that clipping, passed to the split-out -2*log(us) query below."""
     us_min = min(us_lo, us_hi)
-    if ledger:
-        logv = transcendental_error_bound("log", 1.0, fp)
-        n_extra = 0
-    else:
-        logv, n_extra = eps_logv(fptaylor, fp, args.v_trunc, inputs_dir, outputs_dir,
-                                 env, args.verbose, args.bb_geometric_ratio_tol,
-                                 args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
+    logv, n_extra = eps_logv(fptaylor, fp, args.v_trunc, inputs_dir, outputs_dir,
+                             env, args.verbose, args.bb_geometric_ratio_tol,
+                             args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
     eps_accept = accept_raw + logv
-    if args.fast and not ledger:
+    if args.fast:
         # the -2*log(us) query only sees us, so the smallest reachable us (a
         # superset of every shell's us range) is the right bound to pass
         logus, n_logus = eps_logus(fptaylor, fp, us_min, inputs_dir,
@@ -759,8 +595,23 @@ def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
                                    args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
         eps_accept += logus
         n_extra += n_logus
-    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + args.v_trunc
+    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + u_excess + args.v_trunc
     return eps_accept, tv, n_extra
+
+
+def _run_floor_accept(fptaylor, floor_boxes, accept_boxes, args,
+                      inputs_dir, outputs_dir, env):
+    """Run one floor/accept box set through _fptaylor_max; return
+    (floor_raw, accept_raw, n_floor, n_accept)."""
+    floor_raw, n_floor = _fptaylor_max(
+        fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
+        args.verbose, args.jobs, args.bb_geometric_ratio_tol,
+        args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args))
+    accept_raw, n_accept = _fptaylor_max(
+        fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
+        args.verbose, args.jobs, args.bb_geometric_ratio_tol,
+        args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
+    return floor_raw, accept_raw, n_floor, n_accept
 
 
 def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
@@ -784,30 +635,22 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
            u_lo=u_lo, u_hi=u_hi, us_lo=us_lo, us_hi=us_hi,
            v_trunc=args.v_trunc, u_trunc=args.u_trunc)
 
-    floor_boxes  = _btrs_floor_boxes(n, p, fp, tag, consts)
-    accept_boxes = _btrs_accept_boxes(n, p, fp, tag, consts, args.fast)
+    floor_boxes,  floor_excess  = _btrs_floor_boxes(n, p, fp, tag, consts,
+                                                    args.u_trunc)
+    accept_boxes, accept_excess = _btrs_accept_boxes(n, p, fp, tag, consts,
+                                                      args.fast, args.u_trunc)
+    # same underlying trimmed region measured two ways -- max, not sum
+    u_excess = max(floor_excess, accept_excess)
+    us_lo, us_hi = max(us_lo, args.u_trunc), max(us_hi, args.u_trunc)
 
-    # k-tail (k outside [0, n]) is rejected identically by both samplers, so
-    # it costs nothing; us_lo/us_hi (checked against --u-trunc) and the
-    # -log(v) domain floor (--v-trunc, charged flatly to TV) are both
-    # handled in combine_tv.
-    floor_raw, n_floor = _fptaylor_max(
-        fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
-        verbose, args.jobs, args.bb_geometric_ratio_tol,
-        args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args))
+    floor_raw, accept_raw, n_floor, n_accept = _run_floor_accept(
+        fptaylor, floor_boxes, accept_boxes, args, inputs_dir, outputs_dir, env)
     eps_floor = 5 * floor_raw
 
-    accept_raw, n_accept = _fptaylor_max(
-        fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
-        verbose, args.jobs, args.bb_geometric_ratio_tol,
-        args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
-
-    # btrs is renormalized by the modal pmf f(m) = B(m) ~ 1/(sqrt(2*pi)*spq),
-    # so the per-iteration acceptance probability is 1/(alpha*f(m)).
     accept_iter = alpha / (math.sqrt(2 * math.pi) * spq)
     eps_accept, tv, n_extra = combine_tv(
-        fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi, args,
-        inputs_dir, outputs_dir, env)
+        fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
+        u_excess, args, inputs_dir, outputs_dir, env)
     vprint(verbose, f"binomial BTRS boxes n={n} p={p}",
            floor_boxes=n_floor, accept_boxes=n_accept, logv_boxes=n_extra,
            floor_raw=floor_raw, accept_raw=accept_raw)
@@ -816,17 +659,9 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
 
 
 def btrs_box_k_shells(n_iv, p_iv):
-    """
-    (low, high): enclosures covering every k in [0, n] for every n in the box.
-    `low` encloses k, `high` the offset j = n - k; a k is covered if it
-    appears in either.  Each is one query over the whole range of x + 1, with
-    the 1/(x+1) and log(x+1) conditioning left to FPTaylor's own
-    branch-and-bound splitting (--opt bb --bb-split geometric).
-
-    The halves must meet (k_mid + j_mid >= n_hi - 1); too-wide a box raises,
-    telling the caller to bump --split-depth.  A half that collapses to an
-    empty range (e.g. the other half alone already reaches k = 0) is omitted.
-    """
+    """(low, high): enclosures covering every k in [0, n] for every n in the
+    box (low encloses k, high the offset j=n-k).  Raises if the halves
+    don't meet (k_mid + j_mid >= n_hi - 1); caller should bump --split-depth."""
     n_lo, n_hi = n_iv
     j_mid = n_lo
     k_mid = min(j_mid, n_hi - 1.0 - j_mid)
@@ -842,17 +677,11 @@ def btrs_box_k_shells(n_iv, p_iv):
     return shells(k_mid), shells(j_mid)
 
 
-def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
-    """
-    (floor_boxes, accept_boxes) for one sub-box of the parameter grid: the same
-    coverage as the point-mode sweeps (_btrs_floor_boxes, _btrs_accept_boxes),
-    with n and p as FPTaylor variables and every u window widened to hold for
-    every (n, p) in the sub-box.
-
-    The accept sweep is split in k (or in the offset n - k) rather than tied
-    to u, and each k range is paired with the u window (split at u = 0) that
-    maps into it; see make_btrs_accept_box_template.
-    """
+def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast, u_trunc=0.0):
+    """(floor_boxes, accept_boxes, floor_excess, accept_excess) for one
+    sub-box: same coverage as the point-mode sweeps, with n, p as FPTaylor
+    variables (see make_btrs_accept_box_template).  floor_excess/
+    accept_excess are kept separate since they trim overlapping u-mass."""
     (n_lo, n_hi), (p_lo, p_hi) = n_iv, p_iv
     consts = btrs_box_consts(n_iv, p_iv)
     _, a, _, _ = consts
@@ -861,24 +690,23 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
                          f"low corner of n in [{n_lo:.6g}, {n_hi:.6g}], "
                          f"p in [{p_lo:.6g}, {p_hi:.6g}]")
     sub = safe_box_name(n_lo, n_hi, p_lo, p_hi)
-    floor_boxes, accept_boxes = [], []
+    accept_boxes = []
+    accept_excess = 0.0
 
-    for i, (sign, u_lo, u_hi) in enumerate(
-            box_u_shells(consts, *y_window(0.0, n_hi))):
-        box = {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv}
-        floor_boxes.append((f"floor {_shell_label(sign, u_lo, u_hi)}",
-                            _shell_stem("binomial_btrs_floor", fp,
-                                        f"{tag}_{sub}", i, sign),
-                            make_btrs_floor_box_template(box, fp)))
+    floor_shells, floor_excess = box_u_shells(consts, *y_window(0.0, n_hi), u_trunc)
+    floor_boxes = _floor_shell_boxes(
+        floor_shells, fp, f"{tag}_{sub}",
+        lambda u_lo, u_hi: make_btrs_floor_box_template(
+            {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv}, fp))
 
     low, high = btrs_box_k_shells(n_iv, p_iv)
     for is_low, x_shells in ((True, low), (False, high)):
         side = "k" if is_low else "n-k"
         for x_lo, x_hi in x_shells:
-            # the k these x cover, and hence the y and the u that reach them
             k_iv = (x_lo, x_hi) if is_low else (n_lo - x_hi, n_hi - x_lo)
             y_lo, y_hi = y_window(*k_iv)
-            u_win = box_u_shells(consts, y_lo, y_hi)
+            u_win, win_excess = box_u_shells(consts, y_lo, y_hi, u_trunc)
+            accept_excess += win_excess
             for i, (sign, u_lo, u_hi) in enumerate(u_win):
                 box = {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv,
                        "x": (x_lo, x_hi)}
@@ -891,17 +719,12 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
                     f"{'m' if sign < 0 else 'p'}{i:02d}",
                     make_btrs_accept_box_template(box, fp, is_low, (x_lo, x_hi),
                                                   fast=fast)))
-    return floor_boxes, accept_boxes
+    return floor_boxes, accept_boxes, floor_excess, accept_excess
 
 
 def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env):
-    """
-    (eps_floor, eps_accept, tv, n_boxes) valid for every (n, p) in the box.
-
-    The parameter box is bisected at its midpoints into 4^--split-depth
-    sub-boxes; each is swept exactly as a point is, and the max over sub-boxes
-    is the bound for the whole box.
-    """
+    """(eps_floor, eps_accept, tv, n_boxes) valid for every (n, p) in the
+    box: bisected into 4^--split-depth sub-boxes, max taken over all."""
     fp, verbose = args.fp, args.verbose
     _, n_hi = n_iv
 
@@ -910,51 +733,41 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
            split_depth=args.split_depth, sub_boxes=len(sub_boxes),
            v_trunc=args.v_trunc, u_trunc=args.u_trunc)
 
-    eps_floor = eps_accept_raw = 0.0
+    eps_floor = eps_accept_raw = floor_excess = accept_excess = 0.0
     n_boxes = 0
     for sub_n, sub_p in sub_boxes:
-        floor_boxes, accept_boxes = _btrs_sub_box_boxes(
-            sub_n, sub_p, fp, tag, args.fast)
+        floor_boxes, accept_boxes, sub_floor_excess, sub_accept_excess = \
+            _btrs_sub_box_boxes(sub_n, sub_p, fp, tag, args.fast, args.u_trunc)
         if verbose >= 1:
             print(f"  sub-box {_box_label({'n': sub_n, 'p': sub_p})}"
                   f" ({len(floor_boxes)} floor + {len(accept_boxes)} accept)")
 
-        floor_raw, n_floor = _fptaylor_max(
-            fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
-            verbose, args.jobs, args.bb_geometric_ratio_tol,
-            args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args))
-        accept_raw, n_accept = _fptaylor_max(
-            fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
-            verbose, args.jobs, args.bb_geometric_ratio_tol,
-            args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
+        floor_raw, accept_raw, n_floor, n_accept = _run_floor_accept(
+            fptaylor, floor_boxes, accept_boxes, args, inputs_dir, outputs_dir, env)
 
         eps_floor = max(eps_floor, 5 * floor_raw)
         eps_accept_raw = max(eps_accept_raw, accept_raw)
+        floor_excess = max(floor_excess, sub_floor_excess)
+        accept_excess = max(accept_excess, sub_accept_excess)
         n_boxes += n_floor + n_accept
 
-    # widest u reached anywhere in the box, on each side, for the split-out
-    # -2*log(us) query and for the --u-trunc check in combine_tv
+    u_excess = max(floor_excess, accept_excess)
+
     consts = btrs_box_consts(n_iv, p_iv)
     fy_lo, fy_hi = y_window(0.0, n_hi)
-    us_lo = 0.5 + box_u_at(consts, fy_lo)[0]
-    us_hi = 0.5 - box_u_at(consts, fy_hi)[1]
+    us_lo = max(0.5 + box_u_at(consts, fy_lo)[0], args.u_trunc)
+    us_hi = max(0.5 - box_u_at(consts, fy_hi)[1], args.u_trunc)
 
-    # accept_iter = alpha / (sqrt(2*pi)*spq) = (2.83 + 5.1/b) / sqrt(2*pi):
-    # spq cancels, so the worst case over the box is at b_lo.
+    # spq cancels in alpha/(sqrt(2pi)*spq), so the box's worst case is at b_lo
     accept_iter = (2.83 + 5.1 / consts[2][0]) / math.sqrt(2 * math.pi)
     eps_accept, tv, n_extra = combine_tv(
-        fptaylor, fp, eps_floor, eps_accept_raw, accept_iter, us_lo, us_hi, args,
-        inputs_dir, outputs_dir, env)
+        fptaylor, fp, eps_floor, eps_accept_raw, accept_iter, us_lo, us_hi,
+        u_excess, args, inputs_dir, outputs_dir, env)
     return eps_floor, eps_accept, tv, n_boxes + n_extra
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def safe_pair_name(n, p):
-    p_str = f"{p:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
-    return f"n{n}_p{p_str}"
+    return f"n{n}_p{_fmt_signed(p)}"
 
 
 def read_np_pairs(path):
@@ -977,10 +790,6 @@ def read_np_pairs(path):
         pairs.append((n, p))
     return pairs
 
-
-# ---------------------------------------------------------------------------
-# Distribution interface
-# ---------------------------------------------------------------------------
 
 def add_args(parser):
     source = parser.add_mutually_exclusive_group(required=True)
@@ -1030,6 +839,28 @@ def default_out_dir(args):
     return ROOT / f"binomial_runs_{lf.stem}_{backend}"
 
 
+def _btrs_fields(eps_floor, eps_accept, tv, n_boxes, regime):
+    return {"regime": regime, "eps0": "nan", "eps1": "nan", "eps2": "nan",
+            "eps_floor": f"{eps_floor:.17e}", "eps_accept": f"{eps_accept:.17e}",
+            "tv": f"{tv:.17e}", "n_boxes": n_boxes}
+
+
+def _inversion_fields(eps0, eps1, eps2, tv, n_boxes, regime):
+    return {"regime": regime,
+            "eps0": f"{eps0:.17e}", "eps1": f"{eps1:.17e}", "eps2": f"{eps2:.17e}",
+            "eps_floor": "nan", "eps_accept": "nan",
+            "tv": f"{tv:.17e}", "n_boxes": n_boxes}
+
+
+def _print_btrs(label, n_boxes, eps_floor, eps_accept, tv):
+    print(f"{label} [BTRS] boxes={n_boxes} eps_floor={eps_floor:.6e}"
+          f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
+
+
+def _print_inversion(label, eps0, eps1, eps2, tv):
+    print(f"{label} eps0={eps0:.6e} eps1={eps1:.6e} eps2={eps2:.6e} TV={tv:.6e}")
+
+
 def _run_box(args, fptaylor, inputs_dir, outputs_dir, env):
     """Interval mode: one row bounding the error over the whole (n, p) box."""
     n_lo, n_hi = args.n_range
@@ -1051,21 +882,14 @@ def _run_box(args, fptaylor, inputs_dir, outputs_dir, env):
     if args.split_depth < 0:
         raise ValueError("--split-depth must be >= 0")
 
-    # the sampler itself switches algorithm at n*p = 30, so the box has to sit
-    # entirely on one side of it
     if n_lo * p_lo >= _BTRS_SWITCH:
         eps_floor, eps_accept, tv, n_boxes = _run_btrs_box(
             fptaylor, (n_lo, n_hi), (p_lo, p_hi), args, tag,
             inputs_dir, outputs_dir, env,
         )
-        row.update({"regime": "btrs-interval",
-                    "eps0": "nan", "eps1": "nan", "eps2": "nan",
-                    "eps_floor": f"{eps_floor:.17e}",
-                    "eps_accept": f"{eps_accept:.17e}", "tv": f"{tv:.17e}",
-                    "n_boxes": n_boxes})
-        print(f"{_box_label({'n': (n_lo, n_hi), 'p': (p_lo, p_hi)})} [BTRS]"
-              f" boxes={n_boxes} eps_floor={eps_floor:.6e}"
-              f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
+        row.update(_btrs_fields(eps_floor, eps_accept, tv, n_boxes, "btrs-interval"))
+        _print_btrs(_box_label({"n": (n_lo, n_hi), "p": (p_lo, p_hi)}),
+                   n_boxes, eps_floor, eps_accept, tv)
         return [row]
 
     if n_hi * p_hi >= _BTRS_SWITCH:
@@ -1078,13 +902,8 @@ def _run_box(args, fptaylor, inputs_dir, outputs_dir, env):
     eps0, eps1, eps2, tv = _run_inversion_box(
         fptaylor, box, args, tag, inputs_dir, outputs_dir, env,
     )
-    row.update({"regime": "inversion-interval",
-                "eps0": f"{eps0:.17e}", "eps1": f"{eps1:.17e}",
-                "eps2": f"{eps2:.17e}",
-                "eps_floor": "nan", "eps_accept": "nan", "tv": f"{tv:.17e}",
-                "n_boxes": 1})
-    print(f"{_box_label(box)} eps0={eps0:.6e} eps1={eps1:.6e}"
-          f" eps2={eps2:.6e} TV={tv:.6e}")
+    row.update(_inversion_fields(eps0, eps1, eps2, tv, 1, "inversion-interval"))
+    _print_inversion(_box_label(box), eps0, eps1, eps2, tv)
     return [row]
 
 
@@ -1111,49 +930,26 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
     for n, p in pairs:
         tag = safe_pair_name(n, p)
         try:
+            base_row = {"n": n, "p": f"{p:.17g}"}
+            label = f"n={n} p={p}"
             if n * p >= _BTRS_SWITCH:
-                # ---- BTRS regime (FPTaylor only; CIRE not yet supported) ----
                 eps_floor, eps_accept, tv, n_boxes = _run_btrs_fptaylor(
                     fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env,
                 )
-                rows.append({
-                    "n": n, "p": f"{p:.17g}", "regime": "btrs",
-                    "eps0": "nan", "eps1": "nan", "eps2": "nan",
-                    "eps_floor":  f"{eps_floor:.17e}",
-                    "eps_accept": f"{eps_accept:.17e}",
-                    "tv": f"{tv:.17e}", "n_boxes": n_boxes,
-                })
-                print(f"n={n} p={p} [BTRS] boxes={n_boxes}"
-                      f" eps_floor={eps_floor:.6e}"
-                      f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
+                base_row.update(_btrs_fields(eps_floor, eps_accept, tv, n_boxes, "btrs"))
+                rows.append(base_row)
+                _print_btrs(label, n_boxes, eps_floor, eps_accept, tv)
             else:
-                # ---- inversion regime, (FPTaylor only; CIRE not yet supported) ----
                 qn, z_lo, x_hi = inversion_params(n, p)
                 bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
                 vprint(args.verbose, f"binomial inversion n={n} p={p}",
                        qn=qn, z_lo=z_lo, x_hi=x_hi, bound=bound)
-                input_path = inputs_dir / f"binomial_inversion_{args.fp}_{tag}.txt"
-                input_path.write_text(make_template(n, p, args.fp))
-                code, output = run_command(
-                    [fptaylor, "--rel-error", "true", str(input_path)],
-                    cwd=ROOT, env=env,
-                )
-                out_path = outputs_dir / f"binomial_inversion_{args.fp}_{tag}.out"
-                out_path.write_text(output)
-                if args.verbose >= 2:
-                    print(f"--- FPTaylor binomial_inversion (n={n}, p={p}) ---\n{output}")
-                if code != 0:
-                    raise RuntimeError(f"FPTaylor failed for n={n}, p={p}; see {out_path}")
-                deltas = extract_deltas_by_problem(output, f"n={n} p={p}")
-                eps0, eps1, eps2 = deltas["eps0"], deltas["eps1"], deltas["eps2"]
-                tv = 0.5 * (eps0 + eps1 * p + eps2 * bound)
-                rows.append({
-                    "n": n, "p": f"{p:.17g}", "regime": "inversion",
-                    "eps0": f"{eps0:.17e}", "eps1": f"{eps1:.17e}", "eps2": f"{eps2:.17e}",
-                    "eps_floor": "nan", "eps_accept": "nan",
-                    "tv": f"{tv:.17e}", "n_boxes": 1,
-                })
-                print(f"n={n} p={p} eps0={eps0:.6e} eps1={eps1:.6e} eps2={eps2:.6e} TV={tv:.6e}")
+                eps0, eps1, eps2, tv = _run_inversion_fptaylor(
+                    fptaylor, make_template(n, p, args.fp), label, tag, args,
+                    inputs_dir, outputs_dir, env, p, bound)
+                base_row.update(_inversion_fields(eps0, eps1, eps2, tv, 1, "inversion"))
+                rows.append(base_row)
+                _print_inversion(label, eps0, eps1, eps2, tv)
         except Exception as exc:
             print(f"WARNING: skipping n={n} p={p}: {exc}")
 
@@ -1164,7 +960,6 @@ def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
     import contextlib
     import numpy as np
 
-    # interval-mode rows cover a box, not a point on the (n, np) grid
     rows = [r for r in rows if r.get("n") not in (None, "", "nan")]
     if not rows:
         print("Nothing to plot: interval-mode results are not points on the "
