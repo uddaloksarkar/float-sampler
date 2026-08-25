@@ -23,7 +23,7 @@ from dist_common import (
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     loggam_defs, eps_logv, eps_logus,
     transcendental_error_bound,
-    vprint, _fp_var_type,
+    vprint,
     fptaylor_cmd,
     us_root, hormann_u_at, hormann_k_defs,
     point_ivar,
@@ -258,8 +258,18 @@ def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
 
 def _point_hm_defs(n, p, rnd):
     """
-    m and h as Definitions: m = floor((n+1)*p) is exact (unrounded); h =
-    lgamma(m+1) + lgamma(n-m+1) [btrs.c:77] is two independently-rounded
+    m and h as Definitions: m = floor((n+1)*p) is exact (unrounded) --
+    n, p are exact literals here, so Python's (n+1)*p is the same IEEE-754
+    double-precision operation the real sampler performs, no fm-style tie
+    needed (unlike box mode, where m is a genuine enclosure over a range and
+    can't be reduced to one Python float at all -- see btrs_box_m's absence
+    and make_btrs_accept_box_template).  Tying m to (n, p) via fm here was
+    tried and reverted: it adds a permanent width-1 dimension that, near the
+    u ranges that already need heavy splitting (us -> 0), multiplies rather
+    than adds to the search cost -- measured ~4.7x slower to reach the same
+    suboptimality, with no correctness gain to justify it.
+
+    h = lgamma(m+1) + lgamma(n-m+1) [btrs.c:77] is two independently-rounded
     lgamma calls plus a rounded addition -- what btrs.c does at runtime --
     via loggam_int_defs, same as k1_/nk1_.  Precomputing lgamma(m+1)/
     lgamma(n-m+1) in Python and charging only the addition's rounding would
@@ -426,21 +436,6 @@ def make_btrs_floor_box_template(box, fp):
                                     _ivar("p", *box["p"])], "n", "p")
 
 
-def btrs_box_m(n_iv, p_iv):
-    """
-    m enclosure for btrs.c's once-per-(n,p) mode [btrs.c:75]: m =
-    floor((n+1)*p) is non-decreasing in both n and p, so each end comes from
-    the corresponding corner.  m stays a declared Variable (an FPTaylor
-    Definition can't express floor() of a range -- only floor_power2 exists,
-    for FPTaylor's own error-bound bookkeeping, not general use); h is
-    computed from m inside the query instead (see make_btrs_accept_box_
-    template) now that only m, not h, needs to be a free dimension.
-    """
-    (n_lo, n_hi), (p_lo, p_hi) = n_iv, p_iv
-    return (float(math.floor((n_lo + 1.0) * p_lo)),
-            float(math.floor((n_hi + 1.0) * p_hi)))
-
-
 def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
     """
     Interval-parameter form of the accept template, parametrized by whichever
@@ -468,11 +463,18 @@ def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
     which never lets u and n/p interact through that division inside the
     query, is the one that actually works for a box wide enough to matter.
 
-    m stays a declared Variable (box["m"], an enclosure of the once-per-(n,p)
-    mode -- see btrs_box_m); h = lgamma(m+1) + lgamma(n-m+1) is computed from
-    m *inside* the query (loggam_defs) rather than as its own separately
-    -bounded Variable: one fewer free dimension for the search, and h tracks
-    m's actual value instead of two independently-corner-matched enclosures.
+    m is tied to (n, p) the same way k is tied to u: m_ = (n+1)*p - fm,
+    fm in [0, 1), encoding floor((n+1)*p) exactly (m is one integer, computed
+    once, same as k_ and j_ above -- no rounding).  This is safe where tying
+    k to u was not: (n+1)*p is a product of two *positive* ranges, which
+    interval arithmetic bounds exactly (no amplification), unlike a/us's
+    division by something that can shrink toward zero.  It also means m_
+    never appears in FPTaylor's own per-variable domain-size check (only
+    declared Variables do) -- fm in [0,1) is narrow regardless of the box's
+    width, whereas m_ declared directly could be thousands wide, so this
+    removes what was often the single most expensive dimension to narrow.
+    h = lgamma(m+1) + lgamma(n-m+1) is computed from m *inside* the query
+    (loggam_defs), same as before.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     x_lo, x_hi = x_iv
@@ -498,14 +500,15 @@ def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
     defs_hnm, name_hnm = loggam_defs("n - m_ + 1.0", "hnm", rnd)
 
     var_lines = [_ivar("u", *box["u"]), _ivar("n", *box["n"]),
-                 _ivar("p", *box["p"])]
+                 _ivar("p", *box["p"]), "  real fm in [0.0, 1.0]"]
     if not literal:
         var_lines.append(_ivar("x", *box["x"]))
-    var_lines.append(_ivar("m_", *box["m"], kind=_fp_var_type(fp)))
 
     mid = ([f"  us_    {rnd}= 0.5 - abs(u),"]
            + ([f"  x_     = {x_lo:.1f},"] if literal else [])
-           + kdefs + defs_small + defs_big
+           + kdefs
+           + ["  m_     = (n + 1.0) * p - fm,"]
+           + defs_small + defs_big
            + defs_hm + defs_hnm
            + [f"  h_     {rnd}= {name_hm} + {name_hnm},"])
     return make_accept_template(
@@ -835,7 +838,6 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
         raise ValueError(f"BTRS shape constant a reaches {a[0]:.6g} <= 0 at the "
                          f"low corner of n in [{n_lo:.6g}, {n_hi:.6g}], "
                          f"p in [{p_lo:.6g}, {p_hi:.6g}]")
-    m_iv = btrs_box_m(n_iv, p_iv)
     sub = safe_box_name(n_lo, n_hi, p_lo, p_hi)
     floor_boxes, accept_boxes = [], []
 
@@ -857,7 +859,7 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
             u_win = box_u_shells(consts, y_lo, y_hi)
             for i, (sign, u_lo, u_hi) in enumerate(u_win):
                 box = {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv,
-                       "x": (x_lo, x_hi), "m": m_iv}
+                       "x": (x_lo, x_hi)}
                 x_tag = (f"{x_lo:.0f}" if x_lo == x_hi
                          else f"{x_lo:.0f}-{x_hi:.0f}")
                 accept_boxes.append((

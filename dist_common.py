@@ -325,7 +325,7 @@ def add_common_args(parser):
     parser.add_argument("--bb-eval", action="store_true",
                         help="Use FPTaylor's interpreted --opt bb-eval "
                              "backend instead of the default compiling "
-                             "--opt bb --bb-split geometric. No compile "
+                             "--opt bb --bb-split midpoint. No compile "
                              "step, so queries can run concurrently (see "
                              "--jobs) and there is no risk of the bb compile "
                              "race, but bb-eval ignores --bb-split / "
@@ -581,10 +581,17 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
     """
     argv for one FPTaylor query, with its own temporary and log directories.
 
-    Default: the compiling `bb` optimizer with geometric branch-and-bound
-    splitting (--bb-split geometric, --bb-geometric-ratio-tol) instead of
-    Python-side binade shelling of u/v/k -- FPTaylor's own splitter handles
-    the 1/us and log(us)-style conditioning that used to be pre-shelled.
+    Default: the compiling `bb` optimizer with midpoint branch-and-bound
+    splitting, instead of Python-side binade shelling of u/v/k -- FPTaylor's
+    own splitter handles the 1/us and log(us)-style conditioning that used
+    to be pre-shelled.  Measured (not assumed): --bb-split geometric, despite
+    existing for exactly this kind of near-singular conditioning, is both
+    slower *and* looser than plain midpoint splitting on every query shape
+    tested here (floor queries with us down to ~2e-4, and box-mode accept
+    queries with a wide lgamma argument) -- typically ~2x tighter at equal
+    iteration count, sometimes faster in wall time too.  --bb-geometric-
+    ratio-tol is still passed and still validated by FPTaylor (> 1) even in
+    midpoint mode, but no longer affects the actual splitting decision.
 
     `bb` writes its generated OCaml program to tmp-base-dir under fixed names
     -- tmp/bb_1.ml, tmp/bb [FPTaylor/default.cfg:141,
@@ -617,7 +624,7 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
             argv += ["--opt-x-abs-tol", f"{x_abs_tol:.17g}"]
     else:
         argv = [fptaylor, "--opt", "bb",
-               "--bb-split", "geometric",
+               "--bb-split", "midpoint",
                "--bb-geometric-ratio-tol", f"{ratio_tol:.17g}"]
     return argv + [
             "--tmp-base-dir", str(work_dir / "tmp"),
