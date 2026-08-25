@@ -217,7 +217,7 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
 
 
 def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose,
-                       fast=False, u_trunc=2.0 ** -53, ratio_tol=2.0,
+                       fast=False, v_trunc=2.0 ** -53, ratio_tol=2.0,
                        bb_eval=False, x_abs_tol=None):
     """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
     _, a, b, _ = ptrs_consts(lam)
@@ -265,7 +265,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
     eps_accept = accept_raw + k_tail + eps_logv(
-        fptaylor, fp, u_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
+        fptaylor, fp, v_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
         bb_eval, x_abs_tol,
     )[0]
     if fast:
@@ -275,7 +275,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
         )[0]
 
     accept_iter = invalpha
-    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + u_trunc
+    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + v_trunc
     return eps_floor, eps_accept, tv
 
 
@@ -441,7 +441,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             # ---- high range (PTRS) ----
             eps_floor, eps_accept, tv = _run_ptrs_fptaylor(
                 fptaylor, lam_float, args.fp, tag, inputs_dir, outputs_dir,
-                env, args.verbose, fast=args.fast, u_trunc=args.u_trunc,
+                env, args.verbose, fast=args.fast, v_trunc=args.v_trunc,
                 ratio_tol=args.bb_geometric_ratio_tol,
                 bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
             )

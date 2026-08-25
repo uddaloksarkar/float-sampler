@@ -310,13 +310,29 @@ def add_common_args(parser):
                              "full FPTaylor/CIRE/Gelpia output to stdout")
     parser.add_argument("--cache", action="store_true",
                         help="If summary.csv already exists in out-dir, load it and skip re-running")
-    parser.add_argument("--u-trunc", type=float, default=2.0 ** -53,
-                        help="Truncation floor for the uniform-seed domain "
-                             "(BTRS/PTRS: the log(v) domain lower bound, "
-                             "replacing the hardcoded 2^-53). Also the flat "
-                             "amount the reported TV is inflated by, e.g. "
-                             "--u-trunc 1e-8 adds exactly 1e-8 to TV "
-                             "(default: 2^-53).")
+    parser.add_argument("--v-trunc", type=float, default=2.0 ** -53,
+                        help="Truncation floor for the raw uniform-seed "
+                             "domain v (BTRS/PTRS: the log(v) domain lower "
+                             "bound, replacing the hardcoded 2^-53). v can "
+                             "realize any value in (0,1), including values "
+                             "arbitrarily close to 0 where log(v) has no "
+                             "finite rigorous bound, so log(v) is only "
+                             "certified down to this floor; the flat amount "
+                             "the reported TV is inflated by for the "
+                             "region below it, e.g. --v-trunc 1e-8 adds "
+                             "exactly 1e-8 to TV (default: 2^-53).")
+    parser.add_argument("--u-trunc", type=float, default=0.0,
+                        help="BTRS (binomial): minimum allowed us = "
+                             "0.5 - |u| at the sampler's own reachable-k "
+                             "boundary (us_lo, us_hi -- unlike v, u is "
+                             "bounded away from the log singularity by the "
+                             "discrete k=0/k=n edge, so this is a sanity "
+                             "check, not a precision/TV tradeoff like "
+                             "--v-trunc). If the boundary computed from "
+                             "(n, p) ever dips below this, that is treated "
+                             "as an error and raised rather than silently "
+                             "absorbed into TV. Default 0.0: no restriction "
+                             "(never raises).")
     parser.add_argument("--bb-geometric-ratio-tol", type=float, default=2.0,
                         help="FPTaylor's --bb-geometric-ratio-tol: how far "
                              "(as a ratio) the branch-and-bound geometric "
@@ -331,12 +347,50 @@ def add_common_args(parser):
                              "race, but bb-eval ignores --bb-split / "
                              "--bb-geometric-ratio-tol entirely -- pair with "
                              "--opt-x-abs-tol to control precision instead.")
-    parser.add_argument("--opt-x-abs-tol", type=float, default=1e-6,
+    parser.add_argument("--opt-x-abs-tol", type=float, default=None,
                         help="FPTaylor's --opt-x-abs-tol: domain-size "
-                             "termination tolerance for the optimizer "
-                             "(FPTaylor's own default is 0.01). Only passed "
-                             "to FPTaylor when --bb-eval is set (default "
-                             "here: 1e-6).")
+                             "termination tolerance for the optimizer, "
+                             "applied to every variable not overridden by "
+                             "--opt-x-abs-tol-vars (FPTaylor's own default "
+                             "is 0.01). Passed through for both --opt bb "
+                             "and --bb-eval -- with --bb-split midpoint "
+                             "(the default), every declared variable is "
+                             "checked against this width directly, not just "
+                             "the ones FPTaylor's geometric splitter used to "
+                             "exempt, so this now matters for the compiled "
+                             "path too, not only --bb-eval.")
+    parser.add_argument("--opt-x-abs-tol-vars", type=str, default=None,
+                        help="FPTaylor's --opt-x-abs-tol-vars: per-variable "
+                             "overrides of the domain-size termination "
+                             "tolerance, format 'NAME1=VAL1,NAME2=VAL2,...'. "
+                             "Variables not listed fall back to "
+                             "--opt-x-abs-tol (or FPTaylor's own 0.01 "
+                             "default if that isn't set either) -- so "
+                             "covering the actual bottleneck variable(s) "
+                             "matters more than covering the ones that "
+                             "merely look wide (check each declared "
+                             "variable's width in the .txt query directly "
+                             "before guessing). Passed through for both "
+                             "--opt bb and --bb-eval. Applies to both the "
+                             "floor and accept queries unless overridden by "
+                             "--floor-opt-x-abs-tol-vars / "
+                             "--accept-opt-x-abs-tol-vars below.")
+    parser.add_argument("--floor-opt-x-abs-tol-vars", type=str, default=None,
+                        help="Overrides --opt-x-abs-tol-vars for floor "
+                             "queries only (eps_floor). Floor's error is "
+                             "often inherently unbounded near a sampler's "
+                             "own truncation edge (e.g. us -> 0, where "
+                             "division amplifies rounding error "
+                             "quadratically in 1/us, unlike accept's log() "
+                             "terms which only amplify it linearly) and "
+                             "already gets charged to TV via --u-trunc "
+                             "rather than needing a tight finite bound -- "
+                             "so it's often fine to loosen this "
+                             "independently of accept's setting.")
+    parser.add_argument("--accept-opt-x-abs-tol-vars", type=str, default=None,
+                        help="Overrides --opt-x-abs-tol-vars for accept "
+                             "queries only (eps_accept). See "
+                             "--floor-opt-x-abs-tol-vars.")
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +630,20 @@ def loggam_ie(x, shift=0):
     return gl
 
 
+def floor_x_abs_tol_vars(args):
+    """--floor-opt-x-abs-tol-vars if set, else the shared --opt-x-abs-tol-vars."""
+    return (args.floor_opt_x_abs_tol_vars if args.floor_opt_x_abs_tol_vars is not None
+            else args.opt_x_abs_tol_vars)
+
+
+def accept_x_abs_tol_vars(args):
+    """--accept-opt-x-abs-tol-vars if set, else the shared --opt-x-abs-tol-vars."""
+    return (args.accept_opt_x_abs_tol_vars if args.accept_opt_x_abs_tol_vars is not None
+            else args.opt_x_abs_tol_vars)
+
+
 def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
-                 x_abs_tol=None):
+                 x_abs_tol=None, x_abs_tol_vars=None):
     """
     argv for one FPTaylor query, with its own temporary and log directories.
 
@@ -610,22 +676,33 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
     (--opt bb-eval): no compile step, so no compile race and safe to run
     concurrently, at the cost of the geometric splitter (bb-eval ignores
     --bb-split / --bb-geometric-ratio-tol entirely -- see
-    FPTaylor/opt_bb_eval.ml, which calls Opt0.opt without them).  x_abs_tol,
-    if given, is passed as --opt-x-abs-tol to tighten (or loosen) the
-    domain-size termination tolerance both backends read
-    (FPTaylor/opt_common.ml); FPTaylor's own default is 0.01.
+    FPTaylor/opt_bb_eval.ml, which calls Opt0.opt without them).
+
+    x_abs_tol (--opt-x-abs-tol) and x_abs_tol_vars (--opt-x-abs-tol-vars,
+    format "NAME1=VAL1,NAME2=VAL2") both tighten or loosen the domain-size
+    termination tolerance, and both apply to *either* backend -- unlike the
+    old bb-eval-only wiring, this matters for --opt bb too now that its
+    default split mode is midpoint (see above): under midpoint,
+    domain_small checks every declared variable's width against this
+    tolerance directly (opt0.ml), not just the ones geometric mode used to
+    exempt.  Named variables in x_abs_tol_vars use their own tolerance;
+    anything not named falls back to x_abs_tol (or FPTaylor's own 0.01
+    default if that is not set either).  Covering the wrong variable (one
+    that already satisfies the default) does nothing -- check each
+    variable's actual declared width in the .txt query before choosing what
+    to loosen.
 
     Each query still gets its own temporary and log directory, so nothing in
     FPTaylor's scratch space is shared between runs.
     """
-    if bb_eval:
-        argv = [fptaylor, "--opt", "bb-eval"]
-        if x_abs_tol is not None:
-            argv += ["--opt-x-abs-tol", f"{x_abs_tol:.17g}"]
-    else:
-        argv = [fptaylor, "--opt", "bb",
-               "--bb-split", "midpoint",
-               "--bb-geometric-ratio-tol", f"{ratio_tol:.17g}"]
+    argv = [fptaylor, "--opt", "bb-eval"] if bb_eval else [
+        fptaylor, "--opt", "bb",
+        "--bb-split", "midpoint",
+        "--bb-geometric-ratio-tol", f"{ratio_tol:.17g}"]
+    if x_abs_tol is not None:
+        argv += ["--opt-x-abs-tol", f"{x_abs_tol:.17g}"]
+    if x_abs_tol_vars:
+        argv += ["--opt-x-abs-tol-vars", x_abs_tol_vars]
     return argv + [
             "--tmp-base-dir", str(work_dir / "tmp"),
             "--log-base-dir", str(work_dir / "log"),
@@ -702,17 +779,17 @@ _LOGV_EPS_CACHE = {}
 
 
 def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
-             ratio_tol=2.0, bb_eval=False, x_abs_tol=None):
+             ratio_tol=2.0, bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None):
     """
     Absolute error of -log(v) over v in [vtail, 1]; same for every distribution
     parameter, so cache it.  Returns (error, n_boxes).
 
     One query over the whole range: the 1/v conditioning near vtail is left to
-    FPTaylor's own branch-and-bound splitting (--opt bb --bb-split geometric,
+    FPTaylor's own branch-and-bound splitting (--opt bb --bb-split midpoint,
     see fptaylor_cmd) instead of being pre-shelled by binade in Python.
-    bb_eval/x_abs_tol switch to the --opt bb-eval backend instead.
+    bb_eval/x_abs_tol/x_abs_tol_vars are forwarded to fptaylor_cmd unchanged.
     """
-    key = (fp, vtail, ratio_tol, bb_eval, x_abs_tol)
+    key = (fp, vtail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars)
     if key in _LOGV_EPS_CACHE:
         return _LOGV_EPS_CACHE[key]
 
@@ -724,7 +801,8 @@ def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
     try:
         code, output = run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
+                        x_abs_tol, x_abs_tol_vars),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -777,16 +855,16 @@ _LOGUS_EPS_CACHE = {}
 
 
 def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
-              ratio_tol=2.0, bb_eval=False, x_abs_tol=None):
+              ratio_tol=2.0, bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None):
     """
     Absolute error of -2*log(us_) over us_ in [utail, 0.5]; same for every
     distribution parameter, so cache it.  Returns (error, n_boxes).
 
     One query over the whole range: the 1/us conditioning near utail is left
     to FPTaylor's own branch-and-bound splitting (see eps_logv, fptaylor_cmd).
-    bb_eval/x_abs_tol switch to the --opt bb-eval backend instead.
+    bb_eval/x_abs_tol/x_abs_tol_vars are forwarded to fptaylor_cmd unchanged.
     """
-    key = (fp, utail, ratio_tol, bb_eval, x_abs_tol)
+    key = (fp, utail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars)
     if key in _LOGUS_EPS_CACHE:
         return _LOGUS_EPS_CACHE[key]
 
@@ -798,7 +876,8 @@ def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
     work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
     try:
         code, output = run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
+                        x_abs_tol, x_abs_tol_vars),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)

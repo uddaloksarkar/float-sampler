@@ -27,6 +27,7 @@ from dist_common import (
     fptaylor_cmd,
     us_root, hormann_u_at, hormann_k_defs,
     point_ivar,
+    floor_x_abs_tol_vars, accept_x_abs_tol_vars,
 )
 
 NAME = "binomial"
@@ -256,32 +257,32 @@ def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
         "n", "p")
 
 
-def _point_hm_defs(n, p, rnd):
+def _point_hm_defs(rnd):
     """
-    m and h as Definitions: m = floor((n+1)*p) is exact (unrounded) --
-    n, p are exact literals here, so Python's (n+1)*p is the same IEEE-754
-    double-precision operation the real sampler performs, no fm-style tie
-    needed (unlike box mode, where m is a genuine enclosure over a range and
-    can't be reduced to one Python float at all -- see btrs_box_m's absence
-    and make_btrs_accept_box_template).  Tying m to (n, p) via fm here was
-    tried and reverted: it adds a permanent width-1 dimension that, near the
-    u ranges that already need heavy splitting (us -> 0), multiplies rather
-    than adds to the search cost -- measured ~4.7x slower to reach the same
-    suboptimality, with no correctness gain to justify it.
-
-    h = lgamma(m+1) + lgamma(n-m+1) [btrs.c:77] is two independently-rounded
+    m tied to (n, p) via a floor-encoding fm, exactly like k_ = y_ - f (see
+    make_btrs_accept_template): m_ = (n+1)*p - fm, fm in [0, 1), computed
+    entirely inside FPTaylor rather than precomputed via Python's own
+    (n+1)*p, which is not guaranteed to reproduce whatever rounding the
+    actual compiled sampler's multiply performs bit-for-bit.  h =
+    lgamma(m+1) + lgamma(n-m+1) [btrs.c:77] is two independently-rounded
     lgamma calls plus a rounded addition -- what btrs.c does at runtime --
-    via loggam_int_defs, same as k1_/nk1_.  Precomputing lgamma(m+1)/
-    lgamma(n-m+1) in Python and charging only the addition's rounding would
-    assume each lgamma() call is exact, which for m in the thousands is
-    routinely on the order of the whole eps_accept bound.
+    computed from m_ inside the query (loggam_defs), same as k1_/nk1_.
+    Precomputing lgamma(m+1)/lgamma(n-m+1) and charging only the addition's
+    rounding would assume each lgamma() call is exact, which for m in the
+    thousands is routinely on the order of the whole eps_accept bound.
+
+    Note: measured ~4.7x slower per iteration than a precomputed literal m
+    in queries whose u range already reaches near us -> 0 (fm adds a
+    permanent width-1 dimension that compounds with the splitting u already
+    needs there) -- reinstated anyway per explicit request; see git history
+    for the literal-m version if that cost matters more than the rigor gain
+    in a given use case.
     """
-    m = int(math.floor((n + 1) * p))
-    defs_m,  name_m  = loggam_int_defs(float(m) + 1.0,     "hm",  rnd)
-    defs_nm, name_nm = loggam_int_defs(float(n - m) + 1.0, "hnm", rnd)
-    return ([f"  m_     = {float(m):.1f},"]
-            + defs_m + defs_nm
-            + [f"  h_     {rnd}= {name_m} + {name_nm},"])
+    defs_hm,  name_hm  = loggam_defs("m_ + 1.0", "hm", rnd)
+    defs_hnm, name_hnm = loggam_defs("n - m_ + 1.0", "hnm", rnd)
+    return (["  m_     = (n + 1.0) * p - fm,"]
+            + defs_hm + defs_hnm
+            + [f"  h_     {rnd}= {name_hm} + {name_hnm},"])
 
 
 def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
@@ -302,14 +303,14 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
     defs_k,  name_k  = loggam_defs("k1_",  "lgk",  rnd)
     defs_nk, name_nk = loggam_defs("nk1_", "lgnk", rnd)
 
-    mid = (_point_hm_defs(n, p, rnd)
+    mid = (_point_hm_defs(rnd)
            + [f"  us_    {rnd}= 0.5 - abs(u),"]
            + btrs_k_defs(sign, "n", "p")
            + ["  nk1_   = n - k_ + 1.0,"]
            + defs_k + defs_nk)
     return make_accept_template(
         fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p),
-             "  real f in [0.0, 1.0]"],
+             "  real f in [0.0, 1.0]", "  real fm in [0.0, 1.0]"],
         "n", "p", mid, name_k, name_nk, fast)
 
 
@@ -327,11 +328,12 @@ def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
     defs_nk, name_nk = loggam_int_defs(float(n - k) + 1.0, "lgnk", rnd)
 
     mid = ([f"  k_     = {float(k):.1f},"]
-           + _point_hm_defs(n, p, rnd)
+           + _point_hm_defs(rnd)
            + [f"  us_    {rnd}= 0.5 - abs(u),"]
            + defs_k + defs_nk)
     return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p)],
+        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p),
+             "  real fm in [0.0, 1.0]"],
         "n", "p", mid, name_k, name_nk, fast)
 
 
@@ -595,7 +597,8 @@ def safe_box_name(n_lo, n_hi, p_lo, p_hi):
 # ---------------------------------------------------------------------------
 
 def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
-                  verbose, jobs, ratio_tol, bb_eval=False, x_abs_tol=None):
+                  verbose, jobs, ratio_tol, bb_eval=False, x_abs_tol=None,
+                  x_abs_tol_vars=None):
     """
     Run one FPTaylor query per box and return (max_error, n_boxes).
 
@@ -608,6 +611,9 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
     each other's compiled program -- `jobs` is capped to 1 worker.
     bb_eval=True uses the interpreted --opt bb-eval instead: no compile step,
     no race, `jobs` workers run concurrently.
+
+    x_abs_tol/x_abs_tol_vars are forwarded to fptaylor_cmd unchanged (see
+    dist_common.fptaylor_cmd for how they interact with --bb-split midpoint).
     """
     def one(box):
         label, stem, text = box
@@ -618,7 +624,8 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
         work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
         try:
             code, output = run_command(
-                fptaylor_cmd(fptaylor, in_path, work, ratio_tol, bb_eval, x_abs_tol),
+                fptaylor_cmd(fptaylor, in_path, work, ratio_tol, bb_eval,
+                            x_abs_tol, x_abs_tol_vars),
                 cwd=ROOT, env=env)
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -707,27 +714,41 @@ def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
     (eps_accept, tv, n_extra): fold the per-query maxima into the TV bound.
 
     eps_accept still owes -log(v) (and, with --fast, the split-out
-    -2*log(us)) before it's complete.  us_lo/us_hi are how far short of the
-    full u in [-0.5, 0.5) each side's box falls; below args.u_trunc, that
-    shortfall of u mass is charged to TV directly (real and FP samplers may
-    disagree on it, same as a sampler that disagrees on a positive-
-    probability event):
+    -2*log(us)) before it's complete.  v realizes any value in (0,1),
+    including values arbitrarily close to 0 where log(v) has no finite
+    rigorous bound, so -log(v) is only certified down to args.v_trunc; the
+    region of v mass below that is charged to TV directly (real and FP
+    samplers may disagree on it, same as a sampler that disagrees on a
+    positive-probability event):
 
-        tv = 2*eps_floor*accept_iter + 2*eps_accept
-             + max(0, u_trunc - us_lo) + max(0, u_trunc - us_hi)
+        tv = 2*eps_floor*accept_iter + 2*eps_accept + v_trunc
+
+    us_lo/us_hi, by contrast, are the smallest us = 0.5 - |u| the sampler's
+    own reachable-k boundary (k=0, k=n) ever reaches for this (n, p) -- u is
+    bounded away from 0 there by construction (a discrete k boundary, not an
+    infimum like v's), so unlike v_trunc this is not a precision/TV
+    tradeoff: if either dips below args.u_trunc it means this (n, p) reaches
+    a domain edge we don't trust FPTaylor's bound to be meaningful over, and
+    that is raised as an error rather than silently absorbed into TV.
 
     ledger=True charges -log(v) via transcendental_error_bound instead of a
     query, and skips -2*log(us) entirely; unused by any current caller, kept
     for a path that ledgers log/exp rather than inlining them.
     """
+    if us_lo < args.u_trunc:
+        raise ValueError(f"reachable us at the k=0 boundary ({us_lo:.3e}) is "
+                         f"below --u-trunc ({args.u_trunc:.3e})")
+    if us_hi < args.u_trunc:
+        raise ValueError(f"reachable us at the k=n boundary ({us_hi:.3e}) is "
+                         f"below --u-trunc ({args.u_trunc:.3e})")
     us_min = min(us_lo, us_hi)
     if ledger:
         logv = transcendental_error_bound("log", 1.0, fp)
         n_extra = 0
     else:
-        logv, n_extra = eps_logv(fptaylor, fp, args.u_trunc, inputs_dir, outputs_dir,
+        logv, n_extra = eps_logv(fptaylor, fp, args.v_trunc, inputs_dir, outputs_dir,
                                  env, args.verbose, args.bb_geometric_ratio_tol,
-                                 args.bb_eval, args.opt_x_abs_tol)
+                                 args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
     eps_accept = accept_raw + logv
     if args.fast and not ledger:
         # the -2*log(us) query only sees us, so the smallest reachable us (a
@@ -735,11 +756,10 @@ def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
         logus, n_logus = eps_logus(fptaylor, fp, us_min, inputs_dir,
                                    outputs_dir, env, args.verbose,
                                    args.bb_geometric_ratio_tol,
-                                   args.bb_eval, args.opt_x_abs_tol)
+                                   args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
         eps_accept += logus
         n_extra += n_logus
-    u_excess = max(0.0, args.u_trunc - us_lo) + max(0.0, args.u_trunc - us_hi)
-    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + u_excess
+    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + args.v_trunc
     return eps_accept, tv, n_extra
 
 
@@ -761,24 +781,26 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
     us_lo, us_hi = 0.5 + u_lo, 0.5 - u_hi
     vprint(verbose, f"binomial BTRS n={n} p={p}",
            spq=spq, a=a, b=b, c=c, alpha=alpha,
-           u_lo=u_lo, u_hi=u_hi, us_lo=us_lo, us_hi=us_hi, u_trunc=args.u_trunc)
+           u_lo=u_lo, u_hi=u_hi, us_lo=us_lo, us_hi=us_hi,
+           v_trunc=args.v_trunc, u_trunc=args.u_trunc)
 
     floor_boxes  = _btrs_floor_boxes(n, p, fp, tag, consts)
     accept_boxes = _btrs_accept_boxes(n, p, fp, tag, consts, args.fast)
 
     # k-tail (k outside [0, n]) is rejected identically by both samplers, so
-    # it costs nothing; but the u the boxes above don't reach beyond u_trunc
-    # on either side is charged to TV in combine_tv (see us_lo/us_hi there).
+    # it costs nothing; us_lo/us_hi (checked against --u-trunc) and the
+    # -log(v) domain floor (--v-trunc, charged flatly to TV) are both
+    # handled in combine_tv.
     floor_raw, n_floor = _fptaylor_max(
         fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
         verbose, args.jobs, args.bb_geometric_ratio_tol,
-        args.bb_eval, args.opt_x_abs_tol)
+        args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args))
     eps_floor = 5 * floor_raw
 
     accept_raw, n_accept = _fptaylor_max(
         fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
         verbose, args.jobs, args.bb_geometric_ratio_tol,
-        args.bb_eval, args.opt_x_abs_tol)
+        args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
 
     # btrs is renormalized by the modal pmf f(m) = B(m) ~ 1/(sqrt(2*pi)*spq),
     # so the per-iteration acceptance probability is 1/(alpha*f(m)).
@@ -886,7 +908,7 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
     sub_boxes = split_box(n_iv, p_iv, args.split_depth)
     vprint(verbose, f"binomial BTRS box {_box_label({'n': n_iv, 'p': p_iv})}",
            split_depth=args.split_depth, sub_boxes=len(sub_boxes),
-           u_trunc=args.u_trunc)
+           v_trunc=args.v_trunc, u_trunc=args.u_trunc)
 
     eps_floor = eps_accept_raw = 0.0
     n_boxes = 0
@@ -900,18 +922,18 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
         floor_raw, n_floor = _fptaylor_max(
             fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
             verbose, args.jobs, args.bb_geometric_ratio_tol,
-            args.bb_eval, args.opt_x_abs_tol)
+            args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args))
         accept_raw, n_accept = _fptaylor_max(
             fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
             verbose, args.jobs, args.bb_geometric_ratio_tol,
-            args.bb_eval, args.opt_x_abs_tol)
+            args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
 
         eps_floor = max(eps_floor, 5 * floor_raw)
         eps_accept_raw = max(eps_accept_raw, accept_raw)
         n_boxes += n_floor + n_accept
 
     # widest u reached anywhere in the box, on each side, for the split-out
-    # -2*log(us) query and for the u_trunc excess in combine_tv
+    # -2*log(us) query and for the --u-trunc check in combine_tv
     consts = btrs_box_consts(n_iv, p_iv)
     fy_lo, fy_hi = y_window(0.0, n_hi)
     us_lo = 0.5 + box_u_at(consts, fy_lo)[0]
