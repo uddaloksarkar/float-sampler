@@ -16,18 +16,17 @@ import shutil
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
-    run_cire_llvm, extract_cire_abs_error,
     loggam_defs, eps_logv, eps_logus,
     transcendental_error_bound,
     vprint, _fp_var_type,
     fptaylor_cmd,
     us_root, hormann_u_at, hormann_k_defs,
+    point_ivar,
 )
 
 NAME = "binomial"
@@ -113,18 +112,11 @@ def btrs_u_at(n, p, y, consts=None):
 
 _K_SLACK = 1.0            # floor can disagree by one integer: y in [k-1, k+2]
 
-# make_btrs_accept_template ties k to u via k_ = y_ - f (btrs_k_defs /
-# hormann_k_defs), f in [0, 1] -- see hormann_k_defs's docstring.  A shell
-# declared to cover k in [k_lo, ...] has y_window widen its low edge to
-# k_lo - _K_SLACK, so k1_ = k_ + 1 = (y_ - f) + 1 can reach as low as
-# (k_lo - _K_SLACK) - 1 + 1 = k_lo - _K_SLACK at the shell's low corner
-# (y_ at its widened minimum, f at its max).  FPTaylor's native lgamma
-# requires its argument > 0 (see FPTaylor/func.ml:lgamma_I), so k_lo must
-# exceed _K_SLACK; nk1_ mirrors this at the high (k near n) end.  This has
-# nothing to do with lgamma's own domain (it is rigorous for every x > 0) --
-# it is purely _K_SLACK and f's range pushing the *enclosure* below zero.
-# The extra 1.0 beyond _K_SLACK is headroom (the break-even point is exactly
-# _K_SLACK), confirmed empirically to clear FPTaylor's interval enclosure.
+# k1_ = k_ + 1 = (y_ - f) + 1 (btrs_k_defs) can enclose down to k_lo - _K_SLACK
+# at a shell's low corner (y_'s slack-widened minimum, f at its max), which
+# must stay > 0 for FPTaylor's lgamma; not a domain issue, just _K_SLACK/f
+# pushing the enclosure below zero.  +1.0 is headroom past the break-even
+# point (empirically sufficient); nk1_ mirrors this at the k-near-n end.
 _K_BOUNDARY_MARGIN = _K_SLACK + 1.0
 
 
@@ -182,12 +174,6 @@ def btrs_setup_defs(rnd, n_expr, p_expr, accept=False):
     return d
 
 
-def btrs_floor_defs(rnd):
-    """us and the pre-floor value y [btrs.c lines 60-61], as written in C."""
-    return [f"  us_    {rnd}= 0.5 - abs(u),",
-            f"  y_     {rnd}= (2.0 * a_ / us_ + b_) * u + c_,"]
-
-
 def btrs_k_defs(sign, n_expr, p_expr):
     """k = floor(y) for one sign of u (see dist_common.hormann_k_defs)."""
     return hormann_k_defs(
@@ -210,38 +196,6 @@ def _ivar(name, lo, hi, kind="real"):
     return f"  {kind} {name} in [{lo:.20e}, {hi:.20e}]"
 
 
-_EXACT_DIGITS = 25   # far below FPTaylor's own error-bound precision (~1e-16)
-
-
-def _exact_bracket(x, digits=_EXACT_DIGITS):
-    """
-    (lo, hi) exact finite-decimal strings with lo <= x <= hi, rounded outward
-    to `digits` significant digits.  FPTaylor's parser reads a Variables
-    literal as an exact rational (see input_parser_env.ml:add_variable_with_
-    uncertainty), so writing a value like p to only ~20 significant digits
-    (round-trip-safe for re-parsing to the same double, but not its true
-    exact decimal expansion) would silently analyse a slightly different
-    real number than the actual fp64 value.  Rounding outward instead of
-    guessing a single "close enough" literal keeps the query sound: x is
-    guaranteed to sit between the two points, whether or not x itself has a
-    short exact decimal (an integer n collapses to lo == hi automatically;
-    p in general does not).
-    """
-    d = Decimal(x) if isinstance(x, int) else Decimal(float(x))
-    if d == 0:
-        return "0", "0"
-    quant = Decimal(1).scaleb(d.adjusted() - digits + 1)
-    lo = d.quantize(quant, rounding=ROUND_FLOOR)
-    hi = d.quantize(quant, rounding=ROUND_CEILING)
-    return format(lo, "f"), format(hi, "f")
-
-
-def _point_ivar(name, value, kind="real"):
-    """Like _ivar, but for a single point value: see _exact_bracket."""
-    lo, hi = _exact_bracket(value)
-    return f"  {kind} {name} in [{lo}, {hi}]"
-
-
 def _template(var_lines, def_lines, expr):
     """Assemble one query; the last Variable and Definition get their ';'."""
     return ("Variables\n" + ",\n".join(var_lines) + ";\n\n"
@@ -252,12 +206,14 @@ def _template(var_lines, def_lines, expr):
 def make_floor_template(fp, var_lines, n_expr, p_expr):
     """
     eps_floor: absolute error of y = (2*a/us + b)*u + c, us = 0.5 - |u|
-    [btrs.c:61].  a, b, c stay expressions in n and p so they remain correlated
-    with each other and with u, and their own rounding is charged.
+    [btrs.c:60-61].  a, b, c stay expressions in n and p so they remain
+    correlated with each other and with u, and their own rounding is charged.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
+    floor_defs = [f"  us_    {rnd}= 0.5 - abs(u),",
+                  f"  y_     {rnd}= (2.0 * a_ / us_ + b_) * u + c_,"]
     return _template(var_lines,
-                     btrs_setup_defs(rnd, n_expr, p_expr) + btrs_floor_defs(rnd),
+                     btrs_setup_defs(rnd, n_expr, p_expr) + floor_defs,
                      "eps_floor = y_")
 
 
@@ -292,21 +248,30 @@ def make_accept_template(fp, var_lines, n_expr, p_expr, mid, name_k, name_nk,
 def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
     """
     Point form: only u varies; n and p are declared as Variables bracketing
-    the exact n, p (see _exact_bracket) so a, b, c reference them by name
+    the exact n, p (see dist_common.exact_bracket) so a, b, c reference them by name
     instead of embedding the literal expression at every occurrence.
     """
     return make_floor_template(
-        fp, [_ivar("u", u_lo, u_hi), _point_ivar("n", n), _point_ivar("p", p)],
+        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p)],
         "n", "p")
 
 
 def _point_hm_defs(n, p, rnd):
-    """m and h as Definitions: at a literal (n, p) both are literals, so only
-    the addition forming h is charged -- what btrs.c does once [btrs.c:75-76]."""
+    """
+    m and h as Definitions: m = floor((n+1)*p) is exact (unrounded); h =
+    lgamma(m+1) + lgamma(n-m+1) [btrs.c:77] is two independently-rounded
+    lgamma calls plus a rounded addition -- what btrs.c does at runtime --
+    via loggam_int_defs, same as k1_/nk1_.  Precomputing lgamma(m+1)/
+    lgamma(n-m+1) in Python and charging only the addition's rounding would
+    assume each lgamma() call is exact, which for m in the thousands is
+    routinely on the order of the whole eps_accept bound.
+    """
     m = int(math.floor((n + 1) * p))
-    return [f"  m_     = {float(m):.1f},",
-            f"  h_     {rnd}= {math.lgamma(m + 1):.20e}"
-            f" + {math.lgamma(n - m + 1):.20e},"]
+    defs_m,  name_m  = loggam_int_defs(float(m) + 1.0,     "hm",  rnd)
+    defs_nm, name_nm = loggam_int_defs(float(n - m) + 1.0, "hnm", rnd)
+    return ([f"  m_     = {float(m):.1f},"]
+            + defs_m + defs_nm
+            + [f"  h_     {rnd}= {name_m} + {name_nm},"])
 
 
 def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
@@ -314,16 +279,14 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
     Point form, k tied to u: free inputs are u and f only (btrs_k_defs), and
     sign selects the side of u = 0 that k's definition needs.
 
-    Valid for k in [_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN]: FPTaylor's
-    native lgamma(x) is itself rigorous for every x > 0 (see
-    FPTaylor/func.ml:lgamma_I), but k1_ = k_ + 1's *enclosure* dips to <= 0
-    closer than that to either end (see _K_BOUNDARY_MARGIN) -- the k outside
+    Valid for k in [_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN]: lgamma(x)
+    is rigorous for every x > 0, but k1_ = k_ + 1's *enclosure* dips to <= 0
+    closer than that to either end (see _K_BOUNDARY_MARGIN); the k outside
     that window go one at a time through make_btrs_accept_k_template.
 
     n and p are declared as Variables bracketing the exact n, p (see
-    _exact_bracket); every Definition that needs them (btrs_k_defs, nk1_, and
-    via make_accept_template the shared setup block) references them by name
-    instead of embedding the literal expression at every occurrence.
+    dist_common.exact_bracket) and referenced by name rather than re-embedded as
+    literals at every occurrence.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     defs_k,  name_k  = loggam_defs("k1_",  "lgk",  rnd)
@@ -335,21 +298,19 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
            + ["  nk1_   = n - k_ + 1.0,"]
            + defs_k + defs_nk)
     return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi), _point_ivar("n", n), _point_ivar("p", p),
+        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p),
              "  real f in [0.0, 1.0]"],
         "n", "p", mid, name_k, name_nk, fast)
 
 
 def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
     """
-    Point form for one integer k, for the k the margin sweep cannot cover
-    (see _K_BOUNDARY_MARGIN): tying k to u via k_ = y_ - f there would let
-    k1_ or nk1_'s enclosure reach <= 0, so k is a literal instead.
-
-    k as a literal is how btrs.c feeds it: k and n - k + 1 are formed in integer
-    arithmetic and cast, so both are error-free doubles.  This gives up the
-    k-to-u coupling btrs_k_defs maintains (u only ranges over the shell mapping
-    to this k); the error in *choosing* k is eps_floor's job either way.
+    Point form for one integer k, for the k the margin sweep can't cover (see
+    _K_BOUNDARY_MARGIN): tying k to u via k_ = y_ - f would let k1_/nk1_'s
+    enclosure reach <= 0, so k is a literal instead -- error-free, since k
+    and n - k + 1 are formed in integer arithmetic and cast, same as btrs.c.
+    This gives up btrs_k_defs's k-to-u coupling (u only ranges over the shell
+    for this k); the error in *choosing* k is eps_floor's job either way.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     defs_k,  name_k  = loggam_int_defs(float(k) + 1.0,     "lgk",  rnd)
@@ -360,7 +321,7 @@ def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
            + [f"  us_    {rnd}= 0.5 - abs(u),"]
            + defs_k + defs_nk)
     return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi), _point_ivar("n", n), _point_ivar("p", p)],
+        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p)],
         "n", "p", mid, name_k, name_nk, fast)
 
 
@@ -465,53 +426,53 @@ def make_btrs_floor_box_template(box, fp):
                                     _ivar("p", *box["p"])], "n", "p")
 
 
-def btrs_box_hm(n_iv, p_iv):
+def btrs_box_m(n_iv, p_iv):
     """
-    (h, m) enclosures for btrs.c's once-per-(n,p) constants [btrs.c:75-76]:
-    m = floor((n+1)*p), h = lgamma(m+1) + lgamma(n-m+1) = ln(m!) + ln((n-m)!).
-    ln(k!) is non-decreasing over integer k >= 0 (trivially, since k! is), so
-    each end comes from the corresponding corner regardless of how small m or
-    n - m gets.
-
-    Both stay outside the accept query: inlining loggam for m and n - m would
-    add two Horner chains and a dimension to the search, taking FPTaylor from
-    ~30s to >10min per query.  Declaring h `real` over its enclosure charges
-    0.5*ulp(|h|), exactly the addition it replaces; m is an exact int64_t cast,
-    so it gets a float type and is charged nothing.
+    m enclosure for btrs.c's once-per-(n,p) mode [btrs.c:75]: m =
+    floor((n+1)*p) is non-decreasing in both n and p, so each end comes from
+    the corresponding corner.  m stays a declared Variable (an FPTaylor
+    Definition can't express floor() of a range -- only floor_power2 exists,
+    for FPTaylor's own error-bound bookkeeping, not general use); h is
+    computed from m inside the query instead (see make_btrs_accept_box_
+    template) now that only m, not h, needs to be a free dimension.
     """
     (n_lo, n_hi), (p_lo, p_hi) = n_iv, p_iv
-    m = (float(math.floor((n_lo + 1.0) * p_lo)),
-         float(math.floor((n_hi + 1.0) * p_hi)))
-    h = (math.lgamma(m[0] + 1.0) + math.lgamma(n_lo - m[1] + 1.0),
-         math.lgamma(m[1] + 1.0) + math.lgamma(n_hi - m[0] + 1.0))
-    return h, m
+    return (float(math.floor((n_lo + 1.0) * p_lo)),
+            float(math.floor((n_hi + 1.0) * p_hi)))
 
 
 def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
     """
-    Interval-parameter form of the accept template, parametrized by whichever of
-    k and j = n - k is the *small* one:
+    Interval-parameter form of the accept template, parametrized by whichever
+    of k and j = n - k is the *small* one:
 
         low=True   x = k,      k + 1 = x + 1,  n - k + 1 = n - x + 1
         low=False  x = n - k,  k + 1 = n - x + 1,  n - k + 1 = x + 1
 
-    That choice is what makes a box in n analysable at all.  The argument
-    written as n - x + 1 carries the full width of the box (n and x cannot
-    cancel); parametrizing by the small side keeps that wide argument on the
-    large loggam, where the width is harmless, and leaves the small argument
-    exact.  The point templates do not need this: with n a literal,
-    n - k + 1 is exact either way.
+    n - x + 1 carries the full width of the box (n and x can't cancel);
+    parametrizing by the small side keeps that wide argument on the large
+    loggam (harmless there) and leaves the small argument exact.  Point mode
+    doesn't need this since n is a literal.
 
-    x_iv is x's enclosure over this box.  A degenerate (v, v) is emitted as a
-    literal (loggam_int_defs), avoiding an unnecessary FPTaylor variable;
-    otherwise x is an FPTaylor variable ranging over the box.  FPTaylor's
-    native lgamma(x) is rigorous for every x > 0 (see
-    FPTaylor/func.ml:lgamma_I), so there is no Stirling-branch window x_iv
-    needs to stay inside.
+    x_iv is x's enclosure; a degenerate (v, v) is emitted as a literal
+    (loggam_int_defs) rather than an FPTaylor variable.  Unlike the point
+    form, k is not tied to u here (no f): the caller pairs an x enclosure
+    with the u window mapping into it, a sound over-approximation of the
+    reachable (x, u) curve.  Tying k to u live via btrs_k_defs instead (as
+    the point form does) forces FPTaylor to re-derive a division (a/us)
+    with n, p *as ranges* inside the query; division amplifies interval
+    width multiplicatively, and the resulting margin needed to keep k1_/
+    nk1_ positive explodes non-linearly with the box's width (measured:
+    2.6 -> 9.65 -> 78.7 -> 642 -> unsatisfiable as p's width alone grew
+    from 0 to 0.01) rather than scaling gently -- so this shelled form,
+    which never lets u and n/p interact through that division inside the
+    query, is the one that actually works for a box wide enough to matter.
 
-    Unlike the point form, k is not tied to u here (there is no f): the caller
-    pairs an x enclosure with the u window that maps into it, and the resulting
-    rectangle is a sound over-approximation of the reachable (x, u) curve.
+    m stays a declared Variable (box["m"], an enclosure of the once-per-(n,p)
+    mode -- see btrs_box_m); h = lgamma(m+1) + lgamma(n-m+1) is computed from
+    m *inside* the query (loggam_defs) rather than as its own separately
+    -bounded Variable: one fewer free dimension for the search, and h tracks
+    m's actual value instead of two independently-corner-matched enclosures.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     x_lo, x_hi = x_iv
@@ -533,17 +494,20 @@ def make_btrs_accept_box_template(box, fp, low, x_iv, fast=False):
     else:
         defs_small, name_small = loggam_defs(small_expr, small_pre, rnd)
     defs_big, name_big = loggam_defs(big_expr, big_pre, rnd)
+    defs_hm,  name_hm  = loggam_defs("m_ + 1.0", "hm", rnd)
+    defs_hnm, name_hnm = loggam_defs("n - m_ + 1.0", "hnm", rnd)
 
     var_lines = [_ivar("u", *box["u"]), _ivar("n", *box["n"]),
                  _ivar("p", *box["p"])]
     if not literal:
         var_lines.append(_ivar("x", *box["x"]))
-    var_lines += [_ivar("h_", *box["h"]),
-                  _ivar("m_", *box["m"], kind=_fp_var_type(fp))]
+    var_lines.append(_ivar("m_", *box["m"], kind=_fp_var_type(fp)))
 
     mid = ([f"  us_    {rnd}= 0.5 - abs(u),"]
            + ([f"  x_     = {x_lo:.1f},"] if literal else [])
-           + kdefs + defs_small + defs_big)
+           + kdefs + defs_small + defs_big
+           + defs_hm + defs_hnm
+           + [f"  h_     {rnd}= {name_hm} + {name_hnm},"])
     return make_accept_template(
         fp, var_lines, "n", "p", mid,
         name_small if low else name_big,
@@ -635,16 +599,12 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
     `boxes` is a list of (label, stem, template_text): label goes in the log,
     stem names the input/output files.
 
-    With bb_eval=False (default), queries run with the compiling --opt bb
-    (needed for --bb-split geometric), which compiles each query to OCaml
-    under a fixed filename relative to the working directory regardless of
-    --tmp-base-dir [FPTaylor/opt_basic_bb.ml], so concurrent bb queries race
-    and clobber each other's compiled program (observed as hung processes,
-    and in principle a bound reported for the wrong expression) -- `jobs` is
-    ignored and capped to 1 worker.  See dist_common.fptaylor_cmd.
-
-    With bb_eval=True, queries run with the interpreted --opt bb-eval
-    instead: no compile step, no race, so `jobs` workers run concurrently.
+    bb_eval=False (default) compiles each query with --opt bb under a fixed
+    filename relative to the working directory regardless of --tmp-base-dir
+    [FPTaylor/opt_basic_bb.ml], so concurrent bb queries race and clobber
+    each other's compiled program -- `jobs` is capped to 1 worker.
+    bb_eval=True uses the interpreted --opt bb-eval instead: no compile step,
+    no race, `jobs` workers run concurrently.
     """
     def one(box):
         label, stem, text = box
@@ -743,30 +703,19 @@ def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
     """
     (eps_accept, tv, n_extra): fold the per-query maxima into the TV bound.
 
-    eps_accept still owes -log(v), and with --fast the split-out -2*log(us) as
-    well; v and us are sampler variables.  args.u_trunc is the nominal floor
-    of both the log(v) domain (see dist_common.eps_logv) and the u domain.
+    eps_accept still owes -log(v) (and, with --fast, the split-out
+    -2*log(us)) before it's complete.  us_lo/us_hi are how far short of the
+    full u in [-0.5, 0.5) each side's box falls; below args.u_trunc, that
+    shortfall of u mass is charged to TV directly (real and FP samplers may
+    disagree on it, same as a sampler that disagrees on a positive-
+    probability event):
 
-    us_lo = 0.5 + u_lo, us_hi = 0.5 - u_hi are how far short of the full u in
-    [-0.5, 0.5) the box's reachable [u_lo, u_hi] falls on each side (see
-    callers).  u_trunc is the u mass we are willing to call negligible; if a
-    side's box already reaches at least that far (us_lo/us_hi >= u_trunc) it
-    costs nothing, but if the box falls short, the real and FP samplers may
-    disagree on that shortfall of (uniform) u mass, so it is charged to TV
-    same as swapping in a sampler that disagrees on a positive-probability
-    event.
+        tv = 2*eps_floor*accept_iter + 2*eps_accept
+             + max(0, u_trunc - us_lo) + max(0, u_trunc - us_hi)
 
-    tv = 2*eps_floor*accept_iter + 2*eps_accept
-         + max(0, u_trunc - us_lo) + max(0, u_trunc - us_hi)
-    one accepted draw costs the floor error scaled by the per-iteration
-    acceptance probability plus the accept-test error, and each side's
-    shortfall below u_trunc (if any) is added on top.
-
-    ledger=True: -log(v) is charged directly via transcendental_error_bound
-    instead of a separate FPTaylor query, and -2*log(us) is not added here at
-    all.  Not used by any caller currently -- eps_accept and eps_logv/eps_logus
-    are inlined FPTaylor queries everywhere -- kept for a path that ledgers
-    log/exp rather than inlining them.
+    ledger=True charges -log(v) via transcendental_error_bound instead of a
+    query, and skips -2*log(us) entirely; unused by any current caller, kept
+    for a path that ledgers log/exp rather than inlining them.
     """
     us_min = min(us_lo, us_hi)
     if ledger:
@@ -845,16 +794,13 @@ def btrs_box_k_shells(n_iv, p_iv):
     """
     (low, high): enclosures covering every k in [0, n] for every n in the box.
     `low` encloses k, `high` the offset j = n - k; a k is covered if it
-    appears in either.  Each is one query over the whole range of x + 1 (the
-    error runs through 1/(x+1) and log(x+1); FPTaylor's native lgamma(x) is
-    rigorous for every x > 0, so x + 1 never leaves its domain, and the
-    conditioning is left to FPTaylor's own branch-and-bound splitting,
-    --opt bb --bb-split geometric).
+    appears in either.  Each is one query over the whole range of x + 1, with
+    the 1/(x+1) and log(x+1) conditioning left to FPTaylor's own
+    branch-and-bound splitting (--opt bb --bb-split geometric).
 
-    The halves must meet (k_mid + j_mid >= n_hi - 1); if the box is too wide
-    the caller is told to raise --split-depth.  A half that collapses to an
-    empty range (e.g. a box narrow enough in n that the other half alone
-    already reaches down to k = 0) is simply omitted.
+    The halves must meet (k_mid + j_mid >= n_hi - 1); too-wide a box raises,
+    telling the caller to bump --split-depth.  A half that collapses to an
+    empty range (e.g. the other half alone already reaches k = 0) is omitted.
     """
     n_lo, n_hi = n_iv
     j_mid = n_lo
@@ -889,7 +835,7 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
         raise ValueError(f"BTRS shape constant a reaches {a[0]:.6g} <= 0 at the "
                          f"low corner of n in [{n_lo:.6g}, {n_hi:.6g}], "
                          f"p in [{p_lo:.6g}, {p_hi:.6g}]")
-    h_iv, m_iv = btrs_box_hm(n_iv, p_iv)
+    m_iv = btrs_box_m(n_iv, p_iv)
     sub = safe_box_name(n_lo, n_hi, p_lo, p_hi)
     floor_boxes, accept_boxes = [], []
 
@@ -911,7 +857,7 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast):
             u_win = box_u_shells(consts, y_lo, y_hi)
             for i, (sign, u_lo, u_hi) in enumerate(u_win):
                 box = {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv,
-                       "x": (x_lo, x_hi), "h": h_iv, "m": m_iv}
+                       "x": (x_lo, x_hi), "m": m_iv}
                 x_tag = (f"{x_lo:.0f}" if x_lo == x_hi
                          else f"{x_lo:.0f}-{x_hi:.0f}")
                 accept_boxes.append((
@@ -976,60 +922,6 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
         fptaylor, fp, eps_floor, eps_accept_raw, accept_iter, us_lo, us_hi, args,
         inputs_dir, outputs_dir, env)
     return eps_floor, eps_accept, tv, n_boxes + n_extra
-
-# ---------------------------------------------------------------------------
-# CIRE C code
-# ---------------------------------------------------------------------------
-
-_BINOM_C = """\
-#include <math.h>
-/* eps0: absolute error of exp(n * log(1-p)) */
-double binom_eps0(double n, double p) { double q = 1.0 - p; return exp(n * log(q)); }
-/* eps1: absolute error of z * (n - X + 1) * p / (X * (1-p)) */
-double binom_eps1(double z, double X, double n, double p)
-    { double q = 1.0 - p; return z * (n - X + 1.0) * p / (X * q); }
-/* eps2: absolute error of sum + prod */
-double binom_eps2(double s, double pr) { return s + pr; }
-"""
-
-
-def _run_cire(cire, n, p, args, inputs_dir, outputs_dir):
-    """Return (eps0, eps1, eps2) relative errors via CIRE absolute errors."""
-    q = 1.0 - p
-    qn, z_lo, x_hi = inversion_params(n, p)
-
-    tag = safe_pair_name(n, p)
-
-    def _run(func, domains, label):
-        rc, out = run_cire_llvm(
-            cire, _BINOM_C, func, domains, tag, inputs_dir, outputs_dir,
-            verbose=args.verbose,
-        )
-        if rc != 0:
-            raise RuntimeError(f"CIRE failed for {label} (n={n}, p={p}); "
-                               f"see outputs/{tag}_{func}.out")
-        return extract_cire_abs_error(out, label)
-
-    abs0 = _run("binom_eps0",
-                [(float(n), float(n)), (p, p)],
-                "eps0")
-    abs1 = _run("binom_eps1",
-                [(z_lo, 1.0), (1.0, x_hi),
-                 (float(n), float(n)), (p, p)],
-                "eps1")
-    abs2 = _run("binom_eps2",
-                [(qn, 1.0), (0.0, 1.0)],
-                "eps2")
-
-    # relative error = abs_error / lower_bound_of_exact_expression
-    # eps0 lower bound: qn (the exact value, single-point expression)
-    # eps1 lower bound: minimum of z*(n-X+1)*p/(X*q) at z=z_lo, X=x_hi
-    # eps2 lower bound: qn (minimum of sum+prod = qn+0)
-    eps1_lo = max(z_lo * (n - x_hi + 1.0) * p / (x_hi * q), sys.float_info.min)
-    eps0 = abs0 / qn
-    eps1 = abs1 / eps1_lo
-    eps2 = abs2 / qn
-    return eps0, eps1, eps2
 
 
 # ---------------------------------------------------------------------------
@@ -1245,7 +1137,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
 
 def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
-    import os, contextlib, math
+    import contextlib
     import numpy as np
 
     # interval-mode rows cover a box, not a point on the (n, np) grid

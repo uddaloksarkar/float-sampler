@@ -13,6 +13,7 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
+    point_ivar,
 )
 
 NAME = "geometric"
@@ -46,9 +47,9 @@ def _make_search_template(p, fp):
     return (
         "Variables\n"
         f"  real z in [{z_lo:.20e}, 1.0],\n"
-        f"  real sum in [{p:.20e}, 1.0];\n\n"
+        f"  real sum in [{p:.20e}, 1.0],\n"
+        + point_ivar("p", p) + ";\n\n"
         + "Definitions\n"
-        f"  p = {p:.20e},\n"
         f"  q         {rnd}= 1.0 - p,\n"
         f"  prod      {rnd}= z * q,\n"
         f"  sum_step  {rnd}= sum + prod;\n\n"
@@ -71,9 +72,9 @@ def _make_inversion_template(p, fp):
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
-        f"  real u in [0.0, 9.99999900000000000000e-01];\n\n"
+        f"  real u in [0.0, 9.99999900000000000000e-01],\n"
+        + point_ivar("p", p) + ";\n\n"
         + "Definitions\n"
-        f"  p = {p:.20e},\n"
         f"  log_q   {rnd}= log(1.0 - p),\n"
         f"  log_1mu {rnd}= log(1.0 - u),\n"
         f"  H       {rnd}= log_1mu / log_q;\n\n"

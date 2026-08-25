@@ -16,7 +16,7 @@ from dist_common import (
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus, fptaylor_cmd,
-    hormann_u_at, hormann_k_defs,
+    hormann_u_at, hormann_k_defs, point_ivar,
 )
 
 NAME = "poisson"
@@ -141,14 +141,17 @@ def make_ptrs_floor_template(lam, fp, utail):
     (2*a/us + b)*u + (lambda + 0.43), with us = 0.5 - |u|
     [random_poisson_ptrs.c line 89]
 
-    Only u is free; a, b, c are expressions in the literal lambda.
+    Only u is free; lambda is declared as a Variable bracketing its exact
+    value (dist_common.exact_bracket) so a, b, c reference it by name
+    instead of re-embedding the literal at every occurrence.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
-        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}];\n\n"
+        f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}],\n"
+        + point_ivar("lam", lam) + ";\n\n"
         + "Definitions\n"
-        + "\n".join(ptrs_setup_defs(rnd, f"{lam:.20e}")) + "\n"
+        + "\n".join(ptrs_setup_defs(rnd, "lam")) + "\n"
         + f"  us_   {rnd}= 0.5 - abs(u),\n"
         + f"  ptrs_floor {rnd}= (2.0 * a_ / us_ + b_) * u + c_;\n\n"
         + "Expressions\n"
@@ -180,15 +183,16 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     return (
         "Variables\n"
         f"  real u in [{u_lo:.20e}, {u_hi:.20e}],\n"
-        f"  real f in [0.0, 1.0];\n\n"
+        f"  real f in [0.0, 1.0],\n"
+        + point_ivar("lam", lam) + ";\n\n"
         + "Definitions\n"
-        + "\n".join(ptrs_setup_defs(rnd, f"{lam:.20e}", accept=True)) + "\n"
+        + "\n".join(ptrs_setup_defs(rnd, "lam", accept=True)) + "\n"
         + f"  us_    {rnd}= 0.5 - abs(u),\n"
-        + "\n".join(ptrs_k_defs(sign, f"{lam:.20e}")) + "\n"
+        + "\n".join(ptrs_k_defs(sign, "lam")) + "\n"
         + "\n".join(defs_k) + "\n"
         + f"  us_sq_      {rnd}= us_ * us_,\n"
         + f"  log_num_    {rnd}= a_ + b_ * us_sq_,\n"
-        + f"  ptrs_accept {rnd}= -{lam:.20e} + k_ * llam_ - {name_k}"
+        + f"  ptrs_accept {rnd}= -lam + k_ * llam_ - {name_k}"
           f" - log(ialp_) + log(log_num_){log_us_term};\n\n"
         + "Expressions\n"
           "  eps_accept = ptrs_accept;\n"

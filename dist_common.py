@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
 import interval_error as ie
@@ -627,6 +628,38 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
 def _fp_var_type(fp):
     """FPTaylor variable type matching `fp`, for inputs that are already floats."""
     return {"fp32": "float32", "fp64": "float64", "fp128": "float128"}[fp]
+
+
+_EXACT_DIGITS = 25   # far below FPTaylor's own error-bound precision (~1e-16)
+
+
+def exact_bracket(x, digits=_EXACT_DIGITS):
+    """
+    (lo, hi) exact finite-decimal strings with lo <= x <= hi, rounded outward
+    to `digits` significant digits.  FPTaylor reads a Variables literal as an
+    exact rational (input_parser_env.ml:add_variable_with_uncertainty), so a
+    ~20-significant-digit literal (round-trip-safe for re-parsing to the same
+    double, but not x's true exact decimal expansion) would analyse a
+    slightly different number than the actual fp64 value.  Rounding outward
+    keeps it sound regardless (an integer collapses to lo == hi; a general
+    float like p or lambda generally does not).
+    """
+    d = Decimal(x) if isinstance(x, int) else Decimal(float(x))
+    if d == 0:
+        return "0", "0"
+    quant = Decimal(1).scaleb(d.adjusted() - digits + 1)
+    lo = d.quantize(quant, rounding=ROUND_FLOOR)
+    hi = d.quantize(quant, rounding=ROUND_CEILING)
+    return format(lo, "f"), format(hi, "f")
+
+
+def point_ivar(name, value, kind="real"):
+    """One Variables-section line bracketing a single point value exactly;
+    see exact_bracket.  FPTaylor collapses a degenerate real interval to an
+    exact constant (add_variable_with_uncertainty), so callers can reference
+    `name` afterward instead of re-embedding the literal at every occurrence."""
+    lo, hi = exact_bracket(value)
+    return f"  {kind} {name} in [{lo}, {hi}]"
 
 
 def make_logv_template(fp, v_lo, v_hi=1.0):

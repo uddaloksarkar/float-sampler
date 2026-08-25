@@ -255,16 +255,26 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     # W rather than Y is the second variable, and Z = W - f (see hrua_z_defs);
     # W in [z_lo + 1, z_hi] is what keeps Z inside the loggam domain.
     d9 = int(math.floor((m + 1) * (mgb + 1) / (c["popsize"] + 2)))
+    # d10's four loggam calls are each independently rounded in FPTaylor
+    # (loggam_defs), not precomputed in Python: matching random_loggam's own
+    # four calls [hypergeometric_hrua.c:91-92] rather than silently assuming
+    # each is exact and charging only the final addition (see dist_binomial.
+    # _point_hm_defs for the same fix on the BTRS analog, h_).
+    defs_d9,  name_d9  = loggam_defs(f"{float(d9) + 1.0:.1f}", "d10a", rnd)
+    defs_mgb, name_mgb = loggam_defs(f"{float(mgb - d9) + 1.0:.1f}", "d10b", rnd)
+    defs_m,   name_m   = loggam_defs(f"{float(m - d9) + 1.0:.1f}", "d10c", rnd)
+    defs_Mgb, name_Mgb = loggam_defs(f"{float(Mgb - m + d9) + 1.0:.1f}", "d10d", rnd)
     return (
         "Variables\n"
         f"  real X in [{xtail:.20e}, {xhi:.20e}],\n"
         f"  real W in [{z_lo + 1.0:.1f}, {z_hi:.1f}],\n"
         f"  real f in [0.0, 1.0];\n\n"
         + "Definitions\n"
-        + f"  d10_ {rnd}= {math.lgamma(d9 + 1):.20e}"
-          f" + {math.lgamma(mgb - d9 + 1):.20e}"
-          f" + {math.lgamma(m - d9 + 1):.20e}"
-          f" + {math.lgamma(Mgb - m + d9 + 1):.20e},\n"
+        + "\n".join(defs_d9)  + "\n"
+        + "\n".join(defs_mgb) + "\n"
+        + "\n".join(defs_m)   + "\n"
+        + "\n".join(defs_Mgb) + "\n"
+        + f"  d10_ {rnd}= {name_d9} + {name_mgb} + {name_m} + {name_Mgb},\n"
         + "\n".join(hrua_z_defs()) + "\n"
         + "\n".join(defs_z)  + "\n"
         + "\n".join(defs_mz) + "\n"
