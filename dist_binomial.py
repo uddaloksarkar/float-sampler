@@ -93,7 +93,6 @@ def btrs_u_at(n, p, y, consts=None):
 
 
 _K_SLACK = 1.0            # floor can disagree by one integer: y in [k-1, k+2]
-_K_BOUNDARY_MARGIN = _K_SLACK + 1.0    # keeps k1_/nk1_ > 0 at a shell's edge
 
 
 def y_window(k_lo, k_hi, slack=_K_SLACK):
@@ -231,40 +230,36 @@ def _point_hm_defs(rnd):
             + [f"  h_     {rnd}= {name_hm} + {name_hnm},"])
 
 
-def make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign, fast=False):
-    """Point form, k tied to u (free inputs: u, f; sign picks the u=0 side).
-    Valid only for k in [_K_BOUNDARY_MARGIN, n-_K_BOUNDARY_MARGIN] -- outside
-    that, k1_/nk1_'s enclosure dips to <= 0, so those k go one at a time
-    through make_btrs_accept_k_template instead."""
+def make_btrs_accept_template(n, p, fp, u_lo, u_hi, k_lo, k_hi, fast=False):
+    """Point form. k is declared directly as a Variable over [k_lo, k_hi]
+    (the full [0, n] in practice -- k1_ = k+1 and nk1_ = n-k+1 are exact
+    functions of the declared k, so they stay in [1, n+1], safely > 0,
+    across that whole range) rather than derived here from u via the
+    y = f(u) map: k and u are only jointly reachable through the sampler's
+    *exact* floor relationship, and eps_floor already bounds any
+    disagreement about which k a given u floors to. Re-deriving k from u
+    inside this template would needlessly propagate u's own error through
+    that derivative-large map into loggam(k+1)/loggam(n-k+1), inflating
+    eps_accept and double-counting what eps_floor already covers (see the
+    old hormann_k_defs docstring in dist_common.py). Declaring k directly,
+    and letting u range over its own full (both-signs) interval only for
+    us_/log_num_, is a sound relaxation -- the same reparametrization used
+    for PTRS's k (dist_poisson.py) and HRUA's W
+    (dist_hypergeometric.hrua_z_defs) -- and drops the sign split entirely,
+    since us_ = 0.5 - abs(u) no longer needs one."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
     defs_k,  name_k  = loggam_defs("k1_",  "lgk",  rnd)
     defs_nk, name_nk = loggam_defs("nk1_", "lgnk", rnd)
 
     mid = (_point_hm_defs(rnd)
-           + [f"  us_    {rnd}= 0.5 - abs(u),"]
-           + btrs_k_defs(sign, "n", "p")
-           + ["  nk1_   = n - k_ + 1.0,"]
+           + [f"  us_    {rnd}= 0.5 - abs(u),",
+              "  k_     = k,",
+              "  k1_    = k + 1.0,",
+              "  nk1_   = n - k + 1.0,"]
            + defs_k + defs_nk)
     return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p),
-             "  real f in [0.0, 1.0]", "  real fm in [0.0, 1.0]"],
-        "n", "p", mid, name_k, name_nk, fast)
-
-
-def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
-    """Point form for one boundary k (see _K_BOUNDARY_MARGIN): k is a
-    literal instead of tied to u, since integer k/n-k+1 need no slack and
-    stay exact; the error in *choosing* k is eps_floor's job either way."""
-    rnd = FP_TO_FPTAYLOR_RND[fp]
-    defs_k,  name_k  = loggam_int_defs(float(k) + 1.0,     "lgk",  rnd)
-    defs_nk, name_nk = loggam_int_defs(float(n - k) + 1.0, "lgnk", rnd)
-
-    mid = ([f"  k_     = {float(k):.1f},"]
-           + _point_hm_defs(rnd)
-           + [f"  us_    {rnd}= 0.5 - abs(u),"]
-           + defs_k + defs_nk)
-    return make_accept_template(
-        fp, [_ivar("u", u_lo, u_hi), point_ivar("n", n), point_ivar("p", p),
+        fp, [_ivar("u", u_lo, u_hi), _ivar("k", k_lo, k_hi),
+             point_ivar("n", n), point_ivar("p", p),
              "  real fm in [0.0, 1.0]"],
         "n", "p", mid, name_k, name_nk, fast)
 
@@ -551,36 +546,28 @@ def _btrs_floor_boxes(n, p, fp, tag, consts, u_trunc=0.0):
 
 
 def _btrs_accept_boxes(n, p, fp, tag, consts, fast, u_trunc=0.0):
-    """Boxes covering the accept expression for every k in [0, n]: a
-    margin-tied shell for k in [_K_BOUNDARY_MARGIN, n-_K_BOUNDARY_MARGIN],
-    plus one literal-k query each for the boundary k outside it (see
-    _K_BOUNDARY_MARGIN).  --u-trunc clips or drops each; returns
-    (boxes, excess)."""
-    boxes = []
-    excess = 0.0
-    margin = _K_BOUNDARY_MARGIN
-    y_lo, y_hi = y_window(margin, n - margin)
-    shells, shell_excess = u_shells(n, p, y_lo, y_hi, consts, u_trunc)
-    excess += shell_excess
-    for i, (sign, u_lo, u_hi) in enumerate(shells):
-        boxes.append((f"accept {_shell_label(sign, u_lo, u_hi)}",
-                      _shell_stem("binomial_btrs_accept", fp, tag, i, sign),
-                      make_btrs_accept_template(n, p, fp, u_lo, u_hi, sign,
-                                                fast=fast)))
+    """One box covering the accept expression for every k in [0, n], k
+    declared directly (see make_btrs_accept_template).  --u-trunc clips or
+    drops it; returns (boxes, excess).
 
-    edge = math.ceil(margin)
-    for k in (list(range(edge)) + [n - j for j in range(edge)]):
-        ky_lo, ky_hi = y_window(k, k)
-        u_lo, u_hi, k_excess = clip_u_trunc(
-            btrs_u_at(n, p, ky_lo, consts), btrs_u_at(n, p, ky_hi, consts),
-            u_trunc)
-        excess += k_excess
-        if u_lo > u_hi:
-            continue    # k=k's whole u range lies beyond the truncation edge
-        boxes.append((f"accept k={k}",
-                      f"binomial_btrs_accept_{fp}_{tag}_k{k}",
-                      make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k,
-                                                  fast=fast)))
+    k1_ = k+1 and nk1_ = n-k+1 are exact (unrounded) functions of the
+    directly-declared k, so they stay in [1, n+1] -- safely > 0 -- across
+    the whole k in [0, n] range with no separate boundary-k handling
+    needed (unlike the old u-derived k_, which needed padding/slack and a
+    margin to keep its *enclosure* off zero; see make_btrs_accept_template).
+    k no longer depends on u's sign either (declared directly, not derived
+    via the y = f(u) map), so unlike the floor boxes this is a single box,
+    not one per sign -- us_ = 0.5 - abs(u) is already sign-symmetric."""
+    y_lo, y_hi = y_window(0.0, float(n))
+    u_lo, u_hi, excess = clip_u_trunc(
+        btrs_u_at(n, p, y_lo, consts), btrs_u_at(n, p, y_hi, consts), u_trunc)
+    if u_lo > u_hi:
+        return [], excess
+    us_lo, us_hi = 0.5 - max(abs(u_lo), abs(u_hi)), 0.5 - min(abs(u_lo), abs(u_hi))
+    boxes = [(f"accept k in [0, {n}] us in [{us_lo:.3e}, {us_hi:.3e}]",
+             f"binomial_btrs_accept_{fp}_{tag}_main",
+             make_btrs_accept_template(n, p, fp, u_lo, u_hi, 0.0, float(n),
+                                       fast=fast))]
     return boxes, excess
 
 
@@ -632,10 +619,6 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
         raise ValueError(f"BTRS shape constant a = {a:.6g} <= 0 "
                          f"(n*p*q = {n * p * (1.0 - p):.6g} too small); "
                          "the reachable u range is not a single interval")
-    if n < 2 * _K_BOUNDARY_MARGIN:
-        raise ValueError(f"n = {n} is too small to leave any k in "
-                         f"[_K_BOUNDARY_MARGIN, n - _K_BOUNDARY_MARGIN] "
-                         "for the accept margin sweep to cover")
     alpha  = (2.83 + 5.1 / b) * spq
     fy_lo, fy_hi = y_window(0.0, float(n))
     u_lo, u_hi = btrs_u_at(n, p, fy_lo, consts), btrs_u_at(n, p, fy_hi, consts)

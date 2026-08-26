@@ -38,15 +38,20 @@ v_trunc = 1e-20
 u_trunc = 1e-5
 opt_x_abs_tol = 0.01
 floor_opt_x_abs_tol_vars = "u=1e-5,n=1e5,p=0.1"
-accept_opt_x_abs_tol_vars = "u=0.1,n=1e5,p=0.1,f=1,fm=1"
+# k=1: k is now declared directly over [0,n] (see make_btrs_accept_template)
+# instead of derived from u, and defaults to the flat opt-x-abs-tol=0.01 --
+# a needlessly tight resolution relative to k's own [0,n] range (k is
+# conceptually integer-valued; sub-1 precision buys nothing). Confirmed:
+# without this, n=100 p=0.5 didn't converge in 60s+; with it, ~24s.
+accept_opt_x_abs_tol_vars = "u=0.1,n=1e5,p=0.1,f=1,fm=1,k=1"
 
 [poisson]
 approx = false
 bb_eval = false
 v_trunc = 1e-20
-u_trunc = 1e-3
+u_trunc = 1e-5
 opt_x_abs_tol = 0.01
-floor_opt_x_abs_tol_vars = "u=1e-5"
+floor_opt_x_abs_tol_vars = "u=1e-6"
 accept_opt_x_abs_tol_vars = "u=0.1"
 
 [hypergeometric]
