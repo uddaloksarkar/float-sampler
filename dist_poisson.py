@@ -6,8 +6,6 @@ dist_binomial.py (eps_floor / eps_accept split, shared -log(v) and
 -2*log(us) helpers, --fast flag).
 """
 import math
-import shutil
-import tempfile
 import time
 from pathlib import Path
 
@@ -16,7 +14,7 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
-    loggam_defs, eps_logv, eps_logus, fptaylor_cmd,
+    loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
     hormann_u_at, point_ivar,
     hormann_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
@@ -82,7 +80,12 @@ def ptrs_accept_u_range(lam):
     return hormann_u_at(a, b, c, k_lo), hormann_u_at(a, b, c, k_hi)
 
 
-def clip_ptrs_u(u_lo, u_hi, u_trunc):
+def clip_u_trunc(u_lo, u_hi, u_trunc):
+    """Clip [u_lo, u_hi] to keep us = 0.5 - |u| >= u_trunc; same role as
+    dist_binomial.clip_u_trunc (same name, same purpose), but PTRS charges
+    u_trunc to TV as a flat amount (see _run_ptrs_fptaylor) rather than the
+    actual trimmed-mass excess BTRS computes, so unlike BTRS's version this
+    one has no excess to return."""
     edge_lo = -0.5 + u_trunc
     edge_hi = 0.5 - u_trunc
     return max(u_lo, edge_lo), min(u_hi, edge_hi)
@@ -216,31 +219,16 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, k_lo, k_hi, fast=False):
     )
 
 
-def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
-                        bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
-                        approx=True):
-    """Run one FPTaylor query and return output.
-
-    PTRS queries run one per call site, not concurrently, so the compile race
-    documented in dist_common.fptaylor_cmd does not apply here even with the
-    default --opt bb backend.
-    """
-    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
-    try:
-        return run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars, approx),
-            cwd=ROOT, env=env)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose,
-                       fast=False, v_trunc=2.0 ** -53, ratio_tol=2.0,
-                       bb_eval=False, x_abs_tol=None, approx=True,
-                       u_trunc=None, floor_tol_vars=None,
-                       accept_tol_vars=None):
-    """Run PTRS queries and compose the theorem 2.7 bound."""
+def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
+    """(eps_floor, eps_accept, tv) for the PTRS regime at lambda; composes
+    the theorem 2.7 bound."""
+    fp, verbose = args.fp, args.verbose
+    fast, v_trunc = args.fast, args.v_trunc
+    ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
+    x_abs_tol, approx = args.opt_x_abs_tol, args.approx
+    u_trunc = args.u_trunc
+    floor_tol_vars = floor_x_abs_tol_vars(args)
+    accept_tol_vars = accept_x_abs_tol_vars(args)
     if u_trunc is None or not (0.0 < u_trunc < 0.5):
         raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
     _, a, b, _ = ptrs_consts(lam)
@@ -250,7 +238,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
     floor_input.write_text(make_ptrs_floor_template(lam, fp, u_trunc))
 
-    code, output = _run_fptaylor_query(fptaylor, floor_input, outputs_dir, env,
+    code, output = run_fptaylor_query(fptaylor, floor_input, outputs_dir, env,
                                        ratio_tol, bb_eval, x_abs_tol, floor_tol_vars, approx)
     floor_output.write_text(output)
     if verbose >= 2:
@@ -268,7 +256,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     au_lo, au_hi = ptrs_accept_u_range(lam)
     k_lo, k_hi = ptrs_accept_k_range(lam)
     k_tail = ptrs_k_tail_prob(lam)
-    lo, hi = clip_ptrs_u(au_lo, au_hi, u_trunc)
+    lo, hi = clip_u_trunc(au_lo, au_hi, u_trunc)
     if lo > hi:
         raise ValueError(f"lambda={lam}: u-range emptied by u_trunc={u_trunc}")
 
@@ -277,7 +265,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     accept_input.write_text(
         make_ptrs_accept_template(lam, fp, lo, hi, k_lo, k_hi, fast=fast))
 
-    code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir,
+    code, output = run_fptaylor_query(fptaylor, accept_input, outputs_dir,
                                        env, ratio_tol, bb_eval, x_abs_tol,
                                        accept_tol_vars, approx)
     accept_output.write_text(output)
@@ -471,15 +459,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
             # ---- high range (PTRS) ----
             eps_floor, eps_accept, tv = _run_ptrs_fptaylor(
-                fptaylor, lam_float, args.fp, tag, inputs_dir, outputs_dir,
-                env, args.verbose, fast=args.fast, v_trunc=args.v_trunc,
-                ratio_tol=args.bb_geometric_ratio_tol,
-                bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
-                approx=args.approx,
-                u_trunc=args.u_trunc,
-                floor_tol_vars=floor_x_abs_tol_vars(args),
-                accept_tol_vars=accept_x_abs_tol_vars(args),
-            )
+                fptaylor, lam_float, args, tag, inputs_dir, outputs_dir, env)
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 
             row = _empty_row(lam, args.fp)

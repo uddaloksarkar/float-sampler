@@ -22,18 +22,14 @@ takes natural exponents), so it is modeled as exp(y*log(x)) throughout,
 mirroring dist_binomial.make_template's qn_step = exp(n*log(q)).
 """
 import math
-import shutil
-import tempfile
 from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
-    run_command, extract_abs_errors_by_problem,
-    vprint, fptaylor_cmd, point_ivar,
+    extract_abs_errors_by_problem,
+    vprint, run_fptaylor_query, point_ivar, fp_var_type,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
 )
-
-_FP_VAR_TYPE = {"fp32": "float32", "fp64": "float64", "fp128": "float128"}
 
 NAME = "zipf"
 CSV_FIELDS = ["a", "eps_floor", "eps_accept", "tv", "n_boxes"]
@@ -45,10 +41,6 @@ CSV_FIELDS = ["a", "eps_floor", "eps_accept", "tv", "n_boxes"]
 # genuine singularity at U = 0.
 _X_SWEEP = [1, 2, 3, 5, 10, 20, 50, 100, 1000]
 _X_MAX = max(_X_SWEEP)
-
-
-def _rnd(fp):
-    return FP_TO_FPTAYLOR_RND[fp]
 
 
 def zipf_tail_prob(a, x_max=_X_MAX):
@@ -64,13 +56,13 @@ def make_zipf_floor_template(a, fp):
     U is restricted to [U_min, 1], U_min = _X_MAX^-am1, so Y only ranges up
     to _X_MAX -- the X > _X_MAX tail is charged directly via zipf_tail_prob
     instead of asking FPTaylor to bound Y near its true U=0 singularity."""
-    rnd = _rnd(fp)
+    rnd = FP_TO_FPTAYLOR_RND[fp]
     am1 = a - 1.0
     u_min = _X_MAX ** (-am1)
     v0_max = 1.0 - u_min
     return (
         "Variables\n"
-        f"  {_FP_VAR_TYPE[fp]} V0 in [0.0, {v0_max:.20e}],\n"
+        f"  {fp_var_type(fp)} V0 in [0.0, {v0_max:.20e}],\n"
         + point_ivar("a", a) + ";\n\n"
         + "Definitions\n"
         f"  U      {rnd}= 1.0 - V0,\n"
@@ -86,7 +78,7 @@ def make_zipf_accept_template(a, x, fp):
     """eps_accept: absolute error of R = T*(b-1) / (b*x*(T-1)), the threshold
     V is compared against [zipf.c: V*X*(T-1)/(b-1) <= T/b, rearranged so the
     only free input left is V's comparison target]."""
-    rnd = _rnd(fp)
+    rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
         + point_ivar("a", a) + ";\n\n"
@@ -105,16 +97,17 @@ def make_zipf_accept_template(a, x, fp):
 
 def _run_query(fptaylor, text, stem, expr, args, inputs_dir, outputs_dir, env,
                x_abs_tol_vars):
+    """Write one query, run it via the shared run_fptaylor_query, and
+    extract its named error bound. Zipf's floor/accept-sweep queries are
+    each single, independent one-off files (no box-list/max-reduction
+    like binomial's, no fixed pair like poisson's/hypergeometric's), so
+    this thin per-query wrapper -- write, run, extract -- stays local
+    rather than living in dist_common.py."""
     input_path = inputs_dir / f"{stem}.txt"
     input_path.write_text(text)
-    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
-    try:
-        code, output = run_command(
-            fptaylor_cmd(fptaylor, input_path, work, args.bb_geometric_ratio_tol,
-                        args.bb_eval, args.opt_x_abs_tol, x_abs_tol_vars, args.approx),
-            cwd=ROOT, env=env)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    code, output = run_fptaylor_query(
+        fptaylor, input_path, outputs_dir, env, args.bb_geometric_ratio_tol,
+        args.bb_eval, args.opt_x_abs_tol, x_abs_tol_vars, args.approx)
     out_path = outputs_dir / f"{stem}.out"
     out_path.write_text(output)
     if args.verbose >= 2:
@@ -127,7 +120,7 @@ def _run_query(fptaylor, text, stem, expr, args, inputs_dir, outputs_dir, env,
     return errors[expr]
 
 
-def _run_zipf_fptaylor(fptaylor, a, tag, args, inputs_dir, outputs_dir, env):
+def _run_zipf_fptaylor(fptaylor, a, args, tag, inputs_dir, outputs_dir, env):
     """(eps_floor, eps_accept, tv, n_boxes) for one a; see module docstring
     for what tv does and doesn't yet account for."""
     eps_floor = _run_query(
@@ -207,7 +200,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
         tag = safe_a_name(a)
         try:
             eps_floor, eps_accept, tv, n_boxes = _run_zipf_fptaylor(
-                fptaylor, a, tag, args, inputs_dir, outputs_dir, env)
+                fptaylor, a, args, tag, inputs_dir, outputs_dir, env)
             vprint(args.verbose, f"zipf a={a}", eps_floor=eps_floor,
                    eps_accept=eps_accept, tv=tv)
             rows.append({"a": f"{a:.17g}", "eps_floor": f"{eps_floor:.17e}",

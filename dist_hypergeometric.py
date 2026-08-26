@@ -9,15 +9,13 @@ Two regimes, matching numpy's dispatch:
                                     distributions/hypergeometric_hyp.c)
 """
 import math
-import shutil
-import tempfile
 import time
 from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
-    save_loglog_plot, loggam_defs, vprint, fptaylor_cmd,
+    save_loglog_plot, loggam_defs, vprint, run_fptaylor_query,
     rou_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
 )
@@ -80,7 +78,7 @@ def make_template(N, K, n, fp):
 # HRUA FPTaylor templates  (sample > _HRUA_SWITCH)
 # ---------------------------------------------------------------------------
 
-def _hrua_constants(N, K, n):
+def hrua_consts(N, K, n):
     """
     The d4..d11 setup constants of random_hypergeometric_hrua
     (distributions/hypergeometric_hrua.c lines 81-93), computed in exact
@@ -113,7 +111,7 @@ def _log_choose(n, k):
 
 
 def hrua_modal_pmf(N, K, n):
-    c = _hrua_constants(N, K, n)
+    c = hrua_consts(N, K, n)
     z = int(math.floor((c["m"] + 1) * (c["mingoodbad"] + 1)
                        / (c["popsize"] + 2)))
     log_p = (_log_choose(c["mingoodbad"], z)
@@ -151,14 +149,14 @@ def hrua_xtail(N, K, n, ulps=8.0):
 
     Returns (xtail, eps_w_estimate, eps_tail).
     """
-    c = _hrua_constants(N, K, n)
+    c = hrua_consts(N, K, n)
     d6, d8, d11 = c["d6"], c["d8"], c["d11"]
     rho = ulps * 2.0 ** -53
     xtail = (rho * d8 * d8 / (2.0 * d11)) ** (1.0 / 3.0)
     return xtail, rho * (d6 + d8 / (2.0 * xtail)), d11 * xtail ** 2 / (2.0 * d8)
 
 
-def hrua_setup_defs(N, K, n, rnd, exact=False, prefix=""):
+def hrua_setup_defs(rnd, N, K, n, exact=False, prefix=""):
     """
     random_hypergeometric_hrua's setup block [hypergeometric_hrua.c lines
     85-92] as FPTaylor Definitions.  d4..d8 are derived from the integer
@@ -170,7 +168,7 @@ def hrua_setup_defs(N, K, n, rnd, exact=False, prefix=""):
     they stay literals.  exact=True drops the rounding markers, for the
     copies that feed Z (see hrua_z_defs).
     """
-    c = _hrua_constants(N, K, n)
+    c = hrua_consts(N, K, n)
     r = "=" if exact else f"{rnd}="
     P, M, mgb = c["popsize"], c["m"], c["mingoodbad"]
     return [
@@ -189,7 +187,7 @@ def hrua_z_range(N, K, n):
     lgamma argument > 0. Z = W - f only guarantees Z > W_lo - 1, so the
     template's W window starts one above z_lo.
     """
-    c = _hrua_constants(N, K, n)
+    c = hrua_consts(N, K, n)
     mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
     z_lo = float(max(0, -(Mgb - m)))
     z_hi = float(min(int(c["d11"]) - 1, mgb, m))
@@ -240,7 +238,7 @@ def make_hrua_w_template(N, K, n, fp, xtail, xhi=1.0):
         f"  real X in [{xtail:.20e}, {xhi:.20e}],\n"
         f"  real Y in [0.0, 1.0];\n\n"
         + "Definitions\n"
-        + "\n".join(hrua_setup_defs(N, K, n, rnd)) + "\n"
+        + "\n".join(hrua_setup_defs(rnd, N, K, n)) + "\n"
         + f"  w_step {rnd}= d6_ + d8_ * (Y - 0.5) / X;\n\n"
         + "Expressions\n"
           "  eps_w = w_step;\n"
@@ -260,7 +258,7 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     dist_common.py). Z is restricted (hrua_z_range) to the range where all
     four lgamma arguments stay > 0.
     """
-    c   = _hrua_constants(N, K, n)
+    c   = hrua_consts(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
     z_lo, z_hi = hrua_z_range(N, K, n)
@@ -302,44 +300,33 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     )
 
 
-def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
-                        bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
-                        approx=True):
-    """Run one FPTaylor query and return output.
+def _run_hrua_fptaylor(fptaylor, N, K, n, args, tag, inputs_dir, outputs_dir, env):
+    """(eps_w, eps_accept, tv) for the HRUA regime at (N, K, n); composes
+    the ratio-of-uniforms rejection bound.
 
-    HRUA queries run one per call site, not concurrently, so the compile race
-    documented in dist_common.fptaylor_cmd does not apply here even with the
-    default --opt bb backend.
+    W's declared range (hrua_z_range) grows with N/K/n, so a flat
+    --opt-x-abs-tol forces ever more splitting on it as the population
+    scales up -- auto-derive a per-case value (~10x N) unless the user
+    passed their own via --opt-x-abs-tol-vars.
+
+    args.u_trunc plays the same role as binomial/poisson's --u-trunc: a
+    floor on X (the ratio-of-uniforms proposal variable, playing the same
+    role there as u/us does in BTRS/PTRS) below which the domain is
+    clipped rather than analyzed, charged directly to TV as a flat amount
+    -- same tradeoff as --v-trunc/--u-trunc elsewhere (see add_common_args
+    in dist_common.py), not the tighter quadratic tail-probability
+    estimate (hrua_xtail's docstring) that used to be computed and charged
+    here.
     """
-    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
-    try:
-        return run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars, approx),
-            cwd=ROOT, env=env)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    fp, verbose = args.fp, args.verbose
+    ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
+    x_abs_tol, approx = args.opt_x_abs_tol, args.approx
+    u_trunc = args.u_trunc
+    x_abs_tol_vars = args.opt_x_abs_tol_vars
+    if x_abs_tol_vars is None:
+        x_abs_tol_vars = f"W={10.0 * N:.6g}"
 
-
-def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
-                       verbose, ratio_tol=2.0, bb_eval=False, x_abs_tol=None,
-                       x_abs_tol_vars=None, approx=True, u_trunc=0.0):
-    """Run HRUA queries and compose the ratio-of-uniforms rejection bound.
-
-    x_abs_tol_vars matters here the same way it does for binomial: W's
-    declared range (hrua_z_range) grows with N/K/n, so a flat x_abs_tol
-    forces ever more splitting on it as the population scales up -- pass
-    e.g. "W=<N-scale>" to keep W's own width from being the bottleneck.
-
-    u_trunc plays the same role as binomial/poisson's --u-trunc: a floor on
-    X (the ratio-of-uniforms proposal variable, playing the same role
-    there as u/us does in BTRS/PTRS) below which the domain is clipped
-    rather than analyzed, charged directly to TV as a flat amount --
-    same tradeoff as --v-trunc/--u-trunc elsewhere (see add_common_args in
-    dist_common.py), not the tighter quadratic tail-probability estimate
-    (hrua_xtail's docstring) that used to be computed and charged here.
-    """
-    c = _hrua_constants(N, K, n)
+    c = hrua_consts(N, K, n)
     xtail_star, _, _ = hrua_xtail(N, K, n)
     xtail = max(u_trunc, xtail_star)
 
@@ -347,7 +334,7 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
     w_output = outputs_dir / f"hypergeometric_hrua_w_{fp}_{tag}.out"
     w_input.write_text(make_hrua_w_template(N, K, n, fp, xtail))
 
-    code, output = _run_fptaylor_query(fptaylor, w_input, outputs_dir, env,
+    code, output = run_fptaylor_query(fptaylor, w_input, outputs_dir, env,
                                        ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
     w_output.write_text(output)
     if verbose >= 2:
@@ -361,7 +348,7 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
     accept_output = outputs_dir / f"hypergeometric_hrua_accept_{fp}_{tag}.out"
     accept_input.write_text(make_hrua_accept_template(N, K, n, fp, xtail))
 
-    code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir, env,
+    code, output = run_fptaylor_query(fptaylor, accept_input, outputs_dir, env,
                                        ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
     accept_output.write_text(output)
     if verbose >= 2:
@@ -494,21 +481,8 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
             # ---- HRUA regime ----
             if _use_hrua(N, K, n):
-                # W's declared range (hrua_z_range) scales with N/K/n, so a
-                # flat opt-x-abs-tol-vars forces ever more splitting on it
-                # as N grows -- auto-derive a per-case value (~10x N,
-                # matching creator.sh's benchmark-dataset convention) unless
-                # the user passed their own.
-                x_abs_tol_vars = args.opt_x_abs_tol_vars
-                if x_abs_tol_vars is None:
-                    x_abs_tol_vars = f"W={10.0 * N:.6g}"
                 eps_w, eps_accept, tv = _run_hrua_fptaylor(
-                    fptaylor, N, K, n, args.fp, tag, inputs_dir, outputs_dir,
-                    env, args.verbose, ratio_tol=args.bb_geometric_ratio_tol,
-                    bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
-                    x_abs_tol_vars=x_abs_tol_vars, approx=args.approx,
-                    u_trunc=args.u_trunc,
-                )
+                    fptaylor, N, K, n, args, tag, inputs_dir, outputs_dir, env)
                 rows.append({
                     "N": N, "K": K, "n": n, "regime": "hrua",
                     "delta": "nan",
