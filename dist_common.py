@@ -93,39 +93,25 @@ def find_gelpia(explicit=None):
 
 def fptaylor_env():
     """
-    env for running FPTaylor, with a specific opam switch's bin dir put
-    first on PATH. --opt bb compiles each query with ocamlopt at runtime
-    (FPTaylor/b_and_b/compile.sh); if PATH doesn't already resolve to the
-    same OCaml that built FPTaylor/INTERVAL, the compile silently uses
-    whatever else is on PATH (e.g. the cluster's module/CVMFS-provided
-    OCaml), producing a native library that makes "inconsistent
-    assumptions" against interval.cmxa's stdlib -- surfacing as
-    "inconsistent assumptions over implementation Stdlib__Callback" (or
-    "is not a compiled interface for this version of OCaml") on every
-    subsequent --opt bb call, not just this one, since the mismatched
-    build artifact is shared state (FPTaylor/b_and_b/tmp).
-
-    `opam var bin` alone isn't enough on machines with multiple switches:
-    it resolves whatever switch happens to be currently selected, which
-    may not be the one FPTaylor/INTERVAL was actually built against.
-    FPTAYLOR_OPAM_SWITCH pins the switch explicitly (default "fptaylor" --
-    the switch FPTaylor/INTERVAL was built with here); `opam var
-    bin --switch=<name>` reads that switch's bin dir without touching the
-    globally selected switch, so it works from any shell -- including a
-    SLURM compute-node shell that never sourced this user's opam init and
-    so wouldn't otherwise see this switch at all.
+    env for running FPTaylor, with the active opam switch's bin dir put
+    first on PATH. --opt bb compiles each query with ocamlfind/ocamlopt at
+    runtime (FPTaylor/b_and_b/compile.sh); if PATH doesn't already resolve
+    to the same OCaml that built FPTaylor/fptaylor, the compile silently
+    uses whatever else is on PATH (e.g. a different opam switch, or a
+    Homebrew OCaml), producing a .cmi incompatible with the already-built
+    binary -- surfacing as "is not a compiled interface for this version
+    of OCaml" on every subsequent --opt bb call, not just this one, since
+    the mismatched .cmi is shared build state.
     """
     env = os.environ.copy()
     env.setdefault("FPTAYLOR_BASE", str(ROOT / "FPTaylor"))
     opam_bin = shutil.which("opam")
-    switch = os.environ.get("FPTAYLOR_OPAM_SWITCH", "fptaylor")
     if opam_bin:
         try:
             bin_dir = subprocess.run(
-                [opam_bin, "var", "bin", f"--switch={switch}"],
-                capture_output=True, text=True,
+                [opam_bin, "var", "bin"], capture_output=True, text=True,
                 timeout=5, check=True).stdout.strip()
-            if bin_dir and Path(bin_dir).is_dir():
+            if bin_dir:
                 path = env.get("PATH", "")
                 if bin_dir not in path.split(os.pathsep):
                     env["PATH"] = bin_dir + os.pathsep + path
