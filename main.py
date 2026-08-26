@@ -34,6 +34,7 @@ from pathlib import Path
 
 from dist_common import (
     add_common_args,
+    apply_settings_defaults,
     find_fptaylor, fptaylor_env,
     find_cire,
     elapsed_since, format_seconds,
@@ -74,6 +75,7 @@ def main():
 
     args = parser.parse_args()
     mod = DISTRIBUTIONS[args.dist]
+    apply_settings_defaults(args)
 
     # --- resolve backend tool ---
     if args.backend == "fptaylor":

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import tomllib
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
@@ -368,7 +369,7 @@ def add_common_args(parser):
                              "full FPTaylor/CIRE/Gelpia output to stdout")
     parser.add_argument("--cache", action="store_true",
                         help="If summary.csv already exists in out-dir, load it and skip re-running")
-    parser.add_argument("--v-trunc", type=float, default=2.0 ** -53,
+    parser.add_argument("--v-trunc", type=float, default=None,
                         help="Truncation floor for the raw uniform-seed "
                              "domain v (BTRS/PTRS: the log(v) domain lower "
                              "bound, replacing the hardcoded 2^-53). v can "
@@ -378,9 +379,10 @@ def add_common_args(parser):
                              "certified down to this floor; the flat amount "
                              "the reported TV is inflated by for the "
                              "region below it, e.g. --v-trunc 1e-8 adds "
-                             "exactly 1e-8 to TV (default: 2^-53).")
-    parser.add_argument("--u-trunc", type=float, default=0.0,
-                        help="BTRS (binomial): minimum allowed us = "
+                             "exactly 1e-8 to TV (default: fptaylor_settings"
+                             ".toml's per-distribution value, else 2^-53).")
+    parser.add_argument("--u-trunc", type=float, default=None,
+                        help="BTRS/PTRS: minimum allowed us = "
                              "0.5 - |u| at the sampler's own reachable-k "
                              "boundary (us_lo, us_hi -- unlike v, u is "
                              "bounded away from the log singularity by the "
@@ -389,14 +391,16 @@ def add_common_args(parser):
                              "--v-trunc). If the boundary computed from "
                              "(n, p) ever dips below this, that is treated "
                              "as an error and raised rather than silently "
-                             "absorbed into TV. Default 0.0: no restriction "
-                             "(never raises).")
+                             "absorbed into TV. Default: fptaylor_settings"
+                             ".toml's per-distribution value, else 0.0 (no "
+                             "restriction, never raises).")
     parser.add_argument("--bb-geometric-ratio-tol", type=float, default=2.0,
                         help="FPTaylor's --bb-geometric-ratio-tol: how far "
                              "(as a ratio) the branch-and-bound geometric "
                              "splitter narrows a sub-domain before stopping. "
                              "Must be > 1 (default: 2.0).")
-    parser.add_argument("--bb-eval", action="store_true",
+    parser.add_argument("--bb-eval", action=argparse.BooleanOptionalAction,
+                        default=None,
                         help="Use FPTaylor's interpreted --opt bb-eval "
                              "backend instead of the default compiling "
                              "--opt bb --bb-split midpoint. No compile "
@@ -404,9 +408,17 @@ def add_common_args(parser):
                              "--jobs) and there is no risk of the bb compile "
                              "race, but bb-eval ignores --bb-split / "
                              "--bb-geometric-ratio-tol entirely -- pair with "
-                             "--opt-x-abs-tol to control precision instead.")
+                             "--opt-x-abs-tol to control precision instead. "
+                             "Default: fptaylor_settings.toml's "
+                             "per-distribution value, else false (compiled "
+                             "bb). See --approx: which of {bb, bb-eval} x "
+                             "{approx, no-approx} is actually fastest is "
+                             "distribution-specific and was found to differ "
+                             "in both directions by sweep_fptaylor.py -- "
+                             "that's why this is a per-distribution setting "
+                             "now, not a single global default.")
     parser.add_argument("--approx", action=argparse.BooleanOptionalAction,
-                        default=True,
+                        default=None,
                         help="Bound each per-operation error term "
                              "separately then sum (--opt-approx true "
                              "--opt-exact false), instead of FPTaylor's own "
@@ -420,7 +432,17 @@ def add_common_args(parser):
                              "a second; both use the same rigorous "
                              "interval-arithmetic optimizer underneath, so "
                              "this is a tightness/speed tradeoff, not a "
-                             "soundness one (default: --approx, i.e. true).")
+                             "soundness one. Which way is faster is "
+                             "distribution- (and backend-) specific: e.g. "
+                             "confirmed via sweep_fptaylor.py that compiled "
+                             "--opt bb triggers a separate OCaml compile per "
+                             "term under --approx, making it ~12x slower "
+                             "than --no-approx for binomial/poisson, while "
+                             "for hypergeometric --no-approx's single joint "
+                             "problem doesn't converge at all (900s+) and "
+                             "--approx is the only viable choice. Default: "
+                             "fptaylor_settings.toml's per-distribution "
+                             "value, else true.")
     parser.add_argument("--opt-x-abs-tol", type=float, default=None,
                         help="FPTaylor's --opt-x-abs-tol: domain-size "
                              "termination tolerance for the optimizer, "
@@ -465,6 +487,74 @@ def add_common_args(parser):
                         help="Overrides --opt-x-abs-tol-vars for accept "
                              "queries only (eps_accept). See "
                              "--floor-opt-x-abs-tol-vars.")
+
+
+# ---------------------------------------------------------------------------
+# fptaylor_settings.toml: per-distribution FPTaylor optimizer defaults,
+# benchmarked by sweep_fptaylor.py (see that file for method and raw
+# results: binomial/poisson are ~12x faster with --no-approx on the
+# compiled --opt bb backend because --approx triggers a separate OCaml
+# compile per per-operation error term there; hypergeometric is the
+# opposite -- --no-approx's single joint optimization never converges
+# (900s+) while --approx does, and --bb-eval edges out compiled --opt bb
+# for that one). CLI flags always win over these; these only fill in
+# values the user didn't pass explicitly (detected via the None-sentinel
+# defaults on --approx/--bb-eval/--v-trunc/--u-trunc/etc above).
+# ---------------------------------------------------------------------------
+
+SETTINGS_TOML_PATH = ROOT / "fptaylor_settings.toml"
+
+# Applied only if neither the CLI nor the TOML sets a value -- matches this
+# module's original argparse defaults, so a distribution with no TOML
+# section (or a missing TOML file entirely) behaves exactly as it did
+# before this settings file existed.
+_HARDCODED_DEFAULTS = {
+    "approx": True,
+    "bb_eval": False,
+    "v_trunc": 2.0 ** -53,
+    "u_trunc": 0.0,
+}
+
+_SETTINGS_CACHE = None
+
+
+def load_settings_toml(path=None):
+    """Load fptaylor_settings.toml once and cache it. Returns {} if the
+    file doesn't exist -- it's an optional speed optimization, not a
+    requirement (every field still has a hardcoded fallback below)."""
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
+    p = path or SETTINGS_TOML_PATH
+    _SETTINGS_CACHE = {} if not p.exists() else tomllib.load(p.open("rb"))
+    return _SETTINGS_CACHE
+
+
+def apply_settings_defaults(args):
+    """Fill in any of {approx, bb_eval, v_trunc, u_trunc, opt_x_abs_tol,
+    opt_x_abs_tol_vars, floor_opt_x_abs_tol_vars, accept_opt_x_abs_tol_vars}
+    the user left unset (None) on the command line, from
+    fptaylor_settings.toml's [args.dist] section, then from
+    _HARDCODED_DEFAULTS for the fields that must never reach a
+    distribution module still None. Call once, right after
+    argparse.parse_args(), before any distribution module reads these
+    fields off args.
+
+    Precedence: explicit CLI flag > fptaylor_settings.toml[dist] >
+    hardcoded default.
+    """
+    settings = load_settings_toml()
+    dist_settings = settings.get(args.dist, {})
+
+    for field in ("approx", "bb_eval", "v_trunc", "u_trunc",
+                  "opt_x_abs_tol", "opt_x_abs_tol_vars",
+                  "floor_opt_x_abs_tol_vars", "accept_opt_x_abs_tol_vars"):
+        if getattr(args, field, None) is None and field in dist_settings:
+            setattr(args, field, dist_settings[field])
+
+    for field, default in _HARDCODED_DEFAULTS.items():
+        if getattr(args, field, None) is None:
+            setattr(args, field, default)
 
 
 # ---------------------------------------------------------------------------

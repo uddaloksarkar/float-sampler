@@ -20,6 +20,7 @@ from dist_common import (
     hormann_u_at, hormann_k_defs, point_ivar,
     hormann_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
+    floor_x_abs_tol_vars, accept_x_abs_tol_vars,
 )
 
 NAME = "poisson"
@@ -90,6 +91,12 @@ def ptrs_accept_u_range(lam):
     _, a, b, c = ptrs_consts(lam)
     k_lo, k_hi = ptrs_accept_k_range(lam)
     return hormann_u_at(a, b, c, k_lo), hormann_u_at(a, b, c, k_hi)
+
+
+def clip_ptrs_u(u_lo, u_hi, u_trunc):
+    edge_lo = -0.5 + u_trunc
+    edge_hi = 0.5 - u_trunc
+    return max(u_lo, edge_lo), min(u_hi, edge_hi)
 
 
 def poisson_cdf_below(lam, k_lo):
@@ -205,7 +212,8 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
 
 
 def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
-                        bb_eval=False, x_abs_tol=None, approx=True):
+                        bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
+                        approx=True):
     """Run one FPTaylor query and return output.
 
     PTRS queries run one per call site, not concurrently, so the compile race
@@ -216,7 +224,7 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
     try:
         return run_command(
             fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, approx=approx),
+                        x_abs_tol, x_abs_tol_vars, approx),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -224,27 +232,26 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
 
 def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose,
                        fast=False, v_trunc=2.0 ** -53, ratio_tol=2.0,
-                       bb_eval=False, x_abs_tol=None, approx=True):
+                       bb_eval=False, x_abs_tol=None, approx=True,
+                       u_trunc=None, floor_tol_vars=None,
+                       accept_tol_vars=None):
     """Run PTRS queries and compose the theorem 2.7 bound."""
+    if u_trunc is None or not (0.0 < u_trunc < 0.5):
+        raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
     _, a, b, _ = ptrs_consts(lam)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
-    utail = 1e-3
 
     floor_input  = inputs_dir  / f"poisson_ptrs_floor_{fp}_{tag}.txt"
     floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
-    floor_input.write_text(make_ptrs_floor_template(lam, fp, utail))
+    floor_input.write_text(make_ptrs_floor_template(lam, fp, u_trunc))
 
     code, output = _run_fptaylor_query(fptaylor, floor_input, outputs_dir, env,
-                                       ratio_tol, bb_eval, x_abs_tol, approx)
+                                       ratio_tol, bb_eval, x_abs_tol, floor_tol_vars, approx)
     floor_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor PTRS floor (lambda={lam}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor PTRS floor failed for lambda={lam}; see {floor_output}")
-
-    t_eta = (2.0 * a / utail + b) * (0.5 - utail)
-    s_eta = t_eta - 0.5
-    u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (lam + s_eta / 3.0)))
 
     floor_raw = extract_abs_errors_by_problem(output)["eps_floor"]
     eps_floor = hormann_proposal_deviation(floor_raw, a, b)
@@ -254,6 +261,9 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     k_tail = ptrs_k_tail_prob(lam)
     accept_raw = 0.0
     for sign, lo, hi in ((-1, au_lo, 0.0), (+1, 0.0, au_hi)):
+        lo, hi = clip_ptrs_u(lo, hi, u_trunc)
+        if lo > hi:
+            continue
         s_tag = "m" if sign < 0 else "p"
         accept_input  = inputs_dir  / f"poisson_ptrs_accept_{fp}_{tag}_{s_tag}.txt"
         accept_output = outputs_dir / f"poisson_ptrs_accept_{fp}_{tag}_{s_tag}.out"
@@ -261,7 +271,8 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
             make_ptrs_accept_template(lam, fp, lo, hi, sign, fast=fast))
 
         code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir,
-                                           env, ratio_tol, bb_eval, x_abs_tol, approx)
+                                           env, ratio_tol, bb_eval, x_abs_tol,
+                                           accept_tol_vars, approx)
         accept_output.write_text(output)
         if verbose >= 2:
             print(f"--- FPTaylor PTRS accept s={sign:+d} (lambda={lam}) ---\n{output}")
@@ -273,17 +284,17 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
 
     logv, _ = eps_logv(
         fptaylor, fp, v_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
-        bb_eval, x_abs_tol, approx=approx,
+        bb_eval, x_abs_tol, accept_tol_vars, approx=approx,
     )
     eps_accept = accept_raw + logv
     if fast:
         logus, _ = eps_logus(
-            fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose, ratio_tol,
-            bb_eval, x_abs_tol, approx=approx,
+            fptaylor, fp, u_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
+            bb_eval, x_abs_tol, accept_tol_vars, approx=approx,
         )
         eps_accept += logus
 
-    tv = (u_tail_prob + 2.0 * k_tail + v_trunc
+    tv = (2.0 * u_trunc + 2.0 * k_tail + v_trunc
           + 2.0 * invalpha * eps_floor
           + acceptance_tv(eps_accept))
     return eps_floor, eps_accept, tv
@@ -459,6 +470,9 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 ratio_tol=args.bb_geometric_ratio_tol,
                 bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
                 approx=args.approx,
+                u_trunc=args.u_trunc,
+                floor_tol_vars=floor_x_abs_tol_vars(args),
+                accept_tol_vars=accept_x_abs_tol_vars(args),
             )
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 

@@ -507,11 +507,19 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
             # ---- HRUA regime ----
             if _use_hrua(N, K, n):
+                # W's declared range (hrua_z_range) scales with N/K/n, so a
+                # flat opt-x-abs-tol-vars forces ever more splitting on it
+                # as N grows -- auto-derive a per-case value (~10x N,
+                # matching creator.sh's benchmark-dataset convention) unless
+                # the user passed their own.
+                x_abs_tol_vars = args.opt_x_abs_tol_vars
+                if x_abs_tol_vars is None:
+                    x_abs_tol_vars = f"W={10.0 * N:.6g}"
                 eps_w, eps_accept, tv = _run_hrua_fptaylor(
                     fptaylor, N, K, n, args.fp, tag, inputs_dir, outputs_dir,
                     env, args.verbose, ratio_tol=args.bb_geometric_ratio_tol,
                     bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
-                    x_abs_tol_vars=args.opt_x_abs_tol_vars, approx=args.approx,
+                    x_abs_tol_vars=x_abs_tol_vars, approx=args.approx,
                 )
                 rows.append({
                     "N": N, "K": K, "n": n, "regime": "hrua",

@@ -1,0 +1,59 @@
+# Per-distribution FPTaylor optimizer defaults, benchmarked by
+# sweep_fptaylor.py (one representative point per distribution: binomial
+# n=10900 p=0.1; poisson lambda=40; hypergeometric N=100 K=40 n=30).
+#
+# main.py applies these automatically (see dist_common.apply_settings_defaults,
+# called from main.py right after argparse.parse_args()) -- any of these
+# fields you pass explicitly on the command line (--approx/--no-approx,
+# --bb-eval/--no-bb-eval, --v-trunc, --u-trunc, --opt-x-abs-tol,
+# --opt-x-abs-tol-vars, --floor-opt-x-abs-tol-vars,
+# --accept-opt-x-abs-tol-vars) always override the value here. A
+# distribution with no section below (or this file missing entirely) falls
+# back to the original hardcoded defaults (approx=true, bb_eval=false,
+# v_trunc=2^-53, u_trunc=0.0).
+#
+# Key finding: the fastest {opt bb vs bb-eval} x {approx vs no-approx}
+# combination is NOT universal -- it flips direction by distribution:
+#   - binomial, poisson: compiled `--opt bb` under `--approx` triggers a
+#     SEPARATE OCaml compile per per-operation error term (confirmed via
+#     live process monitoring: 30+ bb_N.ml compiles for one query), making
+#     it ~12x slower than --no-approx (--opt-exact, one compile, one
+#     harder joint optimization). --no-approx wins for both.
+#   - hypergeometric: the opposite. --no-approx's single joint optimization
+#     never converges (900s+, confirmed hung) -- the joint accept
+#     expression combining several lgamma terms is apparently too hard for
+#     branch-and-bound to close in one shot. --approx (decomposed
+#     per-term) is required for this one to finish at all, and the
+#     interpreted --bb-eval backend edges out compiled --opt bb here
+#     (26.8s vs 38.4s) since there's no compile-multiplication penalty to
+#     avoid and bb-eval's per-box thread parallelism (--jobs) helps instead.
+#
+# Re-run/extend this sweep with sweep_fptaylor.py if these numbers ever
+# need re-validating (e.g. after an FPTaylor upgrade or a template change).
+
+[binomial]
+approx = false
+bb_eval = false
+v_trunc = 1e-20
+u_trunc = 1e-5
+opt_x_abs_tol = 0.01
+floor_opt_x_abs_tol_vars = "u=1e-5,n=1e5,p=0.1"
+accept_opt_x_abs_tol_vars = "u=0.1,n=1e5,p=0.1,f=1,fm=1"
+
+[poisson]
+approx = false
+bb_eval = false
+v_trunc = 1e-20
+u_trunc = 1e-3
+opt_x_abs_tol = 0.01
+floor_opt_x_abs_tol_vars = "u=1e-5"
+accept_opt_x_abs_tol_vars = "u=0.1"
+
+[hypergeometric]
+approx = true
+bb_eval = true
+opt_x_abs_tol = 0.01
+# opt_x_abs_tol_vars (W's tolerance) is intentionally NOT set here: W's
+# range scales with N, so a fixed constant would be a no-op for small N and
+# far too tight for extreme N. dist_hypergeometric.run() auto-derives
+# "W=<10*N>" per case when this isn't overridden -- see the comment there.
