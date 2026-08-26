@@ -302,29 +302,6 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     )
 
 
-def hrua_z_tail_prob(N, K, n):
-    """
-    Chernoff-Hoeffding bound on P(Z outside [z_lo, z_hi]), the output mass
-    the accept query does not cover.  Hoeffding (1963) shows hypergeometric
-    tails are dominated by the binomial ones with the same mean, so the
-    Bernoulli KL bound applies with p = d4 over m draws.
-    """
-    c = _hrua_constants(N, K, n)
-    m, p = c["m"], c["mingoodbad"] / c["popsize"]
-    z_lo, z_hi = hrua_z_range(N, K, n)
-
-    def kl(a):
-        d = a * math.log(a / p) if a > 0.0 else 0.0
-        return d + ((1.0 - a) * math.log((1.0 - a) / (1.0 - p)) if a < 1.0 else 0.0)
-
-    tail = 0.0
-    if z_lo > 0:
-        tail += math.exp(-m * kl(min(z_lo / m, 1.0)))
-    if z_hi < m:
-        tail += math.exp(-m * kl(min(z_hi / m, 1.0)))
-    return tail
-
-
 def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
                         bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
                         approx=True):
@@ -346,18 +323,25 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
 
 def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
                        verbose, ratio_tol=2.0, bb_eval=False, x_abs_tol=None,
-                       x_abs_tol_vars=None, approx=True):
+                       x_abs_tol_vars=None, approx=True, u_trunc=0.0):
     """Run HRUA queries and compose the ratio-of-uniforms rejection bound.
 
     x_abs_tol_vars matters here the same way it does for binomial: W's
     declared range (hrua_z_range) grows with N/K/n, so a flat x_abs_tol
     forces ever more splitting on it as the population scales up -- pass
     e.g. "W=<N-scale>" to keep W's own width from being the bottleneck.
+
+    u_trunc plays the same role as binomial/poisson's --u-trunc: a floor on
+    X (the ratio-of-uniforms proposal variable, playing the same role
+    there as u/us does in BTRS/PTRS) below which the domain is clipped
+    rather than analyzed, charged directly to TV as a flat amount --
+    same tradeoff as --v-trunc/--u-trunc elsewhere (see add_common_args in
+    dist_common.py), not the tighter quadratic tail-probability estimate
+    (hrua_xtail's docstring) that used to be computed and charged here.
     """
     c = _hrua_constants(N, K, n)
     xtail_star, _, _ = hrua_xtail(N, K, n)
-    xtail = max(1e-4, xtail_star)
-    x_tail = c["d11"] * xtail ** 2 / (2.0 * c["d8"])
+    xtail = max(u_trunc, xtail_star)
 
     w_input  = inputs_dir  / f"hypergeometric_hrua_w_{fp}_{tag}.txt"
     w_output = outputs_dir / f"hypergeometric_hrua_w_{fp}_{tag}.out"
@@ -384,18 +368,21 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
         print(f"--- FPTaylor HRUA accept (N={N} K={K} n={n}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor HRUA accept failed for N={N} K={K} n={n}; see {accept_output}")
-    # the accept query only covers Z inside the loggam domain; the rest of the
-    # output mass is charged as z_tail
-    z_tail = hrua_z_tail_prob(N, K, n)
     eps_accept = extract_abs_errors_by_problem(output)["eps_accept"]
     if verbose >= 1:
         z_lo, z_hi = hrua_z_range(N, K, n)
         vprint(verbose, f"hypergeometric HRUA N={N} K={K} n={n}",
-               xtail=xtail, x_tail=x_tail, z_lo=z_lo, z_hi=z_hi,
-               z_tail=z_tail)
+               xtail=xtail, u_trunc=u_trunc, z_lo=z_lo, z_hi=z_hi)
 
     reject_const = 2.0 * c["d8"] * hrua_modal_pmf(N, K, n)
-    tv = x_tail + z_tail + 2.0 * reject_const * eps_w + acceptance_tv(eps_accept)
+    # Charge the *actual* cutoff (xtail = max(u_trunc, xtail_star)), not the
+    # raw u_trunc parameter -- when u_trunc doesn't bind (xtail_star is
+    # already above it), the real excluded region is xtail_star-wide, and
+    # charging only u_trunc would undercharge TV for the mass actually left
+    # out of analysis. xtail (linear) is still a safe, looser-than-tight
+    # upper bound on the true quadratic tail probability (see hrua_xtail's
+    # docstring) for the xtail this small, so this stays conservative.
+    tv = u_trunc + 2.0 * reject_const * eps_w + acceptance_tv(eps_accept)
     return eps_w, eps_accept, tv
 
 
@@ -520,6 +507,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                     env, args.verbose, ratio_tol=args.bb_geometric_ratio_tol,
                     bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
                     x_abs_tol_vars=x_abs_tol_vars, approx=args.approx,
+                    u_trunc=args.u_trunc,
                 )
                 rows.append({
                     "N": N, "K": K, "n": n, "regime": "hrua",

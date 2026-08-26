@@ -53,6 +53,11 @@ accept_opt_x_abs_tol_vars = "u=0.1"
 approx = true
 bb_eval = true
 opt_x_abs_tol = 0.01
+# u_trunc: floor on X (the ratio-of-uniforms proposal variable) below which
+# the domain is clipped rather than analyzed, charged flatly to TV -- same
+# role as binomial/poisson's u_trunc. Was a hardcoded 1e-4 in
+# dist_hypergeometric._run_hrua_fptaylor before becoming a real setting.
+u_trunc = 1e-8
 # opt_x_abs_tol_vars (W's tolerance) is intentionally NOT set here: W's
 # range scales with N, so a fixed constant would be a no-op for small N and
 # far too tight for extreme N. dist_hypergeometric.run() auto-derives
