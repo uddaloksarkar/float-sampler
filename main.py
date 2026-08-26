@@ -29,12 +29,14 @@ To add a new distribution:
 import argparse
 import csv
 import sys
+import time
 from pathlib import Path
 
 from dist_common import (
     add_common_args,
     find_fptaylor, fptaylor_env,
     find_cire,
+    elapsed_since, format_seconds,
 )
 
 import dist_binomial
@@ -55,6 +57,7 @@ DISTRIBUTIONS = {
 
 
 def main():
+    total_start = time.perf_counter()
     parser = argparse.ArgumentParser(
         description="FP-error analysis for discrete-distribution samplers.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -119,6 +122,8 @@ def main():
                                plot_pgf=args.plot_pgf)
         if wrote is not False:      # False = the module had nothing to plot
             print(f"Wrote plot: {plot_path}")
+
+    print(f"Total elapsed: {format_seconds(elapsed_since(total_start))}")
 
 
 if __name__ == "__main__":

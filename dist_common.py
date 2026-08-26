@@ -2,6 +2,7 @@
 Shared utilities for FP-error analysis scripts.
 All distribution modules import from here.
 """
+import argparse
 import contextlib
 import math
 import os
@@ -9,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
@@ -144,6 +146,39 @@ def vprint(verbose, label, **values):
         for k, v in values.items()
     )
     print(f"[{label}] {body}")
+
+
+def elapsed_since(start):
+    return time.perf_counter() - start
+
+
+def format_seconds(seconds):
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {secs:.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {secs:.0f}s"
+
+
+def hormann_proposal_deviation(delta_g, a, b):
+    denom = 4.0 * a + b
+    if denom <= 0.0:
+        raise ValueError(f"Hormann proposal density bound needs 4*a+b > 0, got {denom}")
+    return 2.0 * delta_g * (1.0 + 3.0 / denom)
+
+
+def rou_proposal_deviation(delta_g, d8):
+    if d8 <= 0.0:
+        raise ValueError(f"RoU proposal bound needs d8 > 0, got {d8}")
+    return 2.0 * delta_g * (1.0 + 1.0 / (2.0 * d8))
+
+
+def acceptance_tv(delta_a):
+    if delta_a < 0.0:
+        raise ValueError(f"acceptance error must be non-negative, got {delta_a}")
+    return 2.0 * math.expm1(delta_a)
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +405,22 @@ def add_common_args(parser):
                              "race, but bb-eval ignores --bb-split / "
                              "--bb-geometric-ratio-tol entirely -- pair with "
                              "--opt-x-abs-tol to control precision instead.")
+    parser.add_argument("--approx", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Bound each per-operation error term "
+                             "separately then sum (--opt-approx true "
+                             "--opt-exact false), instead of FPTaylor's own "
+                             "default of summing every term's expression "
+                             "symbolically first and solving one much "
+                             "harder joint optimization over the combined "
+                             "expression (--opt-exact true). The joint form "
+                             "can in principle find a tighter bound, but "
+                             "has been observed to run 10+ minutes with no "
+                             "progress on a query --approx solves in under "
+                             "a second; both use the same rigorous "
+                             "interval-arithmetic optimizer underneath, so "
+                             "this is a tightness/speed tradeoff, not a "
+                             "soundness one (default: --approx, i.e. true).")
     parser.add_argument("--opt-x-abs-tol", type=float, default=None,
                         help="FPTaylor's --opt-x-abs-tol: domain-size "
                              "termination tolerance for the optimizer, "
@@ -418,8 +469,8 @@ def add_common_args(parser):
 
 # ---------------------------------------------------------------------------
 # Shared FPTaylor helpers for Hormann-style transformed-rejection samplers
-# (BTRS for binomial, PTRS for Poisson): inline lgamma (Stirling, x>=7),
-# and standalone cached queries for -log(v) and -2*log(us).
+# (BTRS for binomial, PTRS for Poisson): native FPTaylor lgamma/log and
+# standalone cached queries for -log(v) and -2*log(us).
 # ---------------------------------------------------------------------------
 
 def us_root(a, b, gamma):
@@ -489,7 +540,9 @@ def hormann_k_defs(sign, setup_lines, c_expr):
         f"  k1_    = k_ + 1.0,",
     ]
 
-# Coefficients from random_loggam (numpy distributions.c)
+# Legacy coefficients used only by the interval_error helper below. The
+# FPTaylor templates for the current rejection-sampler analysis use native
+# FPTaylor lgamma/log through loggam_defs().
 LOGGAM_A = [
      8.333333333333333e-02, -2.777777777777778e-03,
      7.936507936507937e-04, -5.952380952380952e-04,
@@ -502,13 +555,9 @@ LOGGAM_LG2PI = 1.8378770664093453e+00
 
 def loggam_defs(x_expr, prefix, rnd):
     """
-    Return FPTaylor Definitions lines computing lgamma(x_expr): FPTaylor's
-    native lgamma(x) operator is a rigorous enclosure of the true value for
-    every x > 0 (FPTaylor/func.ml:lgamma_I), so this is used directly in
-    place of the samplers' own random_loggam (random_poisson_ptrs.c,
-    hypergeometric_hrua.c), whose x < 7 branch runs a different
-    (argument-reduction) computation this no longer models -- see git
-    history if that distinction needs to be reinstated.
+    Return FPTaylor Definitions lines computing lgamma(x_expr). The analysis
+    intentionally uses FPTaylor's native lgamma/log operators for the
+    acceptance kernels.
 
     prefix must be unique per call-site.  The last entry is the result name.
     """
@@ -541,7 +590,7 @@ ULP_LEDGER = {
 def transcendental_error_bound(op, x, fp, backend="ieee"):
     """
     Upper bound on the absolute error of one call to a non-elementary math
-    function (log, exp, lgamma/random_loggam, ...) at argument x, standing in
+    function (log, exp, lgamma, ...) at argument x, standing in
     for whatever the actual backend library (CoreMath's correctly-rounded
     implementations, crlibm, RLIBM, the platform's standard libm, ...)
     guarantees for that op.  `backend` selects the row of ULP_LEDGER (see
@@ -564,7 +613,7 @@ def transcendental_error_bound(op, x, fp, backend="ieee"):
 
 
 def loggam_error_bound(x, fp, backend="ieee"):
-    """random_loggam's case of transcendental_error_bound; see there."""
+    """Legacy lgamma case of transcendental_error_bound; see there."""
     return transcendental_error_bound("lgamma", x, fp, backend=backend)
 
 
@@ -586,9 +635,7 @@ _LGAMMA_ARGMIN = 1.4616321449683623  # where lgamma is smallest on (0, inf)
 def lgamma_ie(x_lo, x_hi):
     """
     Enclosure (lo, hi) of the exact math.lgamma(x) for x in [x_lo, x_hi],
-    x_lo >= 1: what an uncertain FPTaylor Variable for random_loggam's true
-    value needs as its declared range (paired with loggam_error_bound as its
-    +/- uncertainty).  lgamma is convex on (0, inf) with a single minimum at
+    x_lo >= 1. lgamma is convex on (0, inf) with a single minimum at
     _LGAMMA_ARGMIN, so it is monotone on each side of that point: the
     enclosure is the two endpoint values, plus the minimum itself if it
     falls inside [x_lo, x_hi].
@@ -602,9 +649,8 @@ def lgamma_ie(x_lo, x_hi):
 
 def loggam_ie(x, shift=0):
     """
-    random_loggam(x) in (enclosure, error) interval arithmetic -- the same
-    straight-line code loggam_defs emits for FPTaylor, evaluated instead by
-    interval_error so it can be bounded on boxes FPTaylor cannot handle.
+    Legacy random_loggam(x) in (enclosure, error) interval arithmetic. The
+    active FPTaylor rejection-sampler templates use native lgamma/log instead.
 
     `shift` reproduces random_loggam's argument reduction n = (int64_t)(7 - x)
     [random_poisson_ptrs.c:44]: shift == 0 is the Stirling branch, and
@@ -670,7 +716,7 @@ def accept_x_abs_tol_vars(args):
 
 
 def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
-                 x_abs_tol=None, x_abs_tol_vars=None):
+                 x_abs_tol=None, x_abs_tol_vars=None, approx=True):
     """
     argv for one FPTaylor query, with its own temporary and log directories.
 
@@ -721,11 +767,29 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
 
     Each query still gets its own temporary and log directory, so nothing in
     FPTaylor's scratch space is shared between runs.
+
+    approx selects which of FPTaylor's two ways to turn the per-operation
+    error terms into one final bound is used: approx=True (the default)
+    passes --opt-approx true --opt-exact false, bounding each term
+    separately then summing -- cheap per term, since each is a much
+    simpler optimization than the alternative.  approx=False instead
+    passes --opt-approx false --opt-exact true (FPTaylor's own upstream
+    default): it sums every term's expression *symbolically first* into
+    one combined expression and solves a single, much harder joint
+    optimization over that -- "harder... but may yield a better result"
+    (FPTaylor/default.cfg's own words), and in practice can run far longer
+    with no visible progress (observed directly: 10+ minutes with zero
+    output on a query approx solved in under a second). Both call the same
+    rigorous interval-arithmetic optimizer underneath (compute_bound's
+    Opt.find_max_abs vs Opt.find_max), so this is a tightness/speed choice,
+    not a soundness one.
     """
     argv = [fptaylor, "--opt", "bb-eval"] if bb_eval else [
         fptaylor, "--opt", "bb",
         "--bb-split", "midpoint",
         "--bb-geometric-ratio-tol", f"{ratio_tol:.17g}"]
+    argv += ["--opt-approx", "true" if approx else "false",
+             "--opt-exact", "false" if approx else "true"]
     if x_abs_tol is not None:
         argv += ["--opt-x-abs-tol", f"{x_abs_tol:.17g}"]
     if x_abs_tol_vars:
@@ -806,7 +870,8 @@ _LOGV_EPS_CACHE = {}
 
 
 def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
-             ratio_tol=2.0, bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None):
+             ratio_tol=2.0, bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
+             approx=True):
     """
     Absolute error of -log(v) over v in [vtail, 1]; same for every distribution
     parameter, so cache it.  Returns (error, n_boxes).
@@ -814,9 +879,9 @@ def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     One query over the whole range: the 1/v conditioning near vtail is left to
     FPTaylor's own branch-and-bound splitting (--opt bb --bb-split midpoint,
     see fptaylor_cmd) instead of being pre-shelled by binade in Python.
-    bb_eval/x_abs_tol/x_abs_tol_vars are forwarded to fptaylor_cmd unchanged.
+    bb_eval/x_abs_tol/x_abs_tol_vars/approx are forwarded to fptaylor_cmd unchanged.
     """
-    key = (fp, vtail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars)
+    key = (fp, vtail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
     if key in _LOGV_EPS_CACHE:
         return _LOGV_EPS_CACHE[key]
 
@@ -829,7 +894,7 @@ def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     try:
         code, output = run_command(
             fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars),
+                        x_abs_tol, x_abs_tol_vars, approx),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -882,16 +947,17 @@ _LOGUS_EPS_CACHE = {}
 
 
 def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
-              ratio_tol=2.0, bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None):
+              ratio_tol=2.0, bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
+              approx=True):
     """
     Absolute error of -2*log(us_) over us_ in [utail, 0.5]; same for every
     distribution parameter, so cache it.  Returns (error, n_boxes).
 
     One query over the whole range: the 1/us conditioning near utail is left
     to FPTaylor's own branch-and-bound splitting (see eps_logv, fptaylor_cmd).
-    bb_eval/x_abs_tol/x_abs_tol_vars are forwarded to fptaylor_cmd unchanged.
+    bb_eval/x_abs_tol/x_abs_tol_vars/approx are forwarded to fptaylor_cmd unchanged.
     """
-    key = (fp, utail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars)
+    key = (fp, utail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
     if key in _LOGUS_EPS_CACHE:
         return _LOGUS_EPS_CACHE[key]
 
@@ -904,7 +970,7 @@ def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
     try:
         code, output = run_command(
             fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars),
+                        x_abs_tol, x_abs_tol_vars, approx),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)

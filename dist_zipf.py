@@ -111,7 +111,7 @@ def _run_query(fptaylor, text, stem, expr, args, inputs_dir, outputs_dir, env,
     try:
         code, output = run_command(
             fptaylor_cmd(fptaylor, input_path, work, args.bb_geometric_ratio_tol,
-                        args.bb_eval, args.opt_x_abs_tol, x_abs_tol_vars),
+                        args.bb_eval, args.opt_x_abs_tol, x_abs_tol_vars, args.approx),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)

@@ -11,16 +11,20 @@ Two regimes, matching numpy's dispatch:
 import math
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot, loggam_defs, vprint, fptaylor_cmd,
+    rou_proposal_deviation, acceptance_tv,
+    elapsed_since, format_seconds,
 )
 
 NAME = "hypergeometric"
-CSV_FIELDS = ["N", "K", "n", "regime", "delta", "eps_w", "eps_accept", "tv"]
+CSV_FIELDS = ["N", "K", "n", "regime", "delta", "eps_w", "eps_accept", "tv",
+              "time_s"]
 
 _HRUA_SWITCH = 10      # see _use_hrua()
 
@@ -102,6 +106,22 @@ def _hrua_constants(N, K, n):
                 m=m, d6=d6, d7=d7, d8=d8, d10=d10, d11=d11)
 
 
+def _log_choose(n, k):
+    if k < 0 or k > n:
+        return -math.inf
+    return math.lgamma(n + 1.0) - math.lgamma(k + 1.0) - math.lgamma(n - k + 1.0)
+
+
+def hrua_modal_pmf(N, K, n):
+    c = _hrua_constants(N, K, n)
+    z = int(math.floor((c["m"] + 1) * (c["mingoodbad"] + 1)
+                       / (c["popsize"] + 2)))
+    log_p = (_log_choose(c["mingoodbad"], z)
+             + _log_choose(c["maxgoodbad"], c["m"] - z)
+             - _log_choose(c["popsize"], c["m"]))
+    return math.exp(log_p)
+
+
 def hrua_xtail(N, K, n, ulps=8.0):
     """
     The X cutoff that minimizes the total eps_w error budget.
@@ -166,9 +186,8 @@ def hrua_setup_defs(N, K, n, rnd, exact=False, prefix=""):
 def hrua_z_range(N, K, n):
     """
     Z = floor(W) lives in [0, d11 - 1]; narrow it to keep every inlined
-    loggam argument > 0 (FPTaylor's native lgamma is rigorous there; see
-    make_hrua_accept_template).  Z = W - f only guarantees Z > W_lo - 1, so
-    the template's W window starts one above z_lo.
+    lgamma argument > 0. Z = W - f only guarantees Z > W_lo - 1, so the
+    template's W window starts one above z_lo.
     """
     c = _hrua_constants(N, K, n)
     mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
@@ -238,11 +257,8 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
                                              [hypergeometric_hrua.c line 117]
 
     Each loggam(x) is FPTaylor's native lgamma(x) directly (loggam_defs,
-    dist_common.py), rigorous for every x > 0 -- not
-    hypergeometric_hrua.c's own random_loggam, whose x < 7 branch runs a
-    different (shift-then-subtract) computation this no longer models. Z
-    is restricted (hrua_z_range) to the range where all four loggam
-    arguments stay > 0.
+    dist_common.py). Z is restricted (hrua_z_range) to the range where all
+    four lgamma arguments stay > 0.
     """
     c   = _hrua_constants(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]
@@ -257,11 +273,8 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     # W rather than Y is the second variable, and Z = W - f (see hrua_z_defs);
     # W in [z_lo + 1, z_hi] is what keeps Z inside the loggam domain.
     d9 = int(math.floor((m + 1) * (mgb + 1) / (c["popsize"] + 2)))
-    # d10's four loggam calls are each independently rounded in FPTaylor
-    # (loggam_defs), not precomputed in Python: matching random_loggam's own
-    # four calls [hypergeometric_hrua.c:91-92] rather than silently assuming
-    # each is exact and charging only the final addition (see dist_binomial.
-    # _point_hm_defs for the same fix on the BTRS analog, h_).
+    # d10's four lgamma calls are represented as native FPTaylor calls rather
+    # than precomputed Python literals, so each call's rounding is charged.
     defs_d9,  name_d9  = loggam_defs(f"{float(d9) + 1.0:.1f}", "d10a", rnd)
     defs_mgb, name_mgb = loggam_defs(f"{float(mgb - d9) + 1.0:.1f}", "d10b", rnd)
     defs_m,   name_m   = loggam_defs(f"{float(m - d9) + 1.0:.1f}", "d10c", rnd)
@@ -313,7 +326,8 @@ def hrua_z_tail_prob(N, K, n):
 
 
 def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
-                        bb_eval=False, x_abs_tol=None):
+                        bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
+                        approx=True):
     """Run one FPTaylor query and return output.
 
     HRUA queries run one per call site, not concurrently, so the compile race
@@ -323,36 +337,48 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
     work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
     try:
         return run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
+                        x_abs_tol, x_abs_tol_vars, approx),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
-                       verbose, ratio_tol=2.0, bb_eval=False, x_abs_tol=None):
-    """Run both HRUA FPTaylor queries and return (eps_w, eps_accept, tv)."""
-    xtail = 1e-4
+                       verbose, ratio_tol=2.0, bb_eval=False, x_abs_tol=None,
+                       x_abs_tol_vars=None, approx=True):
+    """Run HRUA queries and compose the ratio-of-uniforms rejection bound.
+
+    x_abs_tol_vars matters here the same way it does for binomial: W's
+    declared range (hrua_z_range) grows with N/K/n, so a flat x_abs_tol
+    forces ever more splitting on it as the population scales up -- pass
+    e.g. "W=<N-scale>" to keep W's own width from being the bottleneck.
+    """
+    c = _hrua_constants(N, K, n)
+    xtail_star, _, _ = hrua_xtail(N, K, n)
+    xtail = max(1e-4, xtail_star)
+    x_tail = c["d11"] * xtail ** 2 / (2.0 * c["d8"])
 
     w_input  = inputs_dir  / f"hypergeometric_hrua_w_{fp}_{tag}.txt"
     w_output = outputs_dir / f"hypergeometric_hrua_w_{fp}_{tag}.out"
     w_input.write_text(make_hrua_w_template(N, K, n, fp, xtail))
 
     code, output = _run_fptaylor_query(fptaylor, w_input, outputs_dir, env,
-                                       ratio_tol, bb_eval, x_abs_tol)
+                                       ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
     w_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor HRUA W (N={N} K={K} n={n}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor HRUA W failed for N={N} K={K} n={n}; see {w_output}")
-    eps_w = extract_abs_errors_by_problem(output)["eps_w"]
+    w_raw = extract_abs_errors_by_problem(output)["eps_w"]
+    eps_w = rou_proposal_deviation(w_raw, c["d8"])
 
     accept_input  = inputs_dir  / f"hypergeometric_hrua_accept_{fp}_{tag}.txt"
     accept_output = outputs_dir / f"hypergeometric_hrua_accept_{fp}_{tag}.out"
     accept_input.write_text(make_hrua_accept_template(N, K, n, fp, xtail))
 
     code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir, env,
-                                       ratio_tol, bb_eval, x_abs_tol)
+                                       ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
     accept_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor HRUA accept (N={N} K={K} n={n}) ---\n{output}")
@@ -361,13 +387,15 @@ def _run_hrua_fptaylor(fptaylor, N, K, n, fp, tag, inputs_dir, outputs_dir, env,
     # the accept query only covers Z inside the loggam domain; the rest of the
     # output mass is charged as z_tail
     z_tail = hrua_z_tail_prob(N, K, n)
-    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"] + z_tail
+    eps_accept = extract_abs_errors_by_problem(output)["eps_accept"]
     if verbose >= 1:
         z_lo, z_hi = hrua_z_range(N, K, n)
         vprint(verbose, f"hypergeometric HRUA N={N} K={K} n={n}",
-               xtail=xtail, z_lo=z_lo, z_hi=z_hi, z_tail=z_tail)
+               xtail=xtail, x_tail=x_tail, z_lo=z_lo, z_hi=z_hi,
+               z_tail=z_tail)
 
-    tv = 2 * (eps_w + 1.5 * eps_accept)
+    reject_const = 2.0 * c["d8"] * hrua_modal_pmf(N, K, n)
+    tv = x_tail + z_tail + 2.0 * reject_const * eps_w + acceptance_tv(eps_accept)
     return eps_w, eps_accept, tv
 
 
@@ -456,6 +484,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
     rows = []
     for N, K, n in triples:
+        start = time.perf_counter()
         sample = n
         d2 = min(K, N - K)
 
@@ -465,9 +494,12 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
             rows.append({
                 "N": N, "K": K, "n": n, "regime": "degenerate",
                 "delta": f"{delta:.17e}",
+                "eps_w": "nan", "eps_accept": "nan",
                 "tv":    f"{tv:.17e}",
+                "time_s": f"{elapsed_since(start):.6f}",
             })
-            print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}")
+            print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}"
+                  f" time={format_seconds(elapsed_since(start))}")
             continue
 
         try:
@@ -479,6 +511,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                     fptaylor, N, K, n, args.fp, tag, inputs_dir, outputs_dir,
                     env, args.verbose, ratio_tol=args.bb_geometric_ratio_tol,
                     bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
+                    x_abs_tol_vars=args.opt_x_abs_tol_vars, approx=args.approx,
                 )
                 rows.append({
                     "N": N, "K": K, "n": n, "regime": "hrua",
@@ -486,9 +519,11 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                     "eps_w":      f"{eps_w:.17e}",
                     "eps_accept": f"{eps_accept:.17e}",
                     "tv":         f"{tv:.17e}",
+                    "time_s":     f"{elapsed_since(start):.6f}",
                 })
                 print(f"N={N} K={K} n={n} [HRUA] eps_w={eps_w:.6e}"
-                      f" eps_accept={eps_accept:.6e} TV={tv:.6e}")
+                      f" eps_accept={eps_accept:.6e} TV={tv:.6e}"
+                      f" time={format_seconds(float(rows[-1]['time_s']))}")
                 continue
 
             # ---- HYP regime ----
@@ -519,8 +554,10 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 "delta": f"{delta:.17e}",
                 "eps_w": "nan", "eps_accept": "nan",
                 "tv":    f"{tv:.17e}",
+                "time_s": f"{elapsed_since(start):.6f}",
             })
-            print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}")
+            print(f"N={N} K={K} n={n} delta={delta:.6e} TV={tv:.6e}"
+                  f" time={format_seconds(float(rows[-1]['time_s']))}")
         except Exception as exc:
             print(f"WARNING: skipping N={N} K={K} n={n}: {exc}")
 

@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -17,14 +18,27 @@ from dist_common import (
     us_root, hormann_u_at, hormann_k_defs,
     point_ivar,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
+    hormann_proposal_deviation, acceptance_tv,
+    elapsed_since, format_seconds,
 )
 
 NAME = "binomial"
 CSV_FIELDS = ["n", "p", "n_lo", "n_hi", "p_lo", "p_hi", "regime",
               "eps0", "eps1", "eps2", "eps_floor", "eps_accept", "tv",
-              "n_boxes"]
+              "n_boxes", "time_s"]
 
 _BTRS_SWITCH = 30.0   # n*p threshold: inversion below, BTRS above
+
+
+def sampler_p(p):
+    return 1.0 - p if p > 0.5 else p
+
+
+def sampler_p_interval(p_lo, p_hi):
+    vals = [sampler_p(p_lo), sampler_p(p_hi)]
+    if p_lo <= 0.5 <= p_hi:
+        vals.append(0.5)
+    return min(vals), max(vals)
 
 
 def inversion_params(n, p):
@@ -256,10 +270,7 @@ def make_btrs_accept_k_template(n, p, fp, u_lo, u_hi, k, fast=False):
 
 
 def loggam_int_defs(x, prefix, rnd):
-    """random_loggam(x) for an exact integer x >= 1: FPTaylor's own lgamma
-    is rigorous for every x > 0 (FPTaylor/func.ml:lgamma_I), unlike
-    random_loggam's own restriction to x >= 7, so call it directly at x.
-    Returns (lines, result_name) like loggam_defs."""
+    """Native FPTaylor lgamma for an exact integer x >= 1."""
     return loggam_defs(f"{x:.1f}", prefix, rnd)
 
 
@@ -467,7 +478,7 @@ def safe_box_name(n_lo, n_hi, p_lo, p_hi):
 
 def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
                   verbose, jobs, ratio_tol, bb_eval=False, x_abs_tol=None,
-                  x_abs_tol_vars=None):
+                  x_abs_tol_vars=None, approx=True):
     """Run one FPTaylor query per (label, stem, template_text) box; return
     (max_error, n_boxes).  bb_eval=False compiles under a fixed filename
     regardless of --tmp-base-dir, so concurrent queries race -- jobs is
@@ -482,7 +493,7 @@ def _fptaylor_max(fptaylor, boxes, expr, inputs_dir, outputs_dir, env,
         try:
             code, output = run_command(
                 fptaylor_cmd(fptaylor, in_path, work, ratio_tol, bb_eval,
-                            x_abs_tol, x_abs_tol_vars),
+                            x_abs_tol, x_abs_tol_vars, approx),
                 cwd=ROOT, env=env)
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -575,16 +586,12 @@ def _btrs_accept_boxes(n, p, fp, tag, consts, fast, u_trunc=0.0):
 
 def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
                u_excess, args, inputs_dir, outputs_dir, env):
-    """(eps_accept, tv, n_extra): fold the per-query maxima into
-    tv = 2*eps_floor*accept_iter + 2*eps_accept + v_trunc + u_excess.
-    v_trunc/u_excess charge the -log(v) and u-domain regions each query
-    declines to certify near their respective singularities (see
-    clip_u_trunc); us_lo/us_hi are the smallest us reached by any query
-    after that clipping, passed to the split-out -2*log(us) query below."""
+    """Fold proposal, acceptance, and explicit seed exclusions into TV."""
     us_min = min(us_lo, us_hi)
     logv, n_extra = eps_logv(fptaylor, fp, args.v_trunc, inputs_dir, outputs_dir,
                              env, args.verbose, args.bb_geometric_ratio_tol,
-                             args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
+                             args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args),
+                             args.approx)
     eps_accept = accept_raw + logv
     if args.fast:
         # the -2*log(us) query only sees us, so the smallest reachable us (a
@@ -592,10 +599,13 @@ def combine_tv(fptaylor, fp, eps_floor, accept_raw, accept_iter, us_lo, us_hi,
         logus, n_logus = eps_logus(fptaylor, fp, us_min, inputs_dir,
                                    outputs_dir, env, args.verbose,
                                    args.bb_geometric_ratio_tol,
-                                   args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
+                                   args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args),
+                                   args.approx)
         eps_accept += logus
         n_extra += n_logus
-    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + u_excess + args.v_trunc
+    tv = (2.0 * eps_floor * accept_iter
+          + acceptance_tv(eps_accept)
+          + u_excess + args.v_trunc)
     return eps_accept, tv, n_extra
 
 
@@ -606,11 +616,11 @@ def _run_floor_accept(fptaylor, floor_boxes, accept_boxes, args,
     floor_raw, n_floor = _fptaylor_max(
         fptaylor, floor_boxes, "eps_floor", inputs_dir, outputs_dir, env,
         args.verbose, args.jobs, args.bb_geometric_ratio_tol,
-        args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args))
+        args.bb_eval, args.opt_x_abs_tol, floor_x_abs_tol_vars(args), args.approx)
     accept_raw, n_accept = _fptaylor_max(
         fptaylor, accept_boxes, "eps_accept", inputs_dir, outputs_dir, env,
         args.verbose, args.jobs, args.bb_geometric_ratio_tol,
-        args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args))
+        args.bb_eval, args.opt_x_abs_tol, accept_x_abs_tol_vars(args), args.approx)
     return floor_raw, accept_raw, n_floor, n_accept
 
 
@@ -645,7 +655,7 @@ def _run_btrs_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env):
 
     floor_raw, accept_raw, n_floor, n_accept = _run_floor_accept(
         fptaylor, floor_boxes, accept_boxes, args, inputs_dir, outputs_dir, env)
-    eps_floor = 5 * floor_raw
+    eps_floor = hormann_proposal_deviation(floor_raw, a, b)
 
     accept_iter = alpha / (math.sqrt(2 * math.pi) * spq)
     eps_accept, tv, n_extra = combine_tv(
@@ -745,7 +755,11 @@ def _run_btrs_box(fptaylor, n_iv, p_iv, args, tag, inputs_dir, outputs_dir, env)
         floor_raw, accept_raw, n_floor, n_accept = _run_floor_accept(
             fptaylor, floor_boxes, accept_boxes, args, inputs_dir, outputs_dir, env)
 
-        eps_floor = max(eps_floor, 5 * floor_raw)
+        _, a_iv, b_iv, _ = btrs_box_consts(sub_n, sub_p)
+        eps_floor = max(
+            eps_floor,
+            hormann_proposal_deviation(floor_raw, a_iv[0], b_iv[0]),
+        )
         eps_accept_raw = max(eps_accept_raw, accept_raw)
         floor_excess = max(floor_excess, sub_floor_excess)
         accept_excess = max(accept_excess, sub_accept_excess)
@@ -874,35 +888,40 @@ def _run_box(args, fptaylor, inputs_dir, outputs_dir, env):
     if args.backend != "fptaylor":
         raise ValueError("interval mode is FPTaylor-only")
 
+    analysis_p_lo, analysis_p_hi = sampler_p_interval(p_lo, p_hi)
     tag = safe_box_name(n_lo, n_hi, p_lo, p_hi)
     row = {"n": "", "p": "",
            "n_lo": f"{n_lo:.17g}", "n_hi": f"{n_hi:.17g}",
            "p_lo": f"{p_lo:.17g}", "p_hi": f"{p_hi:.17g}"}
+    start = time.perf_counter()
 
     if args.split_depth < 0:
         raise ValueError("--split-depth must be >= 0")
 
-    if n_lo * p_lo >= _BTRS_SWITCH:
+    if n_lo * analysis_p_lo >= _BTRS_SWITCH:
         eps_floor, eps_accept, tv, n_boxes = _run_btrs_box(
-            fptaylor, (n_lo, n_hi), (p_lo, p_hi), args, tag,
+            fptaylor, (n_lo, n_hi), (analysis_p_lo, analysis_p_hi), args, tag,
             inputs_dir, outputs_dir, env,
         )
         row.update(_btrs_fields(eps_floor, eps_accept, tv, n_boxes, "btrs-interval"))
+        row["time_s"] = f"{elapsed_since(start):.6f}"
         _print_btrs(_box_label({"n": (n_lo, n_hi), "p": (p_lo, p_hi)}),
                    n_boxes, eps_floor, eps_accept, tv)
         return [row]
 
-    if n_hi * p_hi >= _BTRS_SWITCH:
+    if n_hi * analysis_p_hi >= _BTRS_SWITCH:
         raise ValueError(
             f"box straddles the n*p = {_BTRS_SWITCH:.0f} switch "
-            f"(n*p spans [{n_lo * p_lo:.6g}, {n_hi * p_hi:.6g}]): the sampler "
+            f"(n*min(p,1-p) spans "
+            f"[{n_lo * analysis_p_lo:.6g}, {n_hi * analysis_p_hi:.6g}]): the sampler "
             "uses inversion below it and BTRS above, so split the box there")
 
-    box = inversion_box_params(n_lo, n_hi, p_lo, p_hi)
+    box = inversion_box_params(n_lo, n_hi, analysis_p_lo, analysis_p_hi)
     eps0, eps1, eps2, tv = _run_inversion_box(
         fptaylor, box, args, tag, inputs_dir, outputs_dir, env,
     )
     row.update(_inversion_fields(eps0, eps1, eps2, tv, 1, "inversion-interval"))
+    row["time_s"] = f"{elapsed_since(start):.6f}"
     _print_inversion(_box_label(box), eps0, eps1, eps2, tv)
     return [row]
 
@@ -928,26 +947,32 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
     rows = []
     for n, p in pairs:
+        start = time.perf_counter()
+        analysis_p = sampler_p(p)
         tag = safe_pair_name(n, p)
         try:
             base_row = {"n": n, "p": f"{p:.17g}"}
             label = f"n={n} p={p}"
-            if n * p >= _BTRS_SWITCH:
+            if analysis_p != p:
+                label += f" (sampler uses p={analysis_p:.17g})"
+            if n * analysis_p >= _BTRS_SWITCH:
                 eps_floor, eps_accept, tv, n_boxes = _run_btrs_fptaylor(
-                    fptaylor, n, p, args, tag, inputs_dir, outputs_dir, env,
+                    fptaylor, n, analysis_p, args, tag, inputs_dir, outputs_dir, env,
                 )
                 base_row.update(_btrs_fields(eps_floor, eps_accept, tv, n_boxes, "btrs"))
+                base_row["time_s"] = f"{elapsed_since(start):.6f}"
                 rows.append(base_row)
                 _print_btrs(label, n_boxes, eps_floor, eps_accept, tv)
             else:
-                qn, z_lo, x_hi = inversion_params(n, p)
-                bound = n * p + 10.0 * math.sqrt(n * p * (1.0 - p))
+                qn, z_lo, x_hi = inversion_params(n, analysis_p)
+                bound = n * analysis_p + 10.0 * math.sqrt(n * analysis_p * (1.0 - analysis_p))
                 vprint(args.verbose, f"binomial inversion n={n} p={p}",
                        qn=qn, z_lo=z_lo, x_hi=x_hi, bound=bound)
                 eps0, eps1, eps2, tv = _run_inversion_fptaylor(
-                    fptaylor, make_template(n, p, args.fp), label, tag, args,
-                    inputs_dir, outputs_dir, env, p, bound)
+                    fptaylor, make_template(n, analysis_p, args.fp), label, tag, args,
+                    inputs_dir, outputs_dir, env, analysis_p, bound)
                 base_row.update(_inversion_fields(eps0, eps1, eps2, tv, 1, "inversion"))
+                base_row["time_s"] = f"{elapsed_since(start):.6f}"
                 rows.append(base_row)
                 _print_inversion(label, eps0, eps1, eps2, tv)
         except Exception as exc:

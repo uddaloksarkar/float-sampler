@@ -8,6 +8,7 @@ dist_binomial.py (eps_floor / eps_accept split, shared -log(v) and
 import math
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from analyticError import FP_BETA, SWITCH, computeDeltaHighRange, computeDeltaLowRange
@@ -17,10 +18,13 @@ from dist_common import (
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus, fptaylor_cmd,
     hormann_u_at, hormann_k_defs, point_ivar,
+    hormann_proposal_deviation, acceptance_tv,
+    elapsed_since, format_seconds,
 )
 
 NAME = "poisson"
-CSV_FIELDS = ["lambda", "fp", "regime", "eps_floor", "eps_accept", "tv", "ref_tv"]
+CSV_FIELDS = ["lambda", "fp", "regime", "eps_floor", "eps_accept", "tv",
+              "ref_tv", "time_s"]
 
 
 # ---------------------------------------------------------------------------
@@ -63,12 +67,6 @@ def ptrs_k_defs(sign, lam_expr):
         "cx_")
 
 
-# loggam(k1_) is computed via FPTaylor's native lgamma(x), rigorous for
-# every x > 0 (see make_ptrs_accept_template) -- not random_poisson_ptrs.c's
-# random_loggam, whose own x < 7 branch runs a different (shift-then-
-# subtract) computation this analysis no longer models; see git history if
-# that distinction needs to be reinstated.
-#
 # k1_ = k_ + 1 = (y_ - f) + 1, f in [0, 1], and (unlike the BTRS/PTRS accept
 # shell's k-range, which has no extra y-window padding of its own here) y_
 # sits exactly at k_lo at the window's low corner, so k1_'s enclosure dips
@@ -174,9 +172,7 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     with us = 0.5 - |u|   [random_poisson_ptrs.c lines 98-99, rearranged so
     that log(v) is alone on the left-hand side].
     loggam(k+1) is FPTaylor's native lgamma(k1_) directly (loggam_defs,
-    dist_common.py), rigorous for every k1_ > 0 -- not
-    random_poisson_ptrs.c's own random_loggam, whose x < 7 branch runs a
-    different (shift-then-subtract) computation this no longer models.
+    dist_common.py).
     log(a/us^2 + b) is rewritten as log(a + b*us^2) - 2*log(us) to avoid
     forming 1/us^2 directly when us is small (see dist_binomial.py).
 
@@ -209,7 +205,7 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
 
 
 def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
-                        bb_eval=False, x_abs_tol=None):
+                        bb_eval=False, x_abs_tol=None, approx=True):
     """Run one FPTaylor query and return output.
 
     PTRS queries run one per call site, not concurrently, so the compile race
@@ -219,7 +215,8 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
     work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
     try:
         return run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval, x_abs_tol),
+            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
+                        x_abs_tol, approx=approx),
             cwd=ROOT, env=env)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -227,8 +224,8 @@ def _run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
 
 def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, verbose,
                        fast=False, v_trunc=2.0 ** -53, ratio_tol=2.0,
-                       bb_eval=False, x_abs_tol=None):
-    """Run FPTaylor for PTRS and return (eps_floor, eps_accept, tv)."""
+                       bb_eval=False, x_abs_tol=None, approx=True):
+    """Run PTRS queries and compose the theorem 2.7 bound."""
     _, a, b, _ = ptrs_consts(lam)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
     utail = 1e-3
@@ -238,7 +235,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     floor_input.write_text(make_ptrs_floor_template(lam, fp, utail))
 
     code, output = _run_fptaylor_query(fptaylor, floor_input, outputs_dir, env,
-                                       ratio_tol, bb_eval, x_abs_tol)
+                                       ratio_tol, bb_eval, x_abs_tol, approx)
     floor_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor PTRS floor (lambda={lam}) ---\n{output}")
@@ -249,7 +246,8 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
     s_eta = t_eta - 0.5
     u_tail_prob = 2.0 * math.exp(-s_eta ** 2 / (2.0 * (lam + s_eta / 3.0)))
 
-    eps_floor = 5 * extract_abs_errors_by_problem(output)["eps_floor"] + u_tail_prob
+    floor_raw = extract_abs_errors_by_problem(output)["eps_floor"]
+    eps_floor = hormann_proposal_deviation(floor_raw, a, b)
 
     # k's definition needs the sign of u, so the accept query runs once per side
     au_lo, au_hi = ptrs_accept_u_range(lam)
@@ -263,7 +261,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
             make_ptrs_accept_template(lam, fp, lo, hi, sign, fast=fast))
 
         code, output = _run_fptaylor_query(fptaylor, accept_input, outputs_dir,
-                                           env, ratio_tol, bb_eval, x_abs_tol)
+                                           env, ratio_tol, bb_eval, x_abs_tol, approx)
         accept_output.write_text(output)
         if verbose >= 2:
             print(f"--- FPTaylor PTRS accept s={sign:+d} (lambda={lam}) ---\n{output}")
@@ -273,18 +271,21 @@ def _run_ptrs_fptaylor(fptaylor, lam, fp, tag, inputs_dir, outputs_dir, env, ver
         accept_raw = max(accept_raw,
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
-    eps_accept = accept_raw + k_tail + eps_logv(
+    logv, _ = eps_logv(
         fptaylor, fp, v_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
-        bb_eval, x_abs_tol,
-    )[0]
+        bb_eval, x_abs_tol, approx=approx,
+    )
+    eps_accept = accept_raw + logv
     if fast:
-        eps_accept += eps_logus(
+        logus, _ = eps_logus(
             fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose, ratio_tol,
-            bb_eval, x_abs_tol,
-        )[0]
+            bb_eval, x_abs_tol, approx=approx,
+        )
+        eps_accept += logus
 
-    accept_iter = invalpha
-    tv = 2 * eps_floor * accept_iter + 2 * eps_accept + v_trunc
+    tv = (u_tail_prob + 2.0 * k_tail + v_trunc
+          + 2.0 * invalpha * eps_floor
+          + acceptance_tv(eps_accept))
     return eps_floor, eps_accept, tv
 
 
@@ -370,7 +371,8 @@ def _compute_log_low_range_delta(lambda_fp_error, log_prod_error):
 
 def _empty_row(lam, fp):
     return {"lambda": lam, "fp": fp, "regime": "",
-            "eps_floor": "", "eps_accept": "", "tv": "", "ref_tv": ""}
+            "eps_floor": "", "eps_accept": "", "tv": "", "ref_tv": "",
+            "time_s": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +407,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
     rows = []
     for lam in lambdas:
+        start = time.perf_counter()
         lam_float = float(lam)
         tag = safe_lambda_name(lam)
         try:
@@ -443,8 +446,10 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 ref_tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
                 row = _empty_row(lam, args.fp)
                 row.update({"regime": "low", "tv": f"{low_tv:.17e}", "ref_tv": f"{ref_tv:.17e}"})
+                row["time_s"] = f"{elapsed_since(start):.6f}"
                 rows.append(row)
-                print(f"lambda={lam} [low] TV={row['tv']} ref_TV={row['ref_tv']}")
+                print(f"lambda={lam} [low] TV={row['tv']} ref_TV={row['ref_tv']}"
+                      f" time={format_seconds(float(row['time_s']))}")
                 continue
 
             # ---- high range (PTRS) ----
@@ -453,6 +458,7 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 env, args.verbose, fast=args.fast, v_trunc=args.v_trunc,
                 ratio_tol=args.bb_geometric_ratio_tol,
                 bb_eval=args.bb_eval, x_abs_tol=args.opt_x_abs_tol,
+                approx=args.approx,
             )
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 
@@ -463,10 +469,12 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 "eps_accept": f"{eps_accept:.17e}",
                 "tv": f"{tv:.17e}",
                 "ref_tv": f"{ref_tv:.17e}",
+                "time_s": f"{elapsed_since(start):.6f}",
             })
             rows.append(row)
             print(f"lambda={lam} [PTRS] eps_floor={eps_floor:.6e}"
-                  f" eps_accept={eps_accept:.6e} TV={tv:.6e} ref_TV={ref_tv:.6e}")
+                  f" eps_accept={eps_accept:.6e} TV={tv:.6e} ref_TV={ref_tv:.6e}"
+                  f" time={format_seconds(float(row['time_s']))}")
         except Exception as exc:
             print(f"WARNING: skipping lambda={lam}: {exc}")
 
