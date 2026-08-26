@@ -63,17 +63,23 @@ def ptrs_k_defs(sign, lam_expr):
         "cx_")
 
 
-# k = floor(y) is modelled as y - f with f in [0, 1], so the window's lower end
-# has to be 7 for k + 1 > 7 (random_loggam's Stirling branch needs x >= 7).
-# 7 is the exact limit of that branch, not a margin -- the previous 8 charged
-# a whole extra k of Poisson mass as k_tail for nothing.
-_K_STIRLING_LO = 7.0
+# loggam(k1_) is computed via FPTaylor's native lgamma(x), rigorous for
+# every x > 0 (see make_ptrs_accept_template) -- not random_poisson_ptrs.c's
+# random_loggam, whose own x < 7 branch runs a different (shift-then-
+# subtract) computation this analysis no longer models; see git history if
+# that distinction needs to be reinstated.
+#
+# k1_ = k_ + 1 = (y_ - f) + 1, f in [0, 1], and (unlike the BTRS/PTRS accept
+# shell's k-range, which has no extra y-window padding of its own here) y_
+# sits exactly at k_lo at the window's low corner, so k1_'s enclosure dips
+# to exactly k_lo at f = 1 -- k_lo >= 1 is what keeps k1_ > 0.
+_K_BOUNDARY_MARGIN = 1.0
 _K_SIGMAS = 10.0
 
 def ptrs_accept_k_range(lam):
-    """k window the accept query covers: Stirling domain, +-10 sigma bulk."""
+    """k window the accept query covers: +-10 sigma bulk, kept >= _K_BOUNDARY_MARGIN."""
     slam = math.sqrt(lam)
-    k_lo = max(_K_STIRLING_LO, math.ceil(lam - _K_SIGMAS * slam))
+    k_lo = max(_K_BOUNDARY_MARGIN, math.ceil(lam - _K_SIGMAS * slam))
     k_hi = math.floor(lam + _K_SIGMAS * slam)
     if k_lo >= k_hi:
         raise ValueError(f"empty accept window k in [{k_lo:.6g}, {k_hi:.6g}] "
@@ -92,8 +98,8 @@ def poisson_cdf_below(lam, k_lo):
     """
     P(K < k_lo) for K ~ Poisson(lam), summed term by term in log space.
 
-    Only called with k_lo pinned to the Stirling domain (_K_STIRLING_LO), so
-    this is a handful of terms whatever lam is.  Nudged up by a few ulp to
+    Only called with k_lo = ptrs_accept_k_range's low end (see
+    _K_BOUNDARY_MARGIN).  Nudged up by a few ulp to
     stay an upper bound on the exact tail despite lgamma/exp rounding: it is
     charged as probability mass, so erring high is the safe direction.
     """
@@ -112,8 +118,9 @@ def ptrs_k_tail_prob(lam):
     """
     P(K outside the accept window): the output mass that query does not cover.
 
-    The lower tail is summed exactly -- k_lo is pinned to the Stirling domain,
-    so it is O(1) terms, and the Chernoff bound is badly loose that close to
+    The lower tail is summed exactly -- for lambda close to SWITCH, k_lo is
+    pinned near _K_BOUNDARY_MARGIN, so it is O(1) terms, and the Chernoff
+    bound is badly loose that close to
     the mode (at lambda=30 it gives 1.1e-5 for a tail that is really 1.2e-6),
     which made it the dominant term of the whole TV bound.
 
@@ -166,8 +173,10 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, sign, fast=False):
     -lambda + k*log(lambda) - loggam(k+1) - log(invalpha) + log(a/us^2 + b),
     with us = 0.5 - |u|   [random_poisson_ptrs.c lines 98-99, rearranged so
     that log(v) is alone on the left-hand side].
-    loggam is random_loggam's x>=7 Stirling branch, computed via FPTaylor's
-    native lgamma(x) operator (loggam_defs, dist_common.py).
+    loggam(k+1) is FPTaylor's native lgamma(k1_) directly (loggam_defs,
+    dist_common.py), rigorous for every k1_ > 0 -- not
+    random_poisson_ptrs.c's own random_loggam, whose x < 7 branch runs a
+    different (shift-then-subtract) computation this no longer models.
     log(a/us^2 + b) is rewritten as log(a + b*us^2) - 2*log(us) to avoid
     forming 1/us^2 directly when us is small (see dist_binomial.py).
 

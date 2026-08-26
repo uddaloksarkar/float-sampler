@@ -166,16 +166,17 @@ def hrua_setup_defs(N, K, n, rnd, exact=False, prefix=""):
 def hrua_z_range(N, K, n):
     """
     Z = floor(W) lives in [0, d11 - 1]; narrow it to keep every inlined
-    loggam argument >= 7.  Z = W - f only guarantees Z > W_lo - 1, so the
-    template's W window starts one above z_lo.
+    loggam argument > 0 (FPTaylor's native lgamma is rigorous there; see
+    make_hrua_accept_template).  Z = W - f only guarantees Z > W_lo - 1, so
+    the template's W window starts one above z_lo.
     """
     c = _hrua_constants(N, K, n)
     mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
-    z_lo = float(max(0, 6, 6 - (Mgb - m)))
-    z_hi = float(min(int(c["d11"]) - 1, mgb - 6, m - 6))
+    z_lo = float(max(0, -(Mgb - m)))
+    z_hi = float(min(int(c["d11"]) - 1, mgb, m))
     if z_lo >= z_hi:
         raise RuntimeError(
-            f"N={N} K={K} n={n}: no Z range with all loggam arguments >= 7 "
+            f"N={N} K={K} n={n}: no Z range with all loggam arguments > 0 "
             f"(z_lo={z_lo}, z_hi={z_hi}); HRUA analysis not applicable")
     return z_lo, z_hi
 
@@ -236,11 +237,12 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
                                    + loggam(m-Z+1) + loggam(maxgoodbad-m+Z+1))
                                              [hypergeometric_hrua.c line 117]
 
-    loggam is random_loggam's x >= 7 Stirling branch, computed via
-    FPTaylor's native lgamma(x) operator (loggam_defs, dist_common.py), so
-    Z is restricted to the range where all four arguments are >= 7 (same
-    restriction as the BTRS/PTRS analyses, matching random_loggam's own
-    branch selection).
+    Each loggam(x) is FPTaylor's native lgamma(x) directly (loggam_defs,
+    dist_common.py), rigorous for every x > 0 -- not
+    hypergeometric_hrua.c's own random_loggam, whose x < 7 branch runs a
+    different (shift-then-subtract) computation this no longer models. Z
+    is restricted (hrua_z_range) to the range where all four loggam
+    arguments stay > 0.
     """
     c   = _hrua_constants(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]

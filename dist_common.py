@@ -89,8 +89,31 @@ def find_gelpia(explicit=None):
 
 
 def fptaylor_env():
+    """
+    env for running FPTaylor, with the active opam switch's bin dir put
+    first on PATH. --opt bb compiles each query with ocamlfind/ocamlopt at
+    runtime (FPTaylor/b_and_b/compile.sh); if PATH doesn't already resolve
+    to the same OCaml that built FPTaylor/fptaylor, the compile silently
+    uses whatever else is on PATH (e.g. a different opam switch, or a
+    Homebrew OCaml), producing a .cmi incompatible with the already-built
+    binary -- surfacing as "is not a compiled interface for this version
+    of OCaml" on every subsequent --opt bb call, not just this one, since
+    the mismatched .cmi is shared build state.
+    """
     env = os.environ.copy()
     env.setdefault("FPTAYLOR_BASE", str(ROOT / "FPTaylor"))
+    opam_bin = shutil.which("opam")
+    if opam_bin:
+        try:
+            bin_dir = subprocess.run(
+                [opam_bin, "var", "bin"], capture_output=True, text=True,
+                timeout=5, check=True).stdout.strip()
+            if bin_dir:
+                path = env.get("PATH", "")
+                if bin_dir not in path.split(os.pathsep):
+                    env["PATH"] = bin_dir + os.pathsep + path
+        except (subprocess.SubprocessError, OSError):
+            pass
     return env
 
 
@@ -477,35 +500,20 @@ LOGGAM_A = [
 LOGGAM_LG2PI = 1.8378770664093453e+00
 
 
-def loggam_defs(x_expr, prefix, rnd, shift=0):
+def loggam_defs(x_expr, prefix, rnd):
     """
-    Return FPTaylor Definitions lines implementing random_loggam(x_expr) with
-    shift == 0, i.e. for x_expr >= 7 (Stirling / asymptotic branch,
-    straight-line).
+    Return FPTaylor Definitions lines computing lgamma(x_expr): FPTaylor's
+    native lgamma(x) operator is a rigorous enclosure of the true value for
+    every x > 0 (FPTaylor/func.ml:lgamma_I), so this is used directly in
+    place of the samplers' own random_loggam (random_poisson_ptrs.c,
+    hypergeometric_hrua.c), whose x < 7 branch runs a different
+    (argument-reduction) computation this no longer models -- see git
+    history if that distinction needs to be reinstated.
+
     prefix must be unique per call-site.  The last entry is the result name.
-
-    `shift` reproduces random_loggam's argument reduction n = (int64_t)(7 - x)
-    [random_poisson_ptrs.c:44] the same way loggam_ie does: Stirling is
-    evaluated at x0 = x + shift and the shift factors are then peeled back off
-    with `gl -= log(x0 - 1)` [random_poisson_ptrs.c:58-61].  x0 and the x0 - i it
-    steps through are exact whenever x_expr is an exact integer, which is the
-    only way the sampler reaches that branch, so they are written as literals.
-
-    The Stirling series itself is FPTaylor's native lgamma(x) operator (a
-    rigorous enclosure of the true value, valid for every x > 0 -- see
-    FPTaylor/func.ml:lgamma_I), so shift is kept only to mirror
-    random_loggam's own recurrence and is no longer needed to keep x0 in a
-    Stirling-valid range.
     """
-    x0 = f"({x_expr} + {float(shift):.1f})" if shift else f"({x_expr})"
-    lines = [f"  {prefix}_gl {rnd}= lgamma{x0},"]
-    # ... then gl -= log(x0 - 1) once per shifted factor, x0 walking back down
     name = f"{prefix}_gl"
-    for i in range(1, shift + 1):
-        lines.append(f"  {prefix}_gl{i} {rnd}= {name}"
-                     f" - log({x0} - {float(i):.1f}),")
-        name = f"{prefix}_gl{i}"
-    return lines, name
+    return [f"  {name} {rnd}= lgamma({x_expr}),"], name
 
 
 TRANSCENDENTAL_BACKENDS = ("ieee", "crlibm", "rlibm")
@@ -629,6 +637,25 @@ def loggam_ie(x, shift=0):
         x0 = x0m1
     return gl
 
+
+# Floor and accept want opposite things from u's tolerance, which is why
+# they get independently overridable values instead of sharing one:
+#
+#   floor: y_ = (2*a/us + b)*u + c is a handful of arithmetic ops -- cheap
+#   to re-evaluate on every sub-box FPTaylor's branch-and-bound produces --
+#   and eps_floor feeds directly into TV (2*eps_floor*accept_iter) with no
+#   other query able to tighten it later, so it's worth spending a tight u
+#   tolerance here: precision is what's needed, and it's affordable.
+#
+#   accept: the same u domain now drives a much deeper expression (lgamma,
+#   log, division near us -> 0, and in box mode n/p/x/fm all threading
+#   through it too), so splitting u as finely costs far more per split --
+#   confirmed directly: individual accept sub-expressions can each still
+#   show 50-97% suboptimality at a "tight" tolerance, meaning most of that
+#   splitting effort buys little extra tightness anyway. Loosening u here
+#   trades some of that (already partly wasted) tightness for runtime that
+#   stays tractable as n, p (or lambda, N/K/n, ...) scale up -- scalability
+#   is what's needed, at some cost in bound tightness.
 
 def floor_x_abs_tol_vars(args):
     """--floor-opt-x-abs-tol-vars if set, else the shared --opt-x-abs-tol-vars."""
