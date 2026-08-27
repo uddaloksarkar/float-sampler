@@ -22,17 +22,22 @@ VERBOSITY="-v"                    # "-v", "-vv", or "" for none
 COMMON_ARGS=(--fp "$FP")
 [ -n "$VERBOSITY" ] && COMMON_ARGS+=("$VERBOSITY")
 
-# # # ---- binomial (BTRS) -------------------------------------------------------
-python3 main.py "${COMMON_ARGS[@]}" binomial \
-  --n 10900 --p 0.1 --jobs "$JOBS"
+# # # # ---- binomial (BTRS) -------------------------------------------------------
+# python3 main.py "${COMMON_ARGS[@]}" binomial \
+#   --n 10900 --p 0.1 --jobs "$JOBS"
 
-python3 main.py "${COMMON_ARGS[@]}" binomial \
-  --n 1000000 --p 0.0001 --jobs "$JOBS"
+# python3 main.py "${COMMON_ARGS[@]}" binomial \
+#   --n 1000000 --p 0.0001 --jobs "$JOBS"
 
-# ---- poisson (PTRS) --------------------------------------------------------
-python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
+# # ---- poisson (PTRS) --------------------------------------------------------
+# python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
 
-python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
+# python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
+
+# ---- poisson-stable (PTRS, cancellation-avoiding templates) ----------------
+python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e5
+
+python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e8
 
 # ---- hypergeometric (HRUA) -------------------------------------------------
 python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30

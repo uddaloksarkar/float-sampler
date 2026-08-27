@@ -6,6 +6,9 @@ source ~/.venvs/udda/bin/activate
 # One dataset file per distribution (see generate_benchmark_dataset.py),
 # each already in that distribution's own native input-file format:
 #   poisson:        "lambda"        one per line
+#   poisson-stable: "lambda"        one per line (same file as poisson --
+#                                    same distribution, just the cancellation-
+#                                    avoiding template set, see dist_poisson_stable.py)
 #   binomial:       "n p"           one per line
 #   hypergeometric: "N K n"         one per line
 # dist_flags maps 1/2/3 space-separated values on a line to main.py's flags.
@@ -37,9 +40,10 @@ SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-$(pwd)}
 
 # (dist_name, params_file) pairs; the actual --flag names for however many
 # space-separated values one line holds are chosen per distribution below
-# (poisson: --lam; binomial: --n --p; hypergeometric: --N --K --n).
+# (poisson/poisson-stable: --lam; binomial: --n --p; hypergeometric: --N --K --n).
 dist_files=(
     "poisson:${poisson_file}"
+    "poisson-stable:${poisson_file}"
     "binomial:${binomial_file}"
     "hypergeometric:${hypergeometric_file}"
 )
@@ -109,6 +113,10 @@ do
             poisson)
                 distargs="--fp ${FP} poisson --lam ${tok[0]}"
                 tag="poisson_lam_${tok[0]}"
+                ;;
+            poisson-stable)
+                distargs="--fp ${FP} poisson-stable --lam ${tok[0]}"
+                tag="poisson_stable_lam_${tok[0]}"
                 ;;
             binomial)
                 distargs="--fp ${FP} binomial --n ${tok[0]} --p ${tok[1]}"
