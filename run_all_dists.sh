@@ -23,14 +23,21 @@ COMMON_ARGS=(--fp "$FP")
 [ -n "$VERBOSITY" ] && COMMON_ARGS+=("$VERBOSITY")
 
 # # # ---- binomial (BTRS) -------------------------------------------------------
-# python3 main.py "${COMMON_ARGS[@]}" binomial \
-#   --n 10900 --p 0.1 --jobs "$JOBS"
+python3 main.py "${COMMON_ARGS[@]}" binomial \
+  --n 10900 --p 0.1 --jobs "$JOBS"
+
+python3 main.py "${COMMON_ARGS[@]}" binomial \
+  --n 1000000 --p 0.0001 --jobs "$JOBS"
 
 # ---- poisson (PTRS) --------------------------------------------------------
-python3 -m pdb main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
+python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
+
+python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
 
 # ---- hypergeometric (HRUA) -------------------------------------------------
-python3 pdb main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30
+python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30
+
+python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 10000 --K 4000 --n 300
 
 # ---- zipf ------------------------------------------------------------------
 # Not yet covered by fptaylor_settings.toml / sweep_fptaylor.py -- runs on

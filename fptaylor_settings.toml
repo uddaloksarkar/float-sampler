@@ -70,6 +70,20 @@ opt_x_abs_tol = 0.01
 floor_opt_x_abs_tol_vars = "u=1e-6"
 accept_opt_x_abs_tol_vars = "u=0.1"
 
+[poisson-stable]
+# Same distribution as [poisson], different (cancellation-avoiding)
+# templates -- approx/bb_eval inherited from [poisson] rather than
+# independently swept. u_trunc drives dist_poisson.ptrs_accept_k_range
+# (dist_poisson_stable.run_ptrs_stable), same role as [poisson]'s.
+# floor/accept_opt_x_abs_tol_vars intentionally NOT copied from [poisson]:
+# its "u=..." override names dist_poisson.py's u variable, which doesn't
+# exist in this module's templates (declared "us" and "k" instead) -- unset
+# here just means every variable falls back to the flat opt_x_abs_tol.
+approx = false
+bb_eval = true
+u_trunc = 1e-5
+opt_x_abs_tol = 0.01
+
 [hypergeometric]
 switch = 10  # sample-count threshold: HYP below, HRUA above (dist_hypergeometric._HRUA_SWITCH)
 approx = true
