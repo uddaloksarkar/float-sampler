@@ -670,23 +670,36 @@ def loggam_defs(x_expr, prefix, rnd):
 
 TRANSCENDENTAL_BACKENDS = ("ieee", "crlibm", "rlibm")
 
+# Hardcoded fallback for each op, used only when fptaylor_settings.toml's
+# [global.ulp_ledger] doesn't set that op -- log/lgamma default to 5 (the
+# two ops this ledger is actually wired for so far), exp/sin/cos to 10
+# (their old flat placeholder, now just routed through the same toml
+# lookup instead of being a bare literal in the dict below).
+_ULP_DEFAULTS = {"log": 5.0, "lgamma": 5.0, "exp": 10.0, "sin": 10.0, "cos": 10.0}
+
 # PLACEHOLDER ledger: per-(backend, op) ULP bound k in the k * x * eps error
-# model below.  Every entry is currently the same guessed constant (10) that
-# transcendental_error_bound hardcoded for all ops and all backends before
-# this table existed -- none of these numbers have been pulled from the
-# actual accuracy guarantees each library documents yet:
+# model below.  Every op is overridable via fptaylor_settings.toml's
+# [global.ulp_ledger], falling back to _ULP_DEFAULTS if that table or the
+# op's own key is missing -- none of these numbers have been pulled from
+# the actual accuracy guarantees each library documents yet:
 #   - "ieee": no correct-rounding guarantee for transcendentals in IEEE-754
 #     itself; treat as the conservative default until a real libm is named.
 #   - "crlibm": correctly-rounded libm (<= 0.5ulp) for every function it
-#     implements -- real entries should end up near 1, not 10.
+#     implements -- real entries should end up near 1, not 5-10.
 #   - "rlibm": accuracy varies by function and by RLIBM variant (RLIBM-ALL,
 #     RLIBM-FAST, ...); needs one entry per variant once real numbers land.
 # Replace op-by-op as each library's documented bound is looked up; until
-# then every backend behaves identically to the old flat placeholder.
+# then every backend behaves identically to this same flat placeholder.
+_ulp_ledger_settings = load_settings_toml().get("global", {}).get("ulp_ledger", {})
+
+
+def _ulp_default(op):
+    return _ulp_ledger_settings.get(op, _ULP_DEFAULTS[op])
+
+
 ULP_LEDGER = {
-    "ieee":   {"log": 10.0, "exp": 10.0, "sin": 10.0, "cos": 10.0, "lgamma": 10.0},
-    "crlibm": {"log": 10.0, "exp": 10.0, "sin": 10.0, "cos": 10.0, "lgamma": 10.0},
-    "rlibm":  {"log": 10.0, "exp": 10.0, "sin": 10.0, "cos": 10.0, "lgamma": 10.0},
+    backend: {op: _ulp_default(op) for op in _ULP_DEFAULTS}
+    for backend in TRANSCENDENTAL_BACKENDS
 }
 
 

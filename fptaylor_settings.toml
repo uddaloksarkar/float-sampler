@@ -32,19 +32,34 @@
 # need re-validating (e.g. after an FPTaylor upgrade or a template change).
 
 # Cross-distribution constants (analyticError.load_global_settings): the
-# per-format mantissa precision used by every --fp choice, and the lambda
-# threshold Poisson's analytic TV bound (and dist_poisson/dist_poisson_stable/
-# fpsampler/computeLRError's low-vs-high-range split) switches on. Missing
-# here (or this file missing entirely) falls back to analyticError's own
-# hardcoded defaults.
+# per-format mantissa precision used by every --fp choice. Missing here (or
+# this file missing entirely) falls back to analyticError's own hardcoded
+# defaults. Regime-switch thresholds are per-distribution, not global -- see
+# each distribution's own [dist] section below (dist_common.dist_switch);
+# Poisson's low-vs-high-range split (analyticError.SWITCH, shared by
+# dist_poisson/dist_poisson_stable/fpsampler/computeLRError) isn't wired to
+# any [dist] section yet and falls back to analyticError's own hardcoded
+# default (30) until it is.
 [global]
-switch = 30
 
 [global.fp_beta]
 fp32 = 24    # IEEE 754 binary32
 fp64 = 53    # IEEE 754 binary64
 fp128 = 112  # IEEE 754 binary128
 fp256 = 237  # IEEE 754 binary256 (octuple)
+
+[global.ulp_ledger]
+# Placeholder ULP bound k in dist_common.transcendental_error_bound's
+# k * x * eps error model (dist_common.ULP_LEDGER, read via
+# dist_common.load_settings_toml, not analyticError.load_global_settings).
+# Any op missing here (or this file missing entirely) falls back to
+# dist_common._ULP_DEFAULTS: log/lgamma -> 5.0, exp/sin/cos -> 10.0.
+# transcendental_error_bound itself still has no caller anywhere yet.
+log = 5.0
+lgamma = 5.0
+# exp = 10.0
+# sin = 10.0
+# cos = 10.0
 
 [binomial]
 switch = 30.0  # n*p threshold: legacy inversion below, BTRS above (dist_binomial._BTRS_SWITCH)
@@ -75,12 +90,20 @@ accept_opt_x_abs_tol_vars = "u=0.1"
 # templates -- approx/bb_eval inherited from [poisson] rather than
 # independently swept. u_trunc drives dist_poisson.ptrs_accept_k_range
 # (dist_poisson_stable.run_ptrs_stable), same role as [poisson]'s.
+# v_trunc must stay a normal-sized double like [poisson]'s, even though v
+# is exact here and the bound itself stays tight far below this (see
+# dist_poisson_stable.py's module docstring, point 1): FPTaylor's compiled
+# --opt bb backend fails to compile the OCaml it generates for a literal
+# as extreme as 1e-300 (the exact rational for a double that close to the
+# subnormal range blows up), so this is a compile-time floor, not a
+# tightness one.
 # floor/accept_opt_x_abs_tol_vars intentionally NOT copied from [poisson]:
 # its "u=..." override names dist_poisson.py's u variable, which doesn't
 # exist in this module's templates (declared "us" and "k" instead) -- unset
 # here just means every variable falls back to the flat opt_x_abs_tol.
 approx = false
 bb_eval = true
+v_trunc = 1e-20
 u_trunc = 1e-5
 opt_x_abs_tol = 0.01
 

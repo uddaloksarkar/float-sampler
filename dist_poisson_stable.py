@@ -14,8 +14,13 @@ each measured independently on this repo's FPTaylor build:
    amplifies it by dt/du ~ a/us^2 (coefficient 1.63e7 at lambda=1e6).
    Declaring them float64 is sound, not an approximation.
        eps_logv  8.674e-9 -> 1.776e-15;  eps_floor 1.92e-9 -> 1.82e-10 at 1e6.
-   With v exact the bound holds at 5.68e-14 over v in [1e-300, 1], so VTAIL
-   stops contributing 2*vtail*invalpha ~ 2e-10 to tv.
+   With v exact the bound stays tight arbitrarily close to 0 (5.68e-14 at
+   v in [1e-300, 1]), but FPTaylor's compiled --opt bb backend fails to
+   compile the generated OCaml for a literal that extreme (the exact
+   rational it emits for a double that close to the subnormal range blows
+   up), so v_trunc is left at the same CLI/toml-driven value as
+   dist_poisson.py rather than pushed to the edge of what the bound itself
+   would tolerate.
    This does *not* help eps_accept (7.2220e-9 vs 7.2233e-9): that error is
    genuine cancellation, addressed by (2).
 
@@ -72,7 +77,6 @@ import dist_poisson as base
 NAME = "poisson-stable"
 CSV_FIELDS = base.CSV_FIELDS
 
-VTAIL = 1e-300          # v is exact, so the tail cut costs nothing (see 1.)
 NSERIES = 10            # atanh-series terms; truncation is checked per box
 VSPLIT = 0.1            # |v| below which the series is used (Loader's cutoff)
 STIRLERR_KMIN = 16      # series valid above this; exact table below
@@ -346,7 +350,7 @@ def run_ptrs_stable(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     fp, verbose = args.fp, args.verbose
     ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
     x_abs_tol, approx = args.opt_x_abs_tol, args.approx
-    u_trunc = args.u_trunc
+    u_trunc, v_trunc = args.u_trunc, args.v_trunc
     if u_trunc is None or not (0.0 < u_trunc < 0.5):
         raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
     floor_tol_vars = floor_x_abs_tol_vars(args)
@@ -385,11 +389,11 @@ def run_ptrs_stable(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
                  ratio_tol, bb_eval, x_abs_tol, accept_tol_vars, approx)
         acc = max(acc, e)          # table stirlerr and exact log p(0): no method error
 
-    eps_accept = acc + eps_logv(fptaylor, fp, VTAIL, inputs_dir, outputs_dir,
+    eps_accept = acc + eps_logv(fptaylor, fp, v_trunc, inputs_dir, outputs_dir,
                                 env, verbose, ratio_tol, bb_eval, x_abs_tol,
                                 accept_tol_vars, approx)
 
-    tv = (2.0 * u_trunc + VTAIL + 2.0 * invalpha * eps_floor
+    tv = (2.0 * u_trunc + v_trunc + 2.0 * invalpha * eps_floor
           + acceptance_tv(eps_accept))
     return eps_floor, eps_accept, tv
 
