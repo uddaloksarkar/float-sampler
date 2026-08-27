@@ -14,12 +14,15 @@ from dist_common import (
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
     point_ivar,
+    dist_switch,
 )
 
 NAME = "geometric"
 CSV_FIELDS = ["p", "eps0", "eps1", "eps2", "delta", "tv", "backend"]
 
-_SWITCH = 1.0 / 3.0
+# overridable via fptaylor_settings.toml's [geometric].switch
+# (dist_common.dist_switch).
+_SWITCH = dist_switch(NAME, 1.0 / 3.0)
 
 
 def _use_inversion(p):

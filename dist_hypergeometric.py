@@ -18,13 +18,16 @@ from dist_common import (
     save_loglog_plot, loggam_defs, vprint, run_fptaylor_query,
     rou_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
+    dist_switch,
 )
 
 NAME = "hypergeometric"
 CSV_FIELDS = ["N", "K", "n", "regime", "delta", "eps_w", "eps_accept", "tv",
               "time_s"]
 
-_HRUA_SWITCH = 10      # see _use_hrua()
+# see _use_hrua() -- overridable via fptaylor_settings.toml's
+# [hypergeometric].switch (dist_common.dist_switch).
+_HRUA_SWITCH = dist_switch(NAME, 10)
 
 _D1 = 1.7155277699214135   # 2*sqrt(2/e)
 _D2 = 0.8989161620588988   # 3 - 2*sqrt(3/e)

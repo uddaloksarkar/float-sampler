@@ -1,5 +1,6 @@
 #!/bin/bash
 
+source ~/opam-fptaylor-env.sh
 source ~/.venvs/udda/bin/activate
 
 # One dataset file per distribution (see generate_benchmark_dataset.py),

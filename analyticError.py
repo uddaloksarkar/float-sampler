@@ -1,5 +1,7 @@
 import argparse
 import math
+import tomllib
+from pathlib import Path
 
 
 def _pyplot():
@@ -12,16 +14,39 @@ def _pyplot():
     })
     return plt
 
-# Mantissa bits (total significand including implicit leading 1) per FP format
-FP_BETA = {
+# Mantissa bits (total significand including implicit leading 1) per FP
+# format, and the lambda threshold for switching between low- and
+# high-range computations -- overridable via fptaylor_settings.toml's
+# [global]/[global.fp_beta] (see load_global_settings), so every consumer
+# of these two names (this module, dist_poisson, dist_poisson_stable,
+# fpsampler, computeLRError, dist_common) picks up the same values from one
+# place. Falls back to these hardcoded values if the TOML file or its
+# [global] section is missing.
+_DEFAULT_FP_BETA = {
     'fp32':  24,   # IEEE 754 binary32
     'fp64':  53,   # IEEE 754 binary64
     'fp128': 112,  # IEEE 754 binary128
     'fp256': 237,  # IEEE 754 binary256 (octuple)
 }
+_DEFAULT_SWITCH = 30
+
+_SETTINGS_TOML_PATH = Path(__file__).resolve().parent / "fptaylor_settings.toml"
+
+
+def load_global_settings(path=None):
+    """[global] section of fptaylor_settings.toml, or {} if the file or
+    that section doesn't exist."""
+    p = path or _SETTINGS_TOML_PATH
+    if not p.exists():
+        return {}
+    return tomllib.load(p.open("rb")).get("global", {})
+
+
+_global_settings = load_global_settings()
+FP_BETA = _global_settings.get("fp_beta", _DEFAULT_FP_BETA)
+SWITCH = _global_settings.get("switch", _DEFAULT_SWITCH)
 
 COLORS = ['blue', 'green', 'red', 'orange']
-SWITCH = 30 # lambda threshold for switching between low and high range computations
 
 # ---------------------------------------------------------------------------
 # Core computation

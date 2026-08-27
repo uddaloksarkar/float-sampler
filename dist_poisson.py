@@ -15,7 +15,7 @@ from dist_common import (
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
-    hormann_u_at, point_ivar,
+    point_ivar,
     hormann_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
@@ -55,29 +55,33 @@ def ptrs_setup_defs(rnd, lam_expr, accept=False):
     return d
 
 
-# k1_ = k_ + 1 = (y_ - f) + 1, f in [0, 1], and (unlike the BTRS/PTRS accept
-# shell's k-range, which has no extra y-window padding of its own here) y_
-# sits exactly at k_lo at the window's low corner, so k1_'s enclosure dips
-# to exactly k_lo at f = 1 -- k_lo >= 1 is what keeps k1_ > 0.
+# k1_ = k_ + 1 = (y_ - f) + 1, f in [0, 1]: k1_'s enclosure dips as low as
+# k_lo - 1 at f = 1, so k_lo >= 1 is what keeps k1_ > 0 -- a hard
+# domain-validity floor (loggam(k1_) needs k1_ > 0), not an approximation
+# of excluded tail mass.
 _K_BOUNDARY_MARGIN = 1.0
-_K_SIGMAS = 10.0
 
-def ptrs_accept_k_range(lam):
-    """k window the accept query covers: +-10 sigma bulk, kept >= _K_BOUNDARY_MARGIN."""
-    slam = math.sqrt(lam)
-    k_lo = max(_K_BOUNDARY_MARGIN, math.ceil(lam - _K_SIGMAS * slam))
-    k_hi = math.floor(lam + _K_SIGMAS * slam)
+def ptrs_accept_k_range(lam, u_trunc):
+    """
+    k window the accept query covers: the entire domain reachable out to
+    the u_trunc cutoff, not a fixed sigma window -- no excluded-tail mass
+    to separately bound this way, since u_trunc already accounts for it
+    (same as the floor query, see clip_u_trunc's docstring).
+
+    y(u) = (2*a/us + b)*u + c [random_poisson_ptrs.c line 89] is strictly
+    increasing in u (see hormann_u_at), so the maximum reachable k is
+    floor(y) at u's own positive truncation boundary, u = 0.5 - u_trunc
+    (us = u_trunc there). The minimum is clamped to _K_BOUNDARY_MARGIN: y
+    goes negative well before u reaches -0.5, which is unphysical.
+    """
+    _, a, b, c = ptrs_consts(lam)
+    u_hi = 0.5 - u_trunc
+    y_hi = (2.0 * a / u_trunc + b) * u_hi + c
+    k_lo, k_hi = _K_BOUNDARY_MARGIN, math.floor(y_hi)
     if k_lo >= k_hi:
         raise ValueError(f"empty accept window k in [{k_lo:.6g}, {k_hi:.6g}] "
-                         f"for lambda={lam:.6g}")
+                         f"for lambda={lam:.6g}, u_trunc={u_trunc:.3g}")
     return float(k_lo), float(k_hi)
-
-
-def ptrs_accept_u_range(lam):
-    """The u that map into ptrs_accept_k_range."""
-    _, a, b, c = ptrs_consts(lam)
-    k_lo, k_hi = ptrs_accept_k_range(lam)
-    return hormann_u_at(a, b, c, k_lo), hormann_u_at(a, b, c, k_hi)
 
 
 def clip_u_trunc(u_lo, u_hi, u_trunc):
@@ -89,54 +93,6 @@ def clip_u_trunc(u_lo, u_hi, u_trunc):
     edge_lo = -0.5 + u_trunc
     edge_hi = 0.5 - u_trunc
     return max(u_lo, edge_lo), min(u_hi, edge_hi)
-
-
-def poisson_cdf_below(lam, k_lo):
-    """
-    P(K < k_lo) for K ~ Poisson(lam), summed term by term in log space.
-
-    Only called with k_lo = ptrs_accept_k_range's low end (see
-    _K_BOUNDARY_MARGIN).  Nudged up by a few ulp to
-    stay an upper bound on the exact tail despite lgamma/exp rounding: it is
-    charged as probability mass, so erring high is the safe direction.
-    """
-    m = int(math.ceil(k_lo)) - 1          # largest integer k with k < k_lo
-    if m < 0:
-        return 0.0
-    loglam = math.log(lam)
-    total = math.fsum(
-        math.exp(-lam + k * loglam - math.lgamma(k + 1.0))
-        for k in range(m + 1)
-    )
-    return total * (1.0 + 1e-12)
-
-
-def ptrs_k_tail_prob(lam):
-    """
-    P(K outside the accept window): the output mass that query does not cover.
-
-    The lower tail is summed exactly -- for lambda close to SWITCH, k_lo is
-    pinned near _K_BOUNDARY_MARGIN, so it is O(1) terms, and the Chernoff
-    bound is badly loose that close to
-    the mode (at lambda=30 it gives 1.1e-5 for a tail that is really 1.2e-6),
-    which made it the dominant term of the whole TV bound.
-
-    The upper tail stays on the Chernoff bound, using the Poisson rate
-    function h(t) = t*log(t) - t + 1, i.e. P(K >= x) <= exp(-lam*h(x/lam)):
-    it sits ~10 sigma out where the bound is already negligible and summing
-    it would cost O(lam) terms.  Bernstein is far too crude this far out --
-    at lambda=50 it gives 2e-6 for a tail that is really ~1e-12, which would
-    then dominate the whole bound.
-    """
-    k_lo, k_hi = ptrs_accept_k_range(lam)
-    if not (k_lo < lam < k_hi):
-        raise ValueError(f"accept window [{k_lo:.6g}, {k_hi:.6g}] does not "
-                         f"contain lambda={lam:.6g}")
-
-    def h(t):
-        return t * math.log(t) - t + 1.0 if t > 0.0 else 1.0
-
-    return poisson_cdf_below(lam, k_lo) + math.exp(-lam * h(k_hi / lam))
 
 
 def make_ptrs_floor_template(lam, fp, utail):
@@ -249,14 +205,14 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     floor_raw = extract_abs_errors_by_problem(output)["eps_floor"]
     eps_floor = hormann_proposal_deviation(floor_raw, a, b)
 
-    # k is now declared directly over its own interval (ptrs_accept_k_range),
+    # k is declared directly over its own interval (ptrs_accept_k_range),
     # decoupled from u -- see make_ptrs_accept_template's docstring -- so u
     # no longer needs a sign-specific derivation and both sides run as one
-    # query over u's full (both-signs) range.
-    au_lo, au_hi = ptrs_accept_u_range(lam)
-    k_lo, k_hi = ptrs_accept_k_range(lam)
-    k_tail = ptrs_k_tail_prob(lam)
-    lo, hi = clip_u_trunc(au_lo, au_hi, u_trunc)
+    # query over u's full (both-signs), u_trunc-truncated range: the
+    # distribution's entire domain out to that cutoff, same as the floor
+    # query, with no separate tail-probability correction needed.
+    k_lo, k_hi = ptrs_accept_k_range(lam, u_trunc)
+    lo, hi = clip_u_trunc(-0.5, 0.5, u_trunc)
     if lo > hi:
         raise ValueError(f"lambda={lam}: u-range emptied by u_trunc={u_trunc}")
 
@@ -288,7 +244,7 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
         )
         eps_accept += logus
 
-    tv = (2.0 * u_trunc + 2.0 * k_tail + v_trunc
+    tv = (2.0 * u_trunc + v_trunc
           + 2.0 * invalpha * eps_floor
           + acceptance_tv(eps_accept))
     return eps_floor, eps_accept, tv

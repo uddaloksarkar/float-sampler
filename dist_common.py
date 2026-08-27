@@ -557,6 +557,19 @@ def apply_settings_defaults(args):
             setattr(args, field, default)
 
 
+def dist_switch(dist, default):
+    """Regime-switch threshold for `dist` (e.g. binomial's n*p threshold,
+    hypergeometric's sample-count threshold, geometric's p threshold) from
+    fptaylor_settings.toml's [dist].switch, falling back to `default` if
+    the file, the [dist] section, or the switch key is missing. Unlike
+    apply_settings_defaults's fields, these aren't CLI args -- each
+    distribution module reads this once at import time into its own
+    module-level constant (_BTRS_SWITCH, _HRUA_SWITCH, _SWITCH, ...).
+    """
+    settings = load_settings_toml()
+    return settings.get(dist, {}).get("switch", default)
+
+
 # ---------------------------------------------------------------------------
 # Shared FPTaylor helpers for Hormann-style transformed-rejection samplers
 # (BTRS for binomial, PTRS for Poisson): native FPTaylor lgamma/log and

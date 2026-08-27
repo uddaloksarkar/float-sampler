@@ -20,6 +20,7 @@ from dist_common import (
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
     hormann_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
+    dist_switch,
 )
 
 NAME = "binomial"
@@ -27,7 +28,9 @@ CSV_FIELDS = ["n", "p", "n_lo", "n_hi", "p_lo", "p_hi", "regime",
               "eps0", "eps1", "eps2", "eps_floor", "eps_accept", "tv",
               "n_boxes", "time_s"]
 
-_BTRS_SWITCH = 30.0   # n*p threshold: inversion below, BTRS above
+# n*p threshold: inversion below, BTRS above -- overridable via
+# fptaylor_settings.toml's [binomial].switch (dist_common.dist_switch).
+_BTRS_SWITCH = dist_switch(NAME, 30.0)
 
 
 def sampler_p(p):
