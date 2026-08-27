@@ -15,6 +15,7 @@ from dist_common import (
     run_command, extract_abs_errors_by_problem,
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
+    ulp_rnd_op,
     point_ivar,
     hormann_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
@@ -51,7 +52,7 @@ def ptrs_setup_defs(rnd, lam_expr, accept=False):
          f"  c_    {rnd}= {lam_expr} + 0.43,"]
     if accept:
         d += [f"  ialp_ {rnd}= 1.1239 + 1.1328 / (b_ - 3.4),",
-              f"  llam_ {rnd}= log({lam_expr}),"]
+              f"  llam_ {ulp_rnd_op(rnd, 'log')}= log({lam_expr}),"]
     return d
 
 
@@ -154,7 +155,9 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, k_lo, k_hi, fast=False):
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     defs_k, name_k = loggam_defs("k1_", "lgk", rnd)
-    log_us_term = "" if fast else " - 2.0 * log(us_)"
+    log_rnd = ulp_rnd_op(rnd, "log")
+    log_us_def  = "" if fast else f"  log_us_ {log_rnd}= log(us_),\n"
+    log_us_term = "" if fast else " - 2.0 * log_us_"
 
     return (
         "Variables\n"
@@ -168,8 +171,11 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, k_lo, k_hi, fast=False):
         + "\n".join(defs_k) + "\n"
         + f"  us_sq_      {rnd}= us_ * us_,\n"
         + f"  log_num_    {rnd}= a_ + b_ * us_sq_,\n"
+        + f"  log_ialp_   {log_rnd}= log(ialp_),\n"
+        + f"  log_lognum_ {log_rnd}= log(log_num_),\n"
+        + log_us_def
         + f"  ptrs_accept {rnd}= -lam + k * llam_ - {name_k}"
-          f" - log(ialp_) + log(log_num_){log_us_term};\n\n"
+          f" - log_ialp_ + log_lognum_{log_us_term};\n\n"
         + "Expressions\n"
           "  eps_accept = ptrs_accept;\n"
     )

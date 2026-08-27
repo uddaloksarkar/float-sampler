@@ -67,7 +67,7 @@ from pathlib import Path
 from analyticError import FP_BETA, SWITCH, computeDeltaHighRange, computeDeltaLowRange
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND, run_command, extract_abs_errors_by_problem,
-    save_loglog_plot, run_fptaylor_query,
+    save_loglog_plot, run_fptaylor_query, ulp_rnd_op,
     hormann_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
@@ -169,9 +169,14 @@ def make_floor_template(lam, fp, utail, sign):
 
 def _accept_tail(rnd):
     """The us-dependent part, shared by every accept template:
-    log(a + b*us^2) - 2*log(us), with us exact."""
-    return [f"  us2_  {rnd}= us * us,",
-            f"  num_  {rnd}= a_ + b_ * us2_,"]
+    log(a + b*us^2) - 2*log(us), with us exact.  The two log() calls get
+    the ULP ledger's log scale (ulp_rnd_op) rather than the plain rnd used
+    for the surrounding arithmetic -- see dist_common.ulp_rnd_op."""
+    log_rnd = ulp_rnd_op(rnd, "log")
+    return [f"  us2_     {rnd}= us * us,",
+            f"  num_     {rnd}= a_ + b_ * us2_,",
+            f"  log_num_ {log_rnd}= log(num_),",
+            f"  log_us_  {log_rnd}= log(us),"]
 
 
 def make_accept_template(lam, fp, utail, k_lo, k_hi, mode):
@@ -185,6 +190,7 @@ def make_accept_template(lam, fp, utail, k_lo, k_hi, mode):
     """
     a, b, invalpha = ptrs_params(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
+    log_rnd = ulp_rnd_op(rnd, "log")
     C = -math.log(invalpha) - LS2PI
 
     d = [f"  a_    = {a:.20e},",
@@ -201,14 +207,16 @@ def make_accept_template(lam, fp, utail, k_lo, k_hi, mode):
               f"  v2_   {rnd}= v_ * v_,"] + hl + [
               f"  bd0_  {rnd}= dk_ * v_ + ((2.0 * k) * (v_ * v2_)) * {hn},"]
     else:
-        d += [f"  bd0_  {rnd}= (k * log(k / lam_) - k) + lam_,"]
+        d += [f"  log_k_lam_ {log_rnd}= log(k / lam_),",
+              f"  bd0_       {rnd}= (k * log_k_lam_ - k) + lam_,"]
 
     sl, sn = _horner("se_", SERR, "ki2_", rnd)
     d += [f"  ki_   {rnd}= 1.0 / k,",
           f"  ki2_  {rnd}= ki_ * ki_,"] + sl + [f"  st_   {rnd}= {sn} * ki_,"]
+    d += [f"  log_k_ {log_rnd}= log(k),"]
     d += _accept_tail(rnd)
-    d += [f"  acc_  {rnd}= (((C_ - bd0_) - st_) - 0.5 * log(k))"
-          f" + log(num_) - 2.0 * log(us);"]
+    d += [f"  acc_  {rnd}= (((C_ - bd0_) - st_) - 0.5 * log_k_)"
+          f" + log_num_ - 2.0 * log_us_;"]
 
     return ("Variables\n"
             f"  float64 us in [{utail:.20e}, 5.0e-1],\n"
@@ -223,6 +231,7 @@ def make_accept_point_template(lam, fp, utail, k):
     is the only variable.  k = 0 uses log p(0) = -lam exactly."""
     a, b, invalpha = ptrs_params(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
+    log_rnd = ulp_rnd_op(rnd, "log")
     d = [f"  a_    = {a:.20e},",
          f"  b_    = {b:.20e},"]
 
@@ -233,14 +242,16 @@ def make_accept_point_template(lam, fp, utail, k):
     else:
         # -bd0(k,lam) - stirlerr(k) - 0.5*log(k) - LS2PI - log(invalpha)
         C = -math.log(invalpha) - LS2PI - STIRLERR_TAB[k]
-        d += [f"  C_    = {C:.20e},",
-              f"  lam_  = {lam:.20e},",
-              f"  kk_   = {float(k):.20e},",
-              f"  bd0_  {rnd}= (kk_ * log(kk_ / lam_) - kk_) + lam_,",
-              f"  lp_   {rnd}= (C_ - bd0_) - 0.5 * log(kk_),"]
+        d += [f"  C_         = {C:.20e},",
+              f"  lam_       = {lam:.20e},",
+              f"  kk_        = {float(k):.20e},",
+              f"  log_kk_lam_ {log_rnd}= log(kk_ / lam_),",
+              f"  bd0_        {rnd}= (kk_ * log_kk_lam_ - kk_) + lam_,",
+              f"  log_kk_    {log_rnd}= log(kk_),",
+              f"  lp_        {rnd}= (C_ - bd0_) - 0.5 * log_kk_,"]
 
     d += _accept_tail(rnd)
-    d += [f"  acc_  {rnd}= lp_ + log(num_) - 2.0 * log(us);"]
+    d += [f"  acc_  {rnd}= lp_ + log_num_ - 2.0 * log_us_;"]
 
     return ("Variables\n"
             f"  float64 us in [{utail:.20e}, 5.0e-1];\n\n"
@@ -255,7 +266,7 @@ def make_logv_template(fp, vtail):
     return ("Variables\n"
             f"  float64 v in [{vtail:.20e}, 1.0];\n\n"
             "Definitions\n"
-            f"  logv_step {rnd}= - log(v);\n\n"
+            f"  logv_step {ulp_rnd_op(rnd, 'log')}= - log(v);\n\n"
             "Expressions\n  eps_logv = logv_step;\n")
 
 

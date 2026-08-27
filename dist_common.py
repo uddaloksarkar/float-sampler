@@ -656,16 +656,21 @@ LOGGAM_A = [
 LOGGAM_LG2PI = 1.8378770664093453e+00
 
 
-def loggam_defs(x_expr, prefix, rnd):
+def loggam_defs(x_expr, prefix, rnd, backend="ieee"):
     """
     Return FPTaylor Definitions lines computing lgamma(x_expr). The analysis
-    intentionally uses FPTaylor's native lgamma/log operators for the
-    acceptance kernels.
+    intentionally uses FPTaylor's native lgamma operator for the acceptance
+    kernels, rounded under ULP_LEDGER[backend]["lgamma"]'s scale rather than
+    FPTaylor's own default 0.5ulp assumption (see ulp_rnd_op) -- every
+    lgamma call in every distribution's templates goes through this one
+    function, so this is the single place that correction needs applying.
 
     prefix must be unique per call-site.  The last entry is the result name.
+    `rnd` is still the plain rnd32/64/128 token (only its bit width is
+    used); pass fp-consistent rnd here exactly as before.
     """
     name = f"{prefix}_gl"
-    return [f"  {name} {rnd}= lgamma({x_expr}),"], name
+    return [f"  {name} {ulp_rnd_op(rnd, 'lgamma', backend)}= lgamma({x_expr}),"], name
 
 
 TRANSCENDENTAL_BACKENDS = ("ieee", "crlibm", "rlibm")
@@ -703,6 +708,40 @@ ULP_LEDGER = {
 }
 
 
+def ulp_rnd_op(rnd, op, backend="ieee"):
+    """
+    FPTaylor rounding-operator token for one transcendental call ('name
+    rnd[...]= log(x),' etc.), scaled by ULP_LEDGER[backend][op] instead of
+    FPTaylor's own default 0.5ulp assumption.  `rnd` is the plain
+    rnd32/64/128 token (only its bit width is used) already in scope at
+    every call site that needs this (loggam_defs and the various
+    *_setup_defs functions that isolate one log() call of their own).
+
+    FPTaylor's general rounding operator rnd[bits, type, scale, eps, delta]
+    models rnd(f) = f + f*e + d with |e| <= scale * 2^eps (type=ne)
+    [FPTaylor/REFERENCE.md "Rounding"]; the simplified rnd[bits, type,
+    scale] form (the one used here) auto-derives eps/delta from bits/type,
+    so scale alone controls how many multiples of the default's 0.5ulp
+    this call is allowed: plain rnd64 = rnd[64, ne] = rnd[64, ne, 1.0].
+    Confirmed directly: rnd[64, ne, 5.0] on the same lgamma call reports
+    exactly 5x the absolute error rnd64 does.
+
+    This only widens the rounding model FPTaylor assumes for *this specific
+    call* -- it must be the rounding operator on a Definition computing the
+    op alone (`name rnd[...]= log(x),`), not one folded into a larger
+    expression under another rounding operator, since a rounding operator
+    is not applied inside another one [REFERENCE.md "Definitions": "rnd is
+    not applied to another rounding operator and it does not propagate
+    inside another rounding operator"].  A log/lgamma call embedded in a
+    bigger rnd64-wrapped expression needs to be pulled out into its own
+    Definition line first to get this treatment; see loggam_defs for a
+    call site that already isolates it.
+    """
+    bits = int(rnd.removeprefix("rnd"))
+    scale = ULP_LEDGER[backend][op]
+    return f"rnd[{bits}, ne, {scale:.17g}]"
+
+
 def transcendental_error_bound(op, x, fp, backend="ieee"):
     """
     Upper bound on the absolute error of one call to a non-elementary math
@@ -712,16 +751,13 @@ def transcendental_error_bound(op, x, fp, backend="ieee"):
     guarantees for that op.  `backend` selects the row of ULP_LEDGER (see
     there); its entries are still placeholders, not real per-library figures.
 
-    The point of having any such bound, even a placeholder one: FPTaylor
-    otherwise assumes every log/exp/etc. call it evaluates is correctly
-    rounded to 0.5ulp, which need not hold for the library actually linked
-    at runtime.  Supplying the bound externally (as the `+/- uncertainty` on
-    an FPTaylor Variable -- REFERENCE.md "type var in [low, high] +/-
-    uncertainty") means FPTaylor only has to propagate a number we hand it,
-    not assume its own rounding model for that op; the op itself is then an
-    opaque call charged this additive error, not inlined and analysed by
-    FPTaylor at all (see log_ie/exp_ie/lgamma_ie for the paired true-value
-    enclosure).
+    This is the same k*x*eps model ulp_rnd_op hands straight to FPTaylor as
+    a scaled rounding operator (the actually-used mechanism, since FPTaylor
+    then propagates it through its own Taylor-form analysis rather than
+    Python having to separately track and add it after the fact). This
+    standalone function is for a caller that needs the number itself
+    outside an FPTaylor query (e.g. a non-FPTaylor analytic bound); it
+    currently has no such caller.
     """
     eps = 2.0 ** -FP_BETA[fp]
     k = ULP_LEDGER[backend][op]
@@ -995,7 +1031,7 @@ def make_logv_template(fp, v_lo, v_hi=1.0):
         "Variables\n"
         f"  {fp_var_type(fp)} v in [{v_lo:.20e}, {v_hi:.20e}];\n\n"
         "Definitions\n"
-        f"  logv_step {rnd}= - log(v);\n\n"
+        f"  logv_step {ulp_rnd_op(rnd, 'log')}= - log(v);\n\n"
         "Expressions\n"
         "  eps_logv = logv_step;\n"
     )
@@ -1072,7 +1108,7 @@ def make_logus_template(fp, utail, us_hi=0.5):
         "Variables\n"
         f"  {fp_var_type(fp)} us_ in [{utail:.20e}, {us_hi:.20e}];\n\n"
         "Definitions\n"
-        f"  logus_step {rnd}= - 2.0 * log(us_);\n\n"
+        f"  logus_step {ulp_rnd_op(rnd, 'log')}= - 2.0 * log(us_);\n\n"
         "Expressions\n"
         "  eps_logus = logus_step;\n"
     )

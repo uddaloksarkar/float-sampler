@@ -12,7 +12,7 @@ from pathlib import Path
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
-    loggam_defs, eps_logv, eps_logus,
+    loggam_defs, eps_logv, eps_logus, ulp_rnd_op,
     vprint,
     fptaylor_cmd,
     us_root, hormann_u_at, hormann_k_defs,
@@ -155,7 +155,7 @@ def btrs_setup_defs(rnd, n_expr, p_expr, accept=False):
          f"  c_     {rnd}= {n_expr} * {p_expr} + 0.5,"]
     if accept:
         d += [f"  alpha_ {rnd}= (2.83 + 5.1 / b_) * spq_,",
-              f"  lpq_   {rnd}= log({p_expr} / (1.0 - {p_expr})),"]
+              f"  lpq_   {ulp_rnd_op(rnd, 'log')}= log({p_expr} / (1.0 - {p_expr})),"]
     return d
 
 
@@ -200,14 +200,20 @@ def make_accept_template(fp, var_lines, n_expr, p_expr, mid, name_k, name_nk,
     fast, -2*log(us) is dropped here for a separate (cheaper, looser)
     eps_logus query instead."""
     rnd = FP_TO_FPTAYLOR_RND[fp]
+    log_rnd = ulp_rnd_op(rnd, "log")
+    log_us_def = [] if fast else [f"  log_us_ {log_rnd}= log(us_),"]
+    log_us_term = "" if fast else " - 2.0 * log_us_"
     return _template(
         var_lines,
         btrs_setup_defs(rnd, n_expr, p_expr, accept=True) + mid + [
             f"  us_sq_      {rnd}= us_ * us_,",
             f"  log_num_    {rnd}= a_ + b_ * us_sq_,",
+            f"  log_alpha_  {log_rnd}= log(alpha_),",
+            f"  log_lognum_ {log_rnd}= log(log_num_),",
+        ] + log_us_def + [
             f"  btrs_accept {rnd}= h_ - {name_k} - {name_nk}"
-            f" + (k_ - m_) * lpq_ - log(alpha_) + log(log_num_)"
-            f"{'' if fast else ' - 2.0 * log(us_)'},"],
+            f" + (k_ - m_) * lpq_ - log_alpha_ + log_lognum_"
+            f"{log_us_term},"],
         "eps_accept = btrs_accept")
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_abs_errors_by_problem,
-    save_loglog_plot, loggam_defs, vprint, run_fptaylor_query,
+    save_loglog_plot, loggam_defs, vprint, run_fptaylor_query, ulp_rnd_op,
     rou_proposal_deviation, acceptance_tv,
     elapsed_since, format_seconds,
     dist_switch,
@@ -263,6 +263,7 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
     """
     c   = hrua_consts(N, K, n)
     rnd = FP_TO_FPTAYLOR_RND[fp]
+    log_rnd = ulp_rnd_op(rnd, "log")
     mgb, Mgb, m = c["mingoodbad"], c["maxgoodbad"], c["m"]
     z_lo, z_hi = hrua_z_range(N, K, n)
 
@@ -296,7 +297,8 @@ def make_hrua_accept_template(N, K, n, fp, xtail, xhi=1.0):
         + "\n".join(defs_mz) + "\n"
         + "\n".join(defs_kz) + "\n"
         + "\n".join(defs_Mz) + "\n"
-        + f"  hrua_accept {rnd}= 2.0 * log(X) - d10_"
+        + f"  log_x_ {log_rnd}= log(X),\n"
+        + f"  hrua_accept {rnd}= 2.0 * log_x_ - d10_"
           f" + {name_z} + {name_mz} + {name_kz} + {name_Mz};\n\n"
         + "Expressions\n"
           "  eps_accept = hrua_accept;\n"

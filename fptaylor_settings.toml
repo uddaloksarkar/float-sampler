@@ -56,7 +56,7 @@ fp256 = 237  # IEEE 754 binary256 (octuple)
 # dist_common._ULP_DEFAULTS: log/lgamma -> 5.0, exp/sin/cos -> 10.0.
 # transcendental_error_bound itself still has no caller anywhere yet.
 log = 5.0
-lgamma = 5.0
+lgamma = 15.0
 # exp = 10.0
 # sin = 10.0
 # cos = 10.0

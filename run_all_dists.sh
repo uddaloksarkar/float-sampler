@@ -23,49 +23,49 @@ JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 1)"
 # just the terse "FPTaylor ... failed; see <path>.out" a case falls back
 # to on error. Drop to "-v" once things are passing again; -vv is very
 # noisy on a run with many (n, p)/lambda points.
-VERBOSITY="-vv"                   # "-v", "-vv", or "" for none
+VERBOSITY="-v"                   # "-v", "-vv", or "" for none
 
 COMMON_ARGS=(--fp "$FP")
 [ -n "$VERBOSITY" ] && COMMON_ARGS+=("$VERBOSITY")
 
-# # Print a banner before each call and check its own exit code: main.py's
-# # per-item try/except (see dist_*.py run()) means a failed (n, p)/lambda
-# # point is reported as a "WARNING: skipping ..." line and does NOT make
-# # main.py exit non-zero, so under `set -e` the script would otherwise run
-# # straight through a run where every single point failed. run_one below
-# # makes that failure visible immediately instead of only in scrollback.
-# run_one() {
-#     echo "=== running: $* ==="
-#     local status=0
-#     "$@" || status=$?
-#     if [ "$status" -ne 0 ]; then
-#         echo "!!! command failed (exit $status): $*" >&2
-#     fi
-# }
+# Print a banner before each call and check its own exit code: main.py's
+# per-item try/except (see dist_*.py run()) means a failed (n, p)/lambda
+# point is reported as a "WARNING: skipping ..." line and does NOT make
+# main.py exit non-zero, so under `set -e` the script would otherwise run
+# straight through a run where every single point failed. run_one below
+# makes that failure visible immediately instead of only in scrollback.
+run_one() {
+    echo "=== running: $* ==="
+    local status=0
+    "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "!!! command failed (exit $status): $*" >&2
+    fi
+}
 
-# # # # ---- binomial (BTRS) -------------------------------------------------------
-# run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
-#   --n 10900 --p 0.1 --jobs "$JOBS"
+# # # ---- binomial (BTRS) -------------------------------------------------------
+run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
+  --n 10900 --p 0.1 --jobs "$JOBS"
 
-# run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
-#   --n 1000000 --p 0.0001 --jobs "$JOBS"
+run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
+  --n 1000000 --p 0.0001 --jobs "$JOBS"
 
-# # ---- poisson (PTRS) --------------------------------------------------------
-# run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
+# ---- poisson (PTRS) --------------------------------------------------------
+run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
 
-# run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
+run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
 
 # ---- poisson-stable (PTRS, cancellation-avoiding templates) ----------------
 python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e5
 
 python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e8
 
-# # ---- hypergeometric (HRUA) -------------------------------------------------
-# run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30
+# ---- hypergeometric (HRUA) -------------------------------------------------
+run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30
 
-# run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 10000 --K 4000 --n 300
+run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 10000 --K 4000 --n 300
 
-# # ---- zipf ------------------------------------------------------------------
-# # Not yet covered by fptaylor_settings.toml / sweep_fptaylor.py -- runs on
-# # dist_common's hardcoded defaults (approx=true, bb_eval=false).
-# run_one python3 main.py "${COMMON_ARGS[@]}" zipf --s 2.5
+# ---- zipf ------------------------------------------------------------------
+# Not yet covered by fptaylor_settings.toml / sweep_fptaylor.py -- runs on
+# dist_common's hardcoded defaults (approx=true, bb_eval=false).
+run_one python3 main.py "${COMMON_ARGS[@]}" zipf --s 2.5
