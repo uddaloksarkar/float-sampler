@@ -56,9 +56,9 @@ run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
 run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
 
 # ---- poisson-stable (PTRS, cancellation-avoiding templates) ----------------
-python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e5
+run_one python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e5
 
-python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e8
+run_one python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e8
 
 # ---- hypergeometric (HRUA) -------------------------------------------------
 run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30

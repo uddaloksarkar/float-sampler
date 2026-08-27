@@ -607,41 +607,15 @@ def hormann_u_at(a, b, c, y):
     return -(0.5 - us_root(a, b, c - y))
 
 
-def hormann_k_defs(sign, setup_lines, c_expr):
-    """
-    k = floor(y) for one sign of u, as exact (unrounded) Definitions, shared
-    by BTRS and PTRS.  setup_lines must define ax_, bx_ (and whatever they
-    need) without rounding; c_expr is the exact shift.
-
-    Two things are going on here.  k is written as y - f with f in [0, 1],
-    which encodes floor exactly and keeps k tied to u instead of letting it
-    roam over its window independently.  And y is rearranged: with
-    u = s*(0.5 - us),
-
-        (2*a/us + b)*u + c  =  s*(a/us - 2*a + 0.5*b - b*us) + c
-
-    the same real number, but one that bounds tightly under interval
-    arithmetic -- in the C form u and us = 0.5 - |u| appear as separate
-    factors, so FPTaylor's conservative range for it spans zero and 1/(k+1)
-    trips its division-by-zero check.
-
-    Everything here is unrounded, and deliberately uses its own exact copies
-    of the setup constants rather than the rounded ones the acceptance
-    expression uses: k is one integer, computed once, and *both* samplers
-    feed the same integer into the acceptance test.  Letting the rounding of
-    us reach k instead propagates it with derivative a/us^2 ~ 1e6 into
-    loggam(k+1), inflating eps_accept by three orders of magnitude and
-    double-counting the floor disagreement eps_floor already bounds.
-    """
-    s = f"{float(sign):+.1f}"
-    return list(setup_lines) + [
-        f"  usx_   = 0.5 - abs(u),",
-        f"  ys_    = {s} * (ax_ / usx_ - 2.0 * ax_ + 0.5 * bx_"
-        f" - bx_ * usx_),",
-        f"  yk_    = ys_ + {c_expr},",
-        f"  k_     = yk_ - f,",
-        f"  k1_    = k_ + 1.0,",
-    ]
+# hormann_k_defs (k tied to u via a sign-dependent floor encoding) used to
+# live here, shared by BTRS and PTRS.  Both now declare k directly as its
+# own Variable instead (dist_binomial.make_btrs_accept_template,
+# dist_poisson.make_ptrs_accept_template) -- k and u are only jointly
+# reachable through the sampler's *exact* floor relationship, and eps_floor
+# already bounds any disagreement about which k a given u floors to, so
+# re-deriving k from u inside the accept query just double-counted that and
+# propagated u's own error through a derivative-large map into loggam(k+1).
+# Removed once dist_binomial.btrs_k_defs (its last caller) did the same.
 
 # Legacy coefficients used only by the interval_error helper below. The
 # FPTaylor templates for the current rejection-sampler analysis use native

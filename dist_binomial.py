@@ -15,7 +15,7 @@ from dist_common import (
     loggam_defs, eps_logv, eps_logus, ulp_rnd_op,
     vprint,
     fptaylor_cmd,
-    us_root, hormann_u_at, hormann_k_defs,
+    us_root, hormann_u_at,
     point_ivar,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
     hormann_proposal_deviation, acceptance_tv,
@@ -105,8 +105,13 @@ def y_window(k_lo, k_hi, slack=_K_SLACK):
 
 
 def shell_u(u_lo, u_hi, y_lo, y_hi):
-    """Split [u_lo, u_hi] at u=0 (us=0.5-|u| isn't 1:1 across it, and
-    btrs_k_defs needs the sign); y_lo/y_hi only for the error message."""
+    """Split [u_lo, u_hi] at u=0.  Only box_u_shells (interval-parameter
+    accept) still needs this: point-mode floor and accept both run u over
+    its full signed range in one query now (us_ = 0.5-abs(u) needs no
+    sign split by itself -- see _btrs_floor_boxes/make_btrs_accept_template),
+    but box mode's accept still pairs each k-partition with the u window
+    mapping into it, and that window can straddle zero.  y_lo/y_hi only
+    for the error message."""
     if u_lo > u_hi:
         raise ValueError(f"empty u window for y in [{y_lo:.6g}, {y_hi:.6g}]")
     shells = []
@@ -134,17 +139,6 @@ def clip_u_trunc(u_lo, u_hi, u_trunc):
     return u_lo, u_hi, excess
 
 
-def u_shells(n, p, y_lo, y_hi, consts=None, u_trunc=0.0):
-    """shell_u at a literal (n, p); y is increasing in u, so it inverts.
-    Returns (shells, excess); see clip_u_trunc."""
-    consts = consts or btrs_consts(n, p)
-    u_lo, u_hi, excess = clip_u_trunc(
-        btrs_u_at(n, p, y_lo, consts), btrs_u_at(n, p, y_hi, consts), u_trunc)
-    if u_lo > u_hi:
-        return [], excess
-    return shell_u(u_lo, u_hi, y_lo, y_hi), excess
-
-
 def btrs_setup_defs(rnd, n_expr, p_expr, accept=False):
     """btrs.c's setup block [lines 48-51, 72-76] as FPTaylor Definitions --
     kept as expressions (not free inputs) so their own rounding is charged
@@ -157,17 +151,6 @@ def btrs_setup_defs(rnd, n_expr, p_expr, accept=False):
         d += [f"  alpha_ {rnd}= (2.83 + 5.1 / b_) * spq_,",
               f"  lpq_   {ulp_rnd_op(rnd, 'log')}= log({p_expr} / (1.0 - {p_expr})),"]
     return d
-
-
-def btrs_k_defs(sign, n_expr, p_expr):
-    """k = floor(y) for one sign of u (see dist_common.hormann_k_defs)."""
-    return hormann_k_defs(
-        sign,
-        [f"  spqx_  = sqrt({n_expr} * {p_expr} * (1.0 - {p_expr})),",
-         f"  bx_    = 1.15 + 2.53 * spqx_,",
-         f"  ax_    = -0.0873 + 0.0248 * bx_ + 0.01 * {p_expr},",
-         f"  cx_    = {n_expr} * {p_expr} + 0.5,"],
-        "cx_")
 
 
 def _ivar(name, lo, hi, kind="real"):
@@ -530,27 +513,24 @@ def _shell_label(sign, u_lo, u_hi):
     return f"u{'<' if sign < 0 else '>'}0 us in [{us_lo:.3e}, {us_hi:.3e}]"
 
 
-def _shell_stem(prefix, fp, tag, index, sign):
-    return f"{prefix}_{fp}_{tag}_{'m' if sign < 0 else 'p'}{index:02d}"
-
-
-def _floor_shell_boxes(shells, fp, tag, template_fn):
-    """(label, stem, template) triples, one per u=0 side, from `shells`;
-    template_fn(u_lo, u_hi) builds the query text for one side."""
-    return [(f"floor {_shell_label(sign, u_lo, u_hi)}",
-            _shell_stem("binomial_btrs_floor", fp, tag, i, sign),
-            template_fn(u_lo, u_hi))
-            for i, (sign, u_lo, u_hi) in enumerate(shells)]
-
-
 def _btrs_floor_boxes(n, p, fp, tag, consts, u_trunc=0.0):
-    """One box per side of u=0 covering every k in [0, n] [btrs.c:62-64];
-    --u-trunc clips each outer edge (clip_u_trunc). Returns (boxes, excess)."""
+    """One box covering the floor expression for every k in [0, n]
+    [btrs.c:62-64].  u ranges over its full signed domain in a single
+    query: y_ = (2*a/us+b)*u+c and us_ = 0.5-abs(u) are both well-defined,
+    smooth functions of u across u=0 (make_btrs_floor_template), with no
+    dependence on u's sign -- unlike the old k derivation this template no
+    longer uses (see make_btrs_accept_template), nothing here needs
+    splitting at zero.  --u-trunc clips each outer edge (clip_u_trunc).
+    Returns (boxes, excess)."""
     y_lo, y_hi = y_window(0.0, float(n))
-    shells, excess = u_shells(n, p, y_lo, y_hi, consts, u_trunc)
-    boxes = _floor_shell_boxes(
-        shells, fp, tag,
-        lambda u_lo, u_hi: make_btrs_floor_template(n, p, fp, u_lo, u_hi))
+    u_lo, u_hi, excess = clip_u_trunc(
+        btrs_u_at(n, p, y_lo, consts), btrs_u_at(n, p, y_hi, consts), u_trunc)
+    if u_lo > u_hi:
+        return [], excess
+    us_lo, us_hi = 0.5 - max(abs(u_lo), abs(u_hi)), 0.5 - min(abs(u_lo), abs(u_hi))
+    boxes = [(f"floor us in [{us_lo:.3e}, {us_hi:.3e}]",
+             f"binomial_btrs_floor_{fp}_{tag}_main",
+             make_btrs_floor_template(n, p, fp, u_lo, u_hi))]
     return boxes, excess
 
 
@@ -695,11 +675,21 @@ def _btrs_sub_box_boxes(n_iv, p_iv, fp, tag, fast, u_trunc=0.0):
     accept_boxes = []
     accept_excess = 0.0
 
-    floor_shells, floor_excess = box_u_shells(consts, *y_window(0.0, n_hi), u_trunc)
-    floor_boxes = _floor_shell_boxes(
-        floor_shells, fp, f"{tag}_{sub}",
-        lambda u_lo, u_hi: make_btrs_floor_box_template(
-            {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv}, fp))
+    # floor runs u over its full signed range in one box, same as the
+    # point-mode sweep (_btrs_floor_boxes): us_ = 0.5-abs(u) needs no sign
+    # split by itself.
+    y_lo, y_hi = y_window(0.0, n_hi)
+    u_lo, u_hi, floor_excess = clip_u_trunc(
+        box_u_at(consts, y_lo)[0], box_u_at(consts, y_hi)[1], u_trunc)
+    if u_lo > u_hi:
+        floor_boxes = []
+    else:
+        us_lo = 0.5 - max(abs(u_lo), abs(u_hi))
+        us_hi = 0.5 - min(abs(u_lo), abs(u_hi))
+        floor_boxes = [(f"floor us in [{us_lo:.3e}, {us_hi:.3e}]",
+                        f"binomial_btrs_floor_{fp}_{tag}_{sub}_main",
+                        make_btrs_floor_box_template(
+                            {"u": (u_lo, u_hi), "n": n_iv, "p": p_iv}, fp))]
 
     low, high = btrs_box_k_shells(n_iv, p_iv)
     for is_low, x_shells in ((True, low), (False, high)):
