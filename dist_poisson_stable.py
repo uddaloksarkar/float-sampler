@@ -66,10 +66,12 @@ from pathlib import Path
 
 from analyticError import FP_BETA, SWITCH, computeDeltaHighRange, computeDeltaLowRange
 from dist_common import (
-    ROOT, FP_TO_FPTAYLOR_RND, run_command, extract_abs_errors_by_problem,
-    save_loglog_plot, run_fptaylor_query, ulp_rnd_op,
+    ROOT, FP_TO_FPTAYLOR_RND,
+    extract_abs_errors_by_problem,
+    eps_logv, run_fptaylor_query,
+    ulp_rnd_op,
     hormann_proposal_deviation, acceptance_tv,
-    elapsed_since, format_seconds,
+    vprint, elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
 )
 import dist_poisson as base
@@ -101,11 +103,11 @@ SERR = [1 / 12.0, -1 / 360.0, 1 / 1260.0, -1 / 1680.0, 1 / 1188.0, -691 / 360360
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Stable PTRS FPTaylor templates  (lambda >= SWITCH)
 # ---------------------------------------------------------------------------
 
-def ptrs_params(lam):
-    """a, b, invalpha exactly as random_poisson_ptrs_stable.c computes them."""
+def ptrs_consts(lam):
+    """(a, b, invalpha) exactly as random_poisson_ptrs_stable.c computes them."""
     b = 0.931 + 2.53 * math.sqrt(lam)
     a = -0.059 + 0.02483 * b
     return a, b, 1.1239 + 1.1328 / (b - 3.4)
@@ -118,9 +120,9 @@ def _const_err(computed, exact):
     return float(abs(Fraction(computed) - exact))
 
 
-def floor_constants(lam):
+def ptrs_floor_consts(lam):
     """(m, A2, c0, const_err) for  t = s*(a/us + A2 - b*us) + c0,  k = m + floor(t)."""
-    a, b, _ = ptrs_params(lam)
+    a, b, _ = ptrs_consts(lam)
     m = math.floor(lam)
     frac = lam - m                       # exact (Sterbenz, lam >= 1)
     A2 = 0.5 * b - 2.0 * a
@@ -130,9 +132,50 @@ def floor_constants(lam):
     return m, A2, c0, err
 
 
-# ---------------------------------------------------------------------------
-# FPTaylor templates
-# ---------------------------------------------------------------------------
+def ptrs_accept_partition(lam, u_trunc):
+    """[(k_lo, k_hi, mode)] over k >= STIRLERR_KMIN, series only where
+    |v| <= VSPLIT.  Integer k below STIRLERR_KMIN are handled point-wise.
+
+    The k window itself (dist_poisson.ptrs_accept_k_range) is the same real
+    quantity here as in dist_poisson.py: y = (2*a/us + b)*u + c is the same
+    number whether evaluated in that form or in this module's
+    cancellation-avoiding us-only form, so k_lo/k_hi carry over unchanged.
+    """
+    lo, hi = base.ptrs_accept_k_range(lam, u_trunc)
+    lo = max(lo, STIRLERR_KMIN)
+    if lo >= hi:
+        return []
+    r = (1.0 + VSPLIT) / (1.0 - VSPLIT)          # |v| <= VSPLIT  <=>  k/lam in [1/r, r]
+    n_lo, n_hi = lam / r, lam * r
+    parts = []
+    if lo < min(hi, n_lo):
+        parts.append((float(lo), float(min(hi, n_lo)), "direct"))
+    if max(lo, n_lo) < min(hi, n_hi):
+        parts.append((float(max(lo, n_lo)), float(min(hi, n_hi)), "series"))
+    if max(lo, n_hi) < hi:
+        parts.append((float(max(lo, n_hi)), float(hi), "direct"))
+    return parts
+
+
+def ptrs_method_error(lam, k_lo, k_hi, mode):
+    """Bound on |value the template encodes in exact arithmetic - log p(k)|.
+
+    FPTaylor bounds rounding of the written expression; it cannot see that the
+    expression is itself an approximation.  Two sources:
+      * the atanh tail beyond NSERIES terms;
+      * the series coefficients are stored as doubles, so the encoded real
+        expression uses fl(1/(2j+1)) and fl(S_j).  Both series have the sign
+        pattern needed for a term-wise relative bound of EPS.
+    """
+    err = STIRLERR_SERIES_TRUNC + EPS * abs(SERR[0]) / k_lo
+    if mode == "series":
+        v = max(abs((k - lam) / (k + lam)) for k in (k_lo, k_hi))
+        J = NSERIES + 1
+        tail = 2 * k_hi * v ** (2 * J + 1) / ((2 * J + 1) * (1 - v * v))
+        head = 2 * k_hi * v ** 3 / 3.0 / (1 - v * v)
+        err += tail + EPS * head
+    return err
+
 
 def _horner(prefix, coeffs, xvar, rnd):
     """h0 = (..((c_n*x + c_{n-1})*x + ..)*x + c_0.  Returns (lines, name)."""
@@ -143,13 +186,13 @@ def _horner(prefix, coeffs, xvar, rnd):
     return lines, f"{prefix}0"
 
 
-def make_floor_template(lam, fp, utail, sign):
+def make_ptrs_floor_template(lam, fp, utail, sign):
     """Absolute error of  t = s*(a/us + A2 - b*us) + c0,  us in [utail, 1/2].
 
     us is the primitive draw and is exactly representable, hence float64.
     """
-    a, b, _ = ptrs_params(lam)
-    _, A2, c0, _ = floor_constants(lam)
+    a, b, _ = ptrs_consts(lam)
+    _, A2, c0, _ = ptrs_floor_consts(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     core = "(a_ / us + A2_) - b_ * us"
     body = f"({core}) + c0_" if sign > 0 else f"c0_ - ({core})"
@@ -179,7 +222,7 @@ def _accept_tail(rnd):
             f"  log_us_  {log_rnd}= log(us),"]
 
 
-def make_accept_template(lam, fp, utail, k_lo, k_hi, mode):
+def make_ptrs_accept_template(lam, fp, utail, k_lo, k_hi, mode):
     """Absolute error of
 
         C - bd0(k, lam) - stirlerr(k) - 0.5*log(k) + log(a + b*us^2) - 2*log(us)
@@ -188,7 +231,7 @@ def make_accept_template(lam, fp, utail, k_lo, k_hi, mode):
     mode 'series' uses the atanh expansion of bd0, 'direct' uses
     k*log(k/lam) - k + lam.  Requires k_lo >= STIRLERR_KMIN.
     """
-    a, b, invalpha = ptrs_params(lam)
+    a, b, invalpha = ptrs_consts(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     log_rnd = ulp_rnd_op(rnd, "log")
     C = -math.log(invalpha) - LS2PI
@@ -225,11 +268,11 @@ def make_accept_template(lam, fp, utail, k_lo, k_hi, mode):
             "Expressions\n  eps_accept = acc_;\n")
 
 
-def make_accept_point_template(lam, fp, utail, k):
+def make_ptrs_accept_point_template(lam, fp, utail, k):
     """Accept expression for one integer k < STIRLERR_KMIN, where stirlerr
     comes from the exact table rather than the series.  k is a literal, so us
     is the only variable.  k = 0 uses log p(0) = -lam exactly."""
-    a, b, invalpha = ptrs_params(lam)
+    a, b, invalpha = ptrs_consts(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     log_rnd = ulp_rnd_op(rnd, "log")
     d = [f"  a_    = {a:.20e},",
@@ -259,150 +302,78 @@ def make_accept_point_template(lam, fp, utail, k):
             "Expressions\n  eps_accept = acc_;\n")
 
 
-def make_logv_template(fp, vtail):
-    """-log(v) with v exact.  Compare dist_common.make_logv_template, which
-    declares v `real`: that costs 8.67e-9 instead of 5.68e-14."""
-    rnd = FP_TO_FPTAYLOR_RND[fp]
-    return ("Variables\n"
-            f"  float64 v in [{vtail:.20e}, 1.0];\n\n"
-            "Definitions\n"
-            f"  logv_step {ulp_rnd_op(rnd, 'log')}= - log(v);\n\n"
-            "Expressions\n  eps_logv = logv_step;\n")
-
-
-# ---------------------------------------------------------------------------
-# k partition and non-FPTaylor (method) error
-# ---------------------------------------------------------------------------
-
-def accept_partition(lam, u_trunc):
-    """[(k_lo, k_hi, mode)] over k >= STIRLERR_KMIN, series only where
-    |v| <= VSPLIT.  Integer k below STIRLERR_KMIN are handled point-wise.
-
-    The k window itself (dist_poisson.ptrs_accept_k_range) is the same real
-    quantity here as in dist_poisson.py: y = (2*a/us + b)*u + c is the same
-    number whether evaluated in that form or in this module's
-    cancellation-avoiding us-only form, so k_lo/k_hi carry over unchanged.
-    """
-    lo, hi = base.ptrs_accept_k_range(lam, u_trunc)
-    lo = max(lo, STIRLERR_KMIN)
-    if lo >= hi:
-        return []
-    r = (1.0 + VSPLIT) / (1.0 - VSPLIT)          # |v| <= VSPLIT  <=>  k/lam in [1/r, r]
-    n_lo, n_hi = lam / r, lam * r
-    parts = []
-    if lo < min(hi, n_lo):
-        parts.append((float(lo), float(min(hi, n_lo)), "direct"))
-    if max(lo, n_lo) < min(hi, n_hi):
-        parts.append((float(max(lo, n_lo)), float(min(hi, n_hi)), "series"))
-    if max(lo, n_hi) < hi:
-        parts.append((float(max(lo, n_hi)), float(hi), "direct"))
-    return parts
-
-
-def method_error(lam, k_lo, k_hi, mode):
-    """Bound on |value the template encodes in exact arithmetic - log p(k)|.
-
-    FPTaylor bounds rounding of the written expression; it cannot see that the
-    expression is itself an approximation.  Two sources:
-      * the atanh tail beyond NSERIES terms;
-      * the series coefficients are stored as doubles, so the encoded real
-        expression uses fl(1/(2j+1)) and fl(S_j).  Both series have the sign
-        pattern needed for a term-wise relative bound of EPS.
-    """
-    err = STIRLERR_SERIES_TRUNC + EPS * abs(SERR[0]) / k_lo
-    if mode == "series":
-        v = max(abs((k - lam) / (k + lam)) for k in (k_lo, k_hi))
-        J = NSERIES + 1
-        tail = 2 * k_hi * v ** (2 * J + 1) / ((2 * J + 1) * (1 - v * v))
-        head = 2 * k_hi * v ** 3 / 3.0 / (1 - v * v)
-        err += tail + EPS * head
-    return err
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
-def _fpt(fptaylor, name, text, problem, inputs_dir, outputs_dir, env, verbose,
-        label, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx):
-    in_path = inputs_dir / f"{name}.txt"
-    out_path = outputs_dir / f"{name}.out"
-    in_path.write_text(text)
-    code, output = run_fptaylor_query(fptaylor, in_path, outputs_dir, env,
-                                      ratio_tol, bb_eval, x_abs_tol,
-                                      x_abs_tol_vars, approx)
-    out_path.write_text(output)
-    if verbose >= 2:
-        print(f"--- FPTaylor {label} ---\n{output}")
-    if code != 0:
-        raise RuntimeError(f"FPTaylor {label} failed; see {out_path}")
-    return extract_abs_errors_by_problem(output)[problem]
-
-
-_LOGV_CACHE = {}
-
-
-def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
-            ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx):
-    key = (fp, vtail, ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
-    if key not in _LOGV_CACHE:
-        _LOGV_CACHE[key] = _fpt(
-            fptaylor, f"stable_logv_{fp}", make_logv_template(fp, vtail),
-            "eps_logv", inputs_dir, outputs_dir, env, verbose, "log(v)",
-            ratio_tol, bb_eval, x_abs_tol, x_abs_tol_vars, approx)
-    return _LOGV_CACHE[key]
-
-
-def run_ptrs_stable(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
+def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     """(eps_floor, eps_accept, tv) for the stable PTRS formulation; composes
     the same bound as dist_poisson._run_ptrs_fptaylor (Hormann deviation on
     eps_floor, u_trunc/v_trunc flat TV charges, acceptance_tv on eps_accept)
-    over this module's cancellation-avoiding templates."""
+    over this module's cancellation-avoiding templates.  Unlike
+    dist_poisson's single floor/accept pair, each side here is a max over
+    several queries (the two signs of U for floor; the k partition plus the
+    small-k point queries for accept)."""
     fp, verbose = args.fp, args.verbose
+    v_trunc = args.v_trunc
     ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
     x_abs_tol, approx = args.opt_x_abs_tol, args.approx
-    u_trunc, v_trunc = args.u_trunc, args.v_trunc
-    if u_trunc is None or not (0.0 < u_trunc < 0.5):
-        raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
+    u_trunc = args.u_trunc
     floor_tol_vars = floor_x_abs_tol_vars(args)
     accept_tol_vars = accept_x_abs_tol_vars(args)
-    a, b, invalpha = ptrs_params(lam)
+    if u_trunc is None or not (0.0 < u_trunc < 0.5):
+        raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
+    a, b, invalpha = ptrs_consts(lam)
+    m, A2, c0, c_err = ptrs_floor_consts(lam)
+
+    # k window shared with dist_poisson (see ptrs_accept_partition); k=0 is
+    # outside it (dist_poisson.ptrs_accept_k_range clamps k_lo to 1).
+    k_lo, k_hi = base.ptrs_accept_k_range(lam, u_trunc)
+    parts = ptrs_accept_partition(lam, u_trunc)
+    point_ks = range(int(k_lo), min(int(k_hi), STIRLERR_KMIN - 1) + 1)
+    vprint(verbose, f"poisson-stable PTRS lambda={lam}",
+           a=a, b=b, invalpha=invalpha, m=m, A2=A2, c0=c0, c_err=c_err,
+           k_lo=k_lo, k_hi=k_hi, partitions=len(parts), point_ks=len(point_ks),
+           v_trunc=v_trunc, u_trunc=u_trunc)
+
+    def query(stem, text, problem, label, tol_vars):
+        in_path  = inputs_dir  / f"{stem}.txt"
+        out_path = outputs_dir / f"{stem}.out"
+        in_path.write_text(text)
+        code, output = run_fptaylor_query(fptaylor, in_path, outputs_dir, env,
+                                           ratio_tol, bb_eval, x_abs_tol,
+                                           tol_vars, approx)
+        out_path.write_text(output)
+        if verbose >= 2:
+            print(f"--- FPTaylor PTRS-stable {label} (lambda={lam}) ---\n{output}")
+        if code != 0:
+            raise RuntimeError(f"FPTaylor PTRS-stable {label} failed for "
+                               f"lambda={lam}; see {out_path}")
+        return extract_abs_errors_by_problem(output)[problem]
 
     # ---- floor: max over the two signs of U ----
-    _, _, _, c_err = floor_constants(lam)
     floor_raw = max(
-        _fpt(fptaylor, f"stable_floor_{fp}_{tag}_{'p' if s > 0 else 'm'}",
-             make_floor_template(lam, fp, u_trunc, s), "eps_floor",
-             inputs_dir, outputs_dir, env, verbose,
-             f"floor s={s:+d} (lambda={lam})",
-             ratio_tol, bb_eval, x_abs_tol, floor_tol_vars, approx)
+        query(f"poisson_stable_ptrs_floor_{fp}_{tag}_{'p' if s > 0 else 'm'}",
+              make_ptrs_floor_template(lam, fp, u_trunc, s), "eps_floor",
+              f"floor s={s:+d}", floor_tol_vars)
         for s in (+1, -1))
     eps_floor = hormann_proposal_deviation(floor_raw + c_err, a, b)
 
     # ---- accept: max over the k partition, plus the small-k point queries ----
     acc = 0.0
-    for (k_lo, k_hi, mode) in accept_partition(lam, u_trunc):
-        e = _fpt(fptaylor, f"stable_accept_{fp}_{tag}_{mode}_{int(k_lo)}",
-                 make_accept_template(lam, fp, u_trunc, k_lo, k_hi, mode),
-                 "eps_accept", inputs_dir, outputs_dir, env, verbose,
-                 f"accept {mode} k in [{k_lo:.0f},{k_hi:.0f}] (lambda={lam})",
-                 ratio_tol, bb_eval, x_abs_tol, accept_tol_vars, approx)
-        acc = max(acc, e + method_error(lam, k_lo, k_hi, mode))
-
-    # k=0 is outside this window (dist_poisson.ptrs_accept_k_range clamps
-    # k_lo to 1: k1_ = k + 1 must stay > 0), same as dist_poisson.py.
-    lo, hi = base.ptrs_accept_k_range(lam, u_trunc)
-    for k in range(int(lo), min(int(hi), STIRLERR_KMIN - 1) + 1):
-        e = _fpt(fptaylor, f"stable_accept_{fp}_{tag}_k{k}",
-                 make_accept_point_template(lam, fp, u_trunc, k), "eps_accept",
-                 inputs_dir, outputs_dir, env, verbose,
-                 f"accept k={k} (lambda={lam})",
-                 ratio_tol, bb_eval, x_abs_tol, accept_tol_vars, approx)
+    for (part_lo, part_hi, mode) in parts:
+        e = query(f"poisson_stable_ptrs_accept_{fp}_{tag}_{mode}_{int(part_lo)}",
+                  make_ptrs_accept_template(lam, fp, u_trunc, part_lo, part_hi, mode),
+                  "eps_accept", f"accept {mode} k in [{part_lo:.0f},{part_hi:.0f}]",
+                  accept_tol_vars)
+        acc = max(acc, e + ptrs_method_error(lam, part_lo, part_hi, mode))
+    for k in point_ks:
+        e = query(f"poisson_stable_ptrs_accept_{fp}_{tag}_k{k}",
+                  make_ptrs_accept_point_template(lam, fp, u_trunc, k),
+                  "eps_accept", f"accept k={k}", accept_tol_vars)
         acc = max(acc, e)          # table stirlerr and exact log p(0): no method error
 
-    eps_accept = acc + eps_logv(fptaylor, fp, v_trunc, inputs_dir, outputs_dir,
-                                env, verbose, ratio_tol, bb_eval, x_abs_tol,
-                                accept_tol_vars, approx)
+    logv, _ = eps_logv(
+        fptaylor, fp, v_trunc, inputs_dir, outputs_dir, env, verbose, ratio_tol,
+        bb_eval, x_abs_tol, accept_tol_vars, approx=approx,
+    )
+    eps_accept = acc + logv
 
     tv = (2.0 * u_trunc + v_trunc + 2.0 * invalpha * eps_floor
           + acceptance_tv(eps_accept))
@@ -439,44 +410,30 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
         lam_float = float(lam)
         tag = base.safe_lambda_name(lam)
         try:
+            row = base._empty_row(lam, args.fp)
+
             # ---- low range: unchanged, delegated to dist_poisson ----
             if lam_float < SWITCH:
-                lr_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
-                lr_input.write_text(
-                    base._make_log_low_range_template(lam, args.fp) if args.use_log
-                    else base._make_low_range_template(lam, args.fp))
-
-                code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
-                out_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
-                out_path.write_text(output)
-                if args.verbose >= 2:
-                    print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
-                if code != 0:
-                    raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {out_path}")
-
-                errs = extract_abs_errors_by_problem(output)
-                if args.use_log:
-                    _, low_tv = base._compute_log_low_range_delta(
-                        errs["lambda_fp_compute"], errs["log_prod_compute"])
-                else:
-                    _, _, low_tv = base._compute_low_range_delta(
-                        lam_float, errs["L_compute"], errs["prod_compute"])
-
+                tv = base._run_low_range_fptaylor(
+                    fptaylor, lam, args, tag, inputs_dir, outputs_dir, env)
                 ref_tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
-                row = base._empty_row(lam, args.fp)
-                row.update({"regime": "low", "tv": f"{low_tv:.17e}", "ref_tv": f"{ref_tv:.17e}"})
-                row["time_s"] = f"{elapsed_since(start):.6f}"
+
+                row.update({
+                    "regime": "low",
+                    "tv": f"{tv:.17e}",
+                    "ref_tv": f"{ref_tv:.17e}",
+                    "time_s": f"{elapsed_since(start):.6f}",
+                })
                 rows.append(row)
-                print(f"lambda={lam} [low] TV={row['tv']} ref_TV={row['ref_tv']}"
+                print(f"lambda={lam} [low] TV={tv:.6e} ref_TV={ref_tv:.6e}"
                       f" time={format_seconds(float(row['time_s']))}")
                 continue
 
             # ---- high range (stable PTRS) ----
-            eps_floor, eps_accept, tv = run_ptrs_stable(
+            eps_floor, eps_accept, tv = _run_ptrs_fptaylor(
                 fptaylor, lam_float, args, tag, inputs_dir, outputs_dir, env)
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 
-            row = base._empty_row(lam, args.fp)
             row.update({
                 "regime": "ptrs-stable",
                 "eps_floor": f"{eps_floor:.17e}",

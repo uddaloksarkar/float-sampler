@@ -404,8 +404,7 @@ def add_common_args(parser):
                         help="Use FPTaylor's interpreted --opt bb-eval "
                              "backend instead of the default compiling "
                              "--opt bb --bb-split midpoint. No compile "
-                             "step, so queries can run concurrently (see "
-                             "--jobs) and there is no risk of the bb compile "
+                             "step, so there is no risk of the bb compile "
                              "race, but bb-eval ignores --bb-split / "
                              "--bb-geometric-ratio-tol entirely -- pair with "
                              "--opt-x-abs-tol to control precision instead. "
@@ -864,8 +863,8 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
     working directory regardless of --tmp-base-dir, so concurrent bb queries
     race and clobber each other's compiled program (observed as hung
     processes, and in principle a bound reported for the wrong expression).
-    Callers MUST run these serially (max_workers=1) when bb_eval=False; see
-    dist_binomial._fptaylor_max.  `bb` has also been observed to emit OCaml
+    Callers MUST run these serially when bb_eval=False (every dist_*.py
+    currently does: one query at a time).  `bb` has also been observed to emit OCaml
     that does not parse ("Syntax error" on a line of 81 closing parentheses)
     on some deeply-nested box-mode templates, after which FPTaylor dies with
     Not_found -- if that happens on a particular query, that query's template
@@ -929,12 +928,11 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
 def run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
                        bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
                        approx=True):
-    """Run one FPTaylor query (a single input file, not a box list -- see
-    dist_binomial._fptaylor_max for the box-list/max-reduction case) and
-    return (code, output). Shared by PTRS and HRUA, which (unlike BTRS)
-    never run more than one query per call site, so there is no compile
-    race (dist_common.fptaylor_cmd) to guard against here even with the
-    default --opt bb backend."""
+    """Run one FPTaylor query (a single input file) and return (code,
+    output). Shared by every rejection-sampler analysis (PTRS, BTRS, HRUA,
+    zipf), all of which run their queries one at a time, so there is no
+    compile race (dist_common.fptaylor_cmd) to guard against here even with
+    the default --opt bb backend."""
     work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
     try:
         return run_command(
@@ -997,8 +995,8 @@ def make_logv_template(fp, v_lo, v_hi=1.0):
     -log then amplifies by 1/v.  At v = 2^-53 that is a factor of 2^53, so the
     bound collapses to ~1/2 (FPTaylor reports total2 = 0.5, absolute error
     0.508): vacuous.  With the float declaration the same query returns
-    3.6e-15 over the full [2^-53, 1].  dist_poisson_stable.make_logv_template
-    reached the same conclusion independently.
+    3.6e-15 over the full [2^-53, 1].  dist_poisson_stable (which now uses
+    this template too) reached the same conclusion independently.
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (

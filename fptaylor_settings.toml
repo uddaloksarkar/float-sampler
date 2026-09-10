@@ -89,7 +89,7 @@ accept_opt_x_abs_tol_vars = "u=0.1"
 # Same distribution as [poisson], different (cancellation-avoiding)
 # templates -- approx/bb_eval inherited from [poisson] rather than
 # independently swept. u_trunc drives dist_poisson.ptrs_accept_k_range
-# (dist_poisson_stable.run_ptrs_stable), same role as [poisson]'s.
+# (dist_poisson_stable._run_ptrs_fptaylor), same role as [poisson]'s.
 # v_trunc must stay a normal-sized double like [poisson]'s, even though v
 # is exact here and the bound itself stays tight far below this (see
 # dist_poisson_stable.py's module docstring, point 1): FPTaylor's compiled
@@ -122,5 +122,5 @@ u_trunc = 1e-8
 switch = 0.3333333333333333  # p threshold: inversion below, search above (dist_geometric._SWITCH)
 # opt_x_abs_tol_vars (W's tolerance) is intentionally NOT set here: W's
 # range scales with N, so a fixed constant would be a no-op for small N and
-# far too tight for extreme N. dist_hypergeometric.run() auto-derives
+# far too tight for extreme N. dist_hypergeometric._run_hrua_fptaylor() auto-derives
 # "W=<10*N>" per case when this isn't overridden -- see the comment there.

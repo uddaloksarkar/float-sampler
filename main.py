@@ -3,13 +3,12 @@
 Main entry point for FP-error analysis of discrete-distribution samplers.
 
 Usage:
-  python main.py poisson   lambdas.txt  [common opts]
-  python main.py binomial  pairs.txt    [common opts]
-  python main.py binomial  --n-range 900 1100 --p-range 0.09 0.11   # one bound
-                                                                   # for the box
-  python main.py geometric params.txt   [common opts]   # stub
-  python main.py hypergeometric ...     [common opts]   # stub
-  python main.py zipf ...               [common opts]   # stub
+  python main.py poisson        lambdas.txt | --lam L          [common opts]
+  python main.py poisson-stable lambdas.txt | --lam L          [common opts]
+  python main.py binomial       pairs.txt   | --n N --p P      [common opts]
+  python main.py geometric      ps.txt      | --p P            [common opts]
+  python main.py hypergeometric triples.txt | --N N --K K --n n [common opts]
+  python main.py zipf           as.txt      | --s A            [common opts]
 
 Common options (shared by all distributions):
   --fptaylor PATH   path to FPTaylor executable
@@ -23,7 +22,10 @@ Common options (shared by all distributions):
 
 To add a new distribution:
   1. Create dist_<name>.py exporting NAME, CSV_FIELDS,
-     add_args(), default_out_dir(), run(), write_plot().
+     add_args(), default_out_dir(), run(), write_plot() -- follow
+     dist_poisson.py's layout (rejection-sampler templates and
+     _run_<algo>_fptaylor, then the simpler regime's _run_<regime>_fptaylor,
+     helpers, then the interface), as every other dist_*.py does.
   2. Import it below and add it to DISTRIBUTIONS.
 """
 import argparse
@@ -72,6 +74,14 @@ def main():
     for name, mod in DISTRIBUTIONS.items():
         sub = subparsers.add_parser(name, help=f"{name} distribution analysis")
         mod.add_args(sub)
+        # Also accept the common flags after the distribution name
+        # (`main.py poisson --lam 50 --plot`). Their defaults are suppressed
+        # here so the subparser only sets what was actually passed after the
+        # name, and never resets a flag given before it.
+        n_before = len(sub._actions)
+        add_common_args(sub.add_argument_group("common options"))
+        for action in sub._actions[n_before:]:
+            action.default = argparse.SUPPRESS
 
     args = parser.parse_args()
     mod = DISTRIBUTIONS[args.dist]

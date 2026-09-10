@@ -23,8 +23,8 @@ hypergeometric_file="benchmark_hypergeometric_NKn.txt"
 # choice) -- main.py picks it up via dist_common.apply_settings_defaults
 # right after argument parsing, so each case below only needs to pass its
 # own distribution parameters. Hypergeometric's W tolerance (which scales
-# with N, see hrua_z_range) is likewise auto-derived per case inside
-# dist_hypergeometric.run() now, not computed here.
+# with N, see hrua_accept_z_range) is likewise auto-derived per case inside
+# dist_hypergeometric._run_hrua_fptaylor() now, not computed here.
 FP="fp64"
 
 ulimit -t unlimited

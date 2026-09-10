@@ -1,6 +1,5 @@
 #!/bin/bash
 # One-click point-mode FPTaylor runs for the distribution frontends.
-# Binomial interval mode lives in run_box_dists.sh.
 #
 # All FPTaylor optimizer tuning (--approx/--no-approx, --bb-eval,
 # --v-trunc/--u-trunc, per-variable --opt-x-abs-tol-vars) is applied
@@ -16,7 +15,6 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 FP="fp64"
-JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 1)"
 # -vv makes each dist_*.py print the full FPTaylor/CIRE/Gelpia output for
 # every query (dist_common.vprint / each module's own "if verbose >= 2"
 # checks) -- including the tool's own error text on a failed query, not
@@ -45,10 +43,10 @@ run_one() {
 
 # # # # ---- binomial (BTRS) -------------------------------------------------------
 # run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
-#   --n 10900 --p 0.1 --jobs "$JOBS"
+#   --n 10900 --p 0.1
 
 # run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
-#   --n 1000000 --p 0.0001 --jobs "$JOBS"
+#   --n 1000000 --p 0.0001
 
 # # ---- poisson (PTRS) --------------------------------------------------------
 # run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5

@@ -51,12 +51,56 @@ make
 cd ..
 ```
 
+Gelpia is only used by `fpsampler.py`; `main.py` needs just FPTaylor (plus CIRE
+for `--backend cire`).
+
+#### Linux build notes
+
+- **FPTaylor** needs OCaml 4.x (4.14 works). OCaml 5 breaks its Makefile, which
+  links `unix.cma`/`str.cma`/`nums.cma` by bare name. `main.py` puts
+  `opam var bin` on `PATH` itself, so `--opt bb`'s runtime `ocamlopt` compiles
+  use the same switch.
+
+  ```bash
+  opam switch create fpsampler 4.14.2
+  opam install num ocamlfind
+  make -C FPTaylor
+  ```
+
+- **Gelpia**: `make requirements` needs `yacc` and `lex` (bison, flex) to
+  build GAOL. It also installs Rust 1.37, which is too old for this fork's
+  crate versions, so uninstall it (the Makefile puts `requirements/bin` first on
+  `PATH`) and build with a current `rustup` toolchain. Bake in an absolute rpath
+  for Rust's `libstd`/`libgaol`, and link `gdtoa` explicitly: `libgaol.so` uses
+  it without recording the dependency.
+
+  ```bash
+  cd gelpia
+  make requirements
+  bash requirements/lib/rustlib/uninstall.sh
+  RUSTLIB="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/lib"
+  RUSTFLAGS="-C link-args=-Wl,-rpath,$RUSTLIB:$PWD/requirements/lib -C link-args=-Wl,--no-as-needed,-lgdtoa" make
+  pip install sly
+  ```
+
+- **CIRE** (optional, `--backend cire`) needs IBEX 2.8.9 (under GCC 13, add
+  `#include <cstdint>` to its `src/data/ibex_Cov.h`), LLVM >= 16, and `clang` on
+  `PATH`. If LLVM's CMake config can't find Terminfo, point it at the system
+  library with `-DTerminfo_LIBRARIES=/usr/lib/x86_64-linux-gnu/libtinfo.so.6`.
+
+  ```bash
+  cmake -S cire -B cire/build -DCMAKE_BUILD_TYPE=Release \
+    -DIBEX_INSTALL_DIR=/path/to/ibex -DCIRE_ENABLE_LLVM_FRONTEND=ON \
+    -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
+  cmake --build cire/build -j
+  ```
+
 ### 2. Fix Python environment
 
 ```bash
 python3 -m venv ~/.venvs/cdelta
 source ~/.venvs/cdelta/bin/activate
-pip install matplotlib
+pip install matplotlib sly
 ```
 
 ---
@@ -114,11 +158,9 @@ python main.py poisson --lam 50
 # Numerically-stable Poisson reformulation (see distributions/random_poisson_ptrs_stable.c)
 python main.py poisson-stable --lam 50
 
-# Binomial, a file of (n, p) pairs
+# Binomial, a file of (n, p) pairs, or a single pair
 python main.py binomial pairs.txt
-
-# Binomial, a single (n, p) box bound instead of a point
-python main.py binomial --n-range 900 1100 --p-range 0.09 0.11
+python main.py binomial --n 1000 --p 0.1
 
 # Geometric / hypergeometric / zipf follow the same pattern
 python main.py geometric --p 0.2

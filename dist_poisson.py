@@ -18,7 +18,7 @@ from dist_common import (
     ulp_rnd_op,
     point_ivar,
     hormann_proposal_deviation, acceptance_tv,
-    elapsed_since, format_seconds,
+    vprint, elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
 )
 
@@ -193,9 +193,25 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     accept_tol_vars = accept_x_abs_tol_vars(args)
     if u_trunc is None or not (0.0 < u_trunc < 0.5):
         raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
-    _, a, b, _ = ptrs_consts(lam)
+    slam, a, b, c = ptrs_consts(lam)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
 
+    # k is declared directly over its own interval (ptrs_accept_k_range),
+    # decoupled from u -- see make_ptrs_accept_template's docstring -- so u
+    # no longer needs a sign-specific derivation and both sides run as one
+    # query over u's full (both-signs), u_trunc-truncated range: the
+    # distribution's entire domain out to that cutoff, same as the floor
+    # query, with no separate tail-probability correction needed.
+    k_lo, k_hi = ptrs_accept_k_range(lam, u_trunc)
+    u_lo, u_hi = clip_u_trunc(-0.5, 0.5, u_trunc)
+    if u_lo > u_hi:
+        raise ValueError(f"lambda={lam}: u-range emptied by u_trunc={u_trunc}")
+    vprint(verbose, f"poisson PTRS lambda={lam}",
+           slam=slam, a=a, b=b, c=c, invalpha=invalpha,
+           u_lo=u_lo, u_hi=u_hi, k_lo=k_lo, k_hi=k_hi,
+           v_trunc=v_trunc, u_trunc=u_trunc)
+
+    # ---- floor ----
     floor_input  = inputs_dir  / f"poisson_ptrs_floor_{fp}_{tag}.txt"
     floor_output = outputs_dir / f"poisson_ptrs_floor_{fp}_{tag}.out"
     floor_input.write_text(make_ptrs_floor_template(lam, fp, u_trunc))
@@ -211,21 +227,11 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     floor_raw = extract_abs_errors_by_problem(output)["eps_floor"]
     eps_floor = hormann_proposal_deviation(floor_raw, a, b)
 
-    # k is declared directly over its own interval (ptrs_accept_k_range),
-    # decoupled from u -- see make_ptrs_accept_template's docstring -- so u
-    # no longer needs a sign-specific derivation and both sides run as one
-    # query over u's full (both-signs), u_trunc-truncated range: the
-    # distribution's entire domain out to that cutoff, same as the floor
-    # query, with no separate tail-probability correction needed.
-    k_lo, k_hi = ptrs_accept_k_range(lam, u_trunc)
-    lo, hi = clip_u_trunc(-0.5, 0.5, u_trunc)
-    if lo > hi:
-        raise ValueError(f"lambda={lam}: u-range emptied by u_trunc={u_trunc}")
-
+    # ---- accept ----
     accept_input  = inputs_dir  / f"poisson_ptrs_accept_{fp}_{tag}.txt"
     accept_output = outputs_dir / f"poisson_ptrs_accept_{fp}_{tag}.out"
     accept_input.write_text(
-        make_ptrs_accept_template(lam, fp, lo, hi, k_lo, k_hi, fast=fast))
+        make_ptrs_accept_template(lam, fp, u_lo, u_hi, k_lo, k_hi, fast=fast))
 
     code, output = run_fptaylor_query(fptaylor, accept_input, outputs_dir,
                                        env, ratio_tol, bb_eval, x_abs_tol,
@@ -297,6 +303,42 @@ def _make_log_low_range_template(lam_str, fp):
         + f"  log_prod_compute = logp_{k_star};\n"
         + f"  lambda_fp_compute = lambda_fp;\n"
     )
+
+
+def _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
+    """tv for the low range at lambda (`lam` is the input string, embedded
+    verbatim as the template's literal). Also used by dist_poisson_stable."""
+    fp, verbose = args.fp, args.verbose
+    lam_float = float(lam)
+
+    lr_input  = inputs_dir  / f"low_range_{fp}_lam_{tag}.txt"
+    lr_output = outputs_dir / f"low_range_{fp}_lam_{tag}.out"
+    if args.use_log:
+        lr_input.write_text(_make_log_low_range_template(lam, fp))
+    else:
+        lr_input.write_text(_make_low_range_template(lam, fp))
+
+    code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
+    lr_output.write_text(output)
+    if verbose >= 2:
+        print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
+    if code != 0:
+        raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {lr_output}")
+
+    errs = extract_abs_errors_by_problem(output)
+    if args.use_log:
+        missing = {"log_prod_compute", "lambda_fp_compute"} - errs.keys()
+        if missing:
+            raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
+        _, tv = _compute_log_low_range_delta(
+            errs["lambda_fp_compute"], errs["log_prod_compute"])
+    else:
+        missing = {"L_compute", "prod_compute"} - errs.keys()
+        if missing:
+            raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
+        _, _, tv = _compute_low_range_delta(
+            lam_float, errs["L_compute"], errs["prod_compute"])
+    return tv
 
 
 # ---------------------------------------------------------------------------
@@ -378,44 +420,22 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
         lam_float = float(lam)
         tag = safe_lambda_name(lam)
         try:
+            row = _empty_row(lam, args.fp)
+
             # ---- low range ----
             if lam_float < SWITCH:
-                lr_input = inputs_dir / f"low_range_{args.fp}_lam_{tag}.txt"
-                if args.use_log:
-                    lr_input.write_text(_make_log_low_range_template(lam, args.fp))
-                else:
-                    lr_input.write_text(_make_low_range_template(lam, args.fp))
-
-                code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
-                out_path = outputs_dir / f"low_range_{args.fp}_lam_{tag}.out"
-                out_path.write_text(output)
-                if args.verbose >= 2:
-                    print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
-                if code != 0:
-                    raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {out_path}")
-
-                errs = extract_abs_errors_by_problem(output)
-                if args.use_log:
-                    missing = {"log_prod_compute", "lambda_fp_compute"} - errs.keys()
-                    if missing:
-                        raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
-                    _, low_tv = _compute_log_low_range_delta(
-                        errs["lambda_fp_compute"], errs["log_prod_compute"]
-                    )
-                else:
-                    missing = {"L_compute", "prod_compute"} - errs.keys()
-                    if missing:
-                        raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
-                    _, _, low_tv = _compute_low_range_delta(
-                        lam_float, errs["L_compute"], errs["prod_compute"]
-                    )
-
+                tv = _run_low_range_fptaylor(
+                    fptaylor, lam, args, tag, inputs_dir, outputs_dir, env)
                 ref_tv = computeDeltaLowRange(lam_float, FP_BETA[args.fp])
-                row = _empty_row(lam, args.fp)
-                row.update({"regime": "low", "tv": f"{low_tv:.17e}", "ref_tv": f"{ref_tv:.17e}"})
-                row["time_s"] = f"{elapsed_since(start):.6f}"
+
+                row.update({
+                    "regime": "low",
+                    "tv": f"{tv:.17e}",
+                    "ref_tv": f"{ref_tv:.17e}",
+                    "time_s": f"{elapsed_since(start):.6f}",
+                })
                 rows.append(row)
-                print(f"lambda={lam} [low] TV={row['tv']} ref_TV={row['ref_tv']}"
+                print(f"lambda={lam} [low] TV={tv:.6e} ref_TV={ref_tv:.6e}"
                       f" time={format_seconds(float(row['time_s']))}")
                 continue
 
@@ -424,7 +444,6 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
                 fptaylor, lam_float, args, tag, inputs_dir, outputs_dir, env)
             ref_tv = computeDeltaHighRange(lam_float, FP_BETA[args.fp])[0]
 
-            row = _empty_row(lam, args.fp)
             row.update({
                 "regime": "ptrs",
                 "eps_floor": f"{eps_floor:.17e}",
