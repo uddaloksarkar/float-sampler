@@ -90,6 +90,79 @@ python analyticError.py --plot
 
 ---
 
+## main.py (multi-distribution CLI)
+
+The general entry point: one dispatcher over all supported distributions, each
+implemented as a `dist_<name>.py` module (`poisson`, `poisson-stable`,
+`binomial`, `geometric`, `hypergeometric`, `zipf`). It runs the FP-error
+analysis (FPTaylor by default, or CIRE via `--backend cire`), writes a
+`summary.csv`, and optionally plots TV vs. the distribution's parameter.
+
+```bash
+python main.py <distribution> <positional-input-or-flags> [common opts]
+```
+
+### Examples
+
+```bash
+# Poisson, a file of lambda values
+python main.py poisson lambdas_100_1000_step100.txt
+
+# Poisson, single lambda
+python main.py poisson --lam 50
+
+# Numerically-stable Poisson reformulation (see distributions/random_poisson_ptrs_stable.c)
+python main.py poisson-stable --lam 50
+
+# Binomial, a file of (n, p) pairs
+python main.py binomial pairs.txt
+
+# Binomial, a single (n, p) box bound instead of a point
+python main.py binomial --n-range 900 1100 --p-range 0.09 0.11
+
+# Geometric / hypergeometric / zipf follow the same pattern
+python main.py geometric --p 0.2
+python main.py hypergeometric --N 100 --K 40 --n 30
+python main.py zipf --s 2.0
+
+# With plotting, verbose FPTaylor output, and a custom output dir
+python main.py poisson lambdas_10_100_step10.txt --plot -vv --out-dir poisson_runs
+```
+
+Run `python main.py <distribution> --help` to see that distribution's own
+positional/`--`-flag input options (e.g. `--lam`, `--n`/`--p`, `--N`/`--K`/`--n`).
+
+### Common flags (all distributions)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--backend {fptaylor,cire}` | `fptaylor` | FP analysis backend |
+| `--fptaylor PATH` | auto-detect / `$FPTAYLOR` | Path to the FPTaylor executable |
+| `--cire PATH` | auto-detect | Path to the CIRE_LLVM executable (`--backend cire`, fp64 only) |
+| `--fp {fp32,fp64,fp128}` | `fp64` | Floating-point format |
+| `--out-dir PATH` | `<dist>_runs[_<stem>]/` | Output directory |
+| `--plot` | off | Plot TV vs. the distribution's parameter |
+| `--plot-components` | off | Include individual error components in the plot |
+| `--plot-pgf` | off | Also save the plot as PGF |
+| `--plot-file PATH` | `<out-dir>/tv_vs_param.png` | Plot output path |
+| `--cache` | off | Reuse an existing `summary.csv` in `--out-dir` instead of re-running |
+| `-v` / `-vv` | off | `-v`: per-problem internal parameters; `-vv`: also raw tool output |
+| `--v-trunc FLOAT` | per-distribution (`fptaylor_settings.toml`) | BTRS/PTRS: truncation floor for the `log(v)` domain |
+| `--u-trunc FLOAT` | per-distribution (`fptaylor_settings.toml`) | BTRS/PTRS: minimum allowed `us` at the reachable-k boundary |
+| `--bb-geometric-ratio-tol FLOAT` | `2.0` | FPTaylor branch-and-bound geometric-splitter ratio |
+| `--bb-eval` / `--no-bb-eval` | per-distribution | Use FPTaylor's interpreted `--opt bb-eval` backend instead of the compiling `--opt bb` one |
+
+Per-distribution defaults for several of these (`approx`, `bb_eval`,
+`v_trunc`, `u_trunc`, `opt_x_abs_tol`, ...) live in `fptaylor_settings.toml`
+and are applied automatically unless overridden on the command line.
+
+### Output structure
+
+Same layout as FPSampler below (`summary.csv`, `inputs/`, `outputs/`, and the
+plot if `--plot` is passed), under `--out-dir` (default `<dist>_runs[_<stem>]/`).
+
+---
+
 ## FPSampler 
 
 Runs FPTaylor (and Gelpia for λ ≥ 30) to get rigorous numerical bounds, writes

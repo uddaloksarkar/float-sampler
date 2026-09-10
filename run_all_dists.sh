@@ -43,29 +43,29 @@ run_one() {
     fi
 }
 
-# # # ---- binomial (BTRS) -------------------------------------------------------
-run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
-  --n 10900 --p 0.1 --jobs "$JOBS"
+# # # # ---- binomial (BTRS) -------------------------------------------------------
+# run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
+#   --n 10900 --p 0.1 --jobs "$JOBS"
 
-run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
-  --n 1000000 --p 0.0001 --jobs "$JOBS"
+# run_one python3 main.py "${COMMON_ARGS[@]}" binomial \
+#   --n 1000000 --p 0.0001 --jobs "$JOBS"
 
-# ---- poisson (PTRS) --------------------------------------------------------
-run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
+# # ---- poisson (PTRS) --------------------------------------------------------
+# run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e5
 
-run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
+# run_one python3 main.py "${COMMON_ARGS[@]}" poisson --lam 1e8
 
 # ---- poisson-stable (PTRS, cancellation-avoiding templates) ----------------
-run_one python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e5
+run_one python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e13
 
-run_one python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e8
+run_one python3 main.py "${COMMON_ARGS[@]}" poisson-stable --lam 1e10
 
-# ---- hypergeometric (HRUA) -------------------------------------------------
-run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30
+# # ---- hypergeometric (HRUA) -------------------------------------------------
+# run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 100 --K 40 --n 30
 
-run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 10000 --K 4000 --n 300
+# run_one python3 main.py "${COMMON_ARGS[@]}" hypergeometric --N 10000 --K 4000 --n 300
 
-# ---- zipf ------------------------------------------------------------------
-# Not yet covered by fptaylor_settings.toml / sweep_fptaylor.py -- runs on
-# dist_common's hardcoded defaults (approx=true, bb_eval=false).
-run_one python3 main.py "${COMMON_ARGS[@]}" zipf --s 2.5
+# # ---- zipf ------------------------------------------------------------------
+# # Not yet covered by fptaylor_settings.toml / sweep_fptaylor.py -- runs on
+# # dist_common's hardcoded defaults (approx=true, bb_eval=false).
+# run_one python3 main.py "${COMMON_ARGS[@]}" zipf --s 2.5
