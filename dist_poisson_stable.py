@@ -70,6 +70,7 @@ from dist_common import (
     extract_abs_errors_by_problem,
     eps_logv, run_fptaylor_query,
     ulp_rnd_op,
+    iv, interval_ivar, with_param_tols,
     hormann_proposal_deviation, acceptance_tv,
     vprint, elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
@@ -104,10 +105,24 @@ SERR = [1 / 12.0, -1 / 360.0, 1 / 1260.0, -1 / 1680.0, 1 / 1188.0, -691 / 360360
 
 # ---------------------------------------------------------------------------
 # Stable PTRS FPTaylor templates  (lambda >= SWITCH)
+#
+# Every function below takes lambda as a point or as an (lo, hi) interval.
+# The templates embed the doubles random_poisson_ptrs_stable.c computes once
+# per lambda (a, b, A2, c0, lam, C) as exact literals for a point; for an
+# interval each becomes a Variable over its enclosure (_const_lines).  All of
+# them are monotone in lambda -- chains of correctly-rounded monotone ops --
+# so their enclosures are just the endpoint values, padded by a few ulps
+# where a subtraction of two increasing terms (A2) could break that at the
+# last bit.
 # ---------------------------------------------------------------------------
 
 def ptrs_consts(lam):
-    """(a, b, invalpha) exactly as random_poisson_ptrs_stable.c computes them."""
+    """(a, b, invalpha) exactly as random_poisson_ptrs_stable.c computes
+    them; each an (lo, hi) enclosure when lam is an interval (a, b increase
+    with lambda, invalpha decreases)."""
+    if isinstance(lam, tuple):
+        (a0, b0, i0), (a1, b1, i1) = ptrs_consts(lam[0]), ptrs_consts(lam[1])
+        return (a0, a1), (b0, b1), (i1, i0)
     b = 0.931 + 2.53 * math.sqrt(lam)
     a = -0.059 + 0.02483 * b
     return a, b, 1.1239 + 1.1328 / (b - 3.4)
@@ -120,8 +135,28 @@ def _const_err(computed, exact):
     return float(abs(Fraction(computed) - exact))
 
 
+def _pad(lo, hi, ulps=2):
+    """[lo, hi] widened by `ulps` ulps on each side."""
+    for _ in range(ulps):
+        lo, hi = math.nextafter(lo, -math.inf), math.nextafter(hi, math.inf)
+    return lo, hi
+
+
 def ptrs_floor_consts(lam):
-    """(m, A2, c0, const_err) for  t = s*(a/us + A2 - b*us) + c0,  k = m + floor(t)."""
+    """(m, A2, c0, const_err) for  t = s*(a/us + A2 - b*us) + c0,  k = m + floor(t).
+
+    For an interval, m, A2, c0 are (lo, hi) enclosures and const_err bounds
+    the rounding of A2 = 0.5*b - 2*a and c0 = frac + 0.43 by half an ulp of
+    their largest value each (one rounding apiece: the scalings are exact).
+    """
+    if isinstance(lam, tuple):
+        lo, hi = lam
+        (m0, A2_0, c0_0, _), (m1, A2_1, c0_1, _) = ptrs_floor_consts(lo), ptrs_floor_consts(hi)
+        A2 = _pad(A2_0, A2_1)
+        # frac = lam - m is increasing between integers; across one it spans [0, 1)
+        c0 = _pad(c0_0, c0_1) if m0 == m1 else _pad(0.43, 1.0 + 0.43)
+        err = 0.5 * (math.ulp(A2[1]) + math.ulp(c0[1]))
+        return (m0, m1), A2, c0, err
     a, b, _ = ptrs_consts(lam)
     m = math.floor(lam)
     frac = lam - m                       # exact (Sterbenz, lam >= 1)
@@ -132,21 +167,42 @@ def ptrs_floor_consts(lam):
     return m, A2, c0, err
 
 
+def _const_lines(consts):
+    """consts: [(name, value, pad, kind)] -> (Variables lines, Definitions
+    lines).  A point stays an exact Definitions literal (`name{pad}= v,`),
+    an (lo, hi) interval becomes a Variable of type `kind` over it."""
+    var_lines, def_lines = [], []
+    for name, value, pad, kind in consts:
+        lo, hi = iv(value)
+        if lo == hi:
+            def_lines.append(f"  {name}{pad}= {lo:.20e},")
+        else:
+            var_lines.append(interval_ivar(name, lo, hi, kind))
+    return var_lines, def_lines
+
+
+def _variables(lines):
+    return "Variables\n" + ",\n".join(lines) + ";\n\n"
+
+
 def ptrs_accept_partition(lam, u_trunc):
     """[(k_lo, k_hi, mode)] over k >= STIRLERR_KMIN, series only where
-    |v| <= VSPLIT.  Integer k below STIRLERR_KMIN are handled point-wise.
+    |v| <= VSPLIT for every lambda (in the interval).  Integer k below
+    STIRLERR_KMIN are handled point-wise.
 
     The k window itself (dist_poisson.ptrs_accept_k_range) is the same real
     quantity here as in dist_poisson.py: y = (2*a/us + b)*u + c is the same
     number whether evaluated in that form or in this module's
-    cancellation-avoiding us-only form, so k_lo/k_hi carry over unchanged.
+    cancellation-avoiding us-only form, so k_lo/k_hi carry over unchanged;
+    for an interval it is widest at lambda's top.
     """
-    lo, hi = base.ptrs_accept_k_range(lam, u_trunc)
+    lam_lo, lam_hi = iv(lam)
+    lo, hi = base.ptrs_accept_k_range(lam_hi, u_trunc)
     lo = max(lo, STIRLERR_KMIN)
     if lo >= hi:
         return []
     r = (1.0 + VSPLIT) / (1.0 - VSPLIT)          # |v| <= VSPLIT  <=>  k/lam in [1/r, r]
-    n_lo, n_hi = lam / r, lam * r
+    n_lo, n_hi = lam_hi / r, lam_lo * r          # empty (n_lo >= n_hi) for a wide interval
     parts = []
     if lo < min(hi, n_lo):
         parts.append((float(lo), float(min(hi, n_lo)), "direct"))
@@ -166,10 +222,12 @@ def ptrs_method_error(lam, k_lo, k_hi, mode):
       * the series coefficients are stored as doubles, so the encoded real
         expression uses fl(1/(2j+1)) and fl(S_j).  Both series have the sign
         pattern needed for a term-wise relative bound of EPS.
+    |v| = |k - lam|/(k + lam) is monotone in k and in lam, so its max over
+    the box is at a corner.
     """
     err = STIRLERR_SERIES_TRUNC + EPS * abs(SERR[0]) / k_lo
     if mode == "series":
-        v = max(abs((k - lam) / (k + lam)) for k in (k_lo, k_hi))
+        v = max(abs((k - l) / (k + l)) for k in (k_lo, k_hi) for l in iv(lam))
         J = NSERIES + 1
         tail = 2 * k_hi * v ** (2 * J + 1) / ((2 * J + 1) * (1 - v * v))
         head = 2 * k_hi * v ** 3 / 3.0 / (1 - v * v)
@@ -196,15 +254,12 @@ def make_ptrs_floor_template(lam, fp, utail, sign):
     rnd = FP_TO_FPTAYLOR_RND[fp]
     core = "(a_ / us + A2_) - b_ * us"
     body = f"({core}) + c0_" if sign > 0 else f"c0_ - ({core})"
+    cvars, cdefs = _const_lines([("a_", a, "  ", "float64"), ("b_", b, "  ", "float64"),
+                                 ("A2_", A2, " ", "float64"), ("c0_", c0, " ", "float64")])
     return (
-        "Variables\n"
-        f"  float64 us in [{utail:.20e}, 5.0e-1];\n\n"
-        "Definitions\n"
-        f"  a_  = {a:.20e},\n"
-        f"  b_  = {b:.20e},\n"
-        f"  A2_ = {A2:.20e},\n"
-        f"  c0_ = {c0:.20e},\n"
-        f"  t_  {rnd}= {body};\n\n"
+        _variables([f"  float64 us in [{utail:.20e}, 5.0e-1]"] + cvars)
+        + "Definitions\n" + "".join(d + "\n" for d in cdefs)
+        + f"  t_  {rnd}= {body};\n\n"
         "Expressions\n"
         "  eps_floor = t_;\n"
     )
@@ -222,6 +277,15 @@ def _accept_tail(rnd):
             f"  log_us_  {log_rnd}= log(us),"]
 
 
+def _accept_C(invalpha, shift):
+    """-log(invalpha) - shift, as a point or as an (lo, hi) enclosure
+    (increasing in lambda, since invalpha decreases), padded for log's
+    last-bit error."""
+    if isinstance(invalpha, tuple):
+        return _pad(-math.log(invalpha[1]) - shift, -math.log(invalpha[0]) - shift, 4)
+    return -math.log(invalpha) - shift
+
+
 def make_ptrs_accept_template(lam, fp, utail, k_lo, k_hi, mode):
     """Absolute error of
 
@@ -234,12 +298,10 @@ def make_ptrs_accept_template(lam, fp, utail, k_lo, k_hi, mode):
     a, b, invalpha = ptrs_consts(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     log_rnd = ulp_rnd_op(rnd, "log")
-    C = -math.log(invalpha) - LS2PI
+    C = _accept_C(invalpha, LS2PI)
 
-    d = [f"  a_    = {a:.20e},",
-         f"  b_    = {b:.20e},",
-         f"  lam_  = {lam:.20e},",
-         f"  C_    = {C:.20e},"]
+    cvars, d = _const_lines([("a_", a, "    ", "float64"), ("b_", b, "    ", "float64"),
+                             ("lam_", lam, "  ", "float64"), ("C_", C, "    ", "real")])
 
     if mode == "series":
         P = [1.0 / (2 * j + 1) for j in range(1, NSERIES + 1)]
@@ -261,33 +323,34 @@ def make_ptrs_accept_template(lam, fp, utail, k_lo, k_hi, mode):
     d += [f"  acc_  {rnd}= (((C_ - bd0_) - st_) - 0.5 * log_k_)"
           f" + log_num_ - 2.0 * log_us_;"]
 
-    return ("Variables\n"
-            f"  float64 us in [{utail:.20e}, 5.0e-1],\n"
-            f"  real k in [{k_lo:.1f}, {k_hi:.1f}];\n\n"
-            "Definitions\n" + "\n".join(d) + "\n\n"
+    return (_variables([f"  float64 us in [{utail:.20e}, 5.0e-1]",
+                        f"  real k in [{k_lo:.1f}, {k_hi:.1f}]"] + cvars)
+            + "Definitions\n" + "\n".join(d) + "\n\n"
             "Expressions\n  eps_accept = acc_;\n")
 
 
 def make_ptrs_accept_point_template(lam, fp, utail, k):
     """Accept expression for one integer k < STIRLERR_KMIN, where stirlerr
     comes from the exact table rather than the series.  k is a literal, so us
-    is the only variable.  k = 0 uses log p(0) = -lam exactly."""
+    is the only variable (besides the constants, for an interval).  k = 0
+    uses log p(0) = -lam exactly."""
     a, b, invalpha = ptrs_consts(lam)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     log_rnd = ulp_rnd_op(rnd, "log")
-    d = [f"  a_    = {a:.20e},",
-         f"  b_    = {b:.20e},"]
 
     if k == 0:
-        d += [f"  C_    = {-math.log(invalpha):.20e},",
-              f"  lam_  = {lam:.20e},",
-              f"  lp_   {rnd}= C_ - lam_,"]
+        cvars, d = _const_lines([("a_", a, "    ", "float64"), ("b_", b, "    ", "float64"),
+                                 ("C_", _accept_C(invalpha, 0.0), "    ", "real"),
+                                 ("lam_", lam, "  ", "float64")])
+        d += [f"  lp_   {rnd}= C_ - lam_,"]
     else:
         # -bd0(k,lam) - stirlerr(k) - 0.5*log(k) - LS2PI - log(invalpha)
-        C = -math.log(invalpha) - LS2PI - STIRLERR_TAB[k]
-        d += [f"  C_         = {C:.20e},",
-              f"  lam_       = {lam:.20e},",
-              f"  kk_        = {float(k):.20e},",
+        C = _accept_C(invalpha, LS2PI + STIRLERR_TAB[k]) if isinstance(lam, tuple) \
+            else -math.log(invalpha) - LS2PI - STIRLERR_TAB[k]
+        cvars, d = _const_lines([("a_", a, "    ", "float64"), ("b_", b, "    ", "float64"),
+                                 ("C_", C, "         ", "real"),
+                                 ("lam_", lam, "       ", "float64")])
+        d += [f"  kk_        = {float(k):.20e},",
               f"  log_kk_lam_ {log_rnd}= log(kk_ / lam_),",
               f"  bd0_        {rnd}= (kk_ * log_kk_lam_ - kk_) + lam_,",
               f"  log_kk_    {log_rnd}= log(kk_),",
@@ -296,9 +359,8 @@ def make_ptrs_accept_point_template(lam, fp, utail, k):
     d += _accept_tail(rnd)
     d += [f"  acc_  {rnd}= lp_ + log_num_ - 2.0 * log_us_;"]
 
-    return ("Variables\n"
-            f"  float64 us in [{utail:.20e}, 5.0e-1];\n\n"
-            "Definitions\n" + "\n".join(d) + "\n\n"
+    return (_variables([f"  float64 us in [{utail:.20e}, 5.0e-1]"] + cvars)
+            + "Definitions\n" + "\n".join(d) + "\n\n"
             "Expressions\n  eps_accept = acc_;\n")
 
 
@@ -309,30 +371,40 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     over this module's cancellation-avoiding templates.  Unlike
     dist_poisson's single floor/accept pair, each side here is a max over
     several queries (the two signs of U for floor; the k partition plus the
-    small-k point queries for accept)."""
+    small-k point queries for accept).
+
+    lam may be an (lo, hi) interval; as in dist_poisson, invalpha and the
+    Hormann factor are worst at lo and the k window widest at hi."""
+    label = base._lam_label(lam)
+    lam_lo, lam_hi = iv(lam)
     fp, verbose = args.fp, args.verbose
     v_trunc = args.v_trunc
     ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
     x_abs_tol, approx = args.opt_x_abs_tol, args.approx
     u_trunc = args.u_trunc
-    floor_tol_vars = floor_x_abs_tol_vars(args)
-    accept_tol_vars = accept_x_abs_tol_vars(args)
     if u_trunc is None or not (0.0 < u_trunc < 0.5):
         raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
-    a, b, invalpha = ptrs_consts(lam)
+    a, b, invalpha = ptrs_consts(lam_lo)
     m, A2, c0, c_err = ptrs_floor_consts(lam)
+    # per-variable tolerances for the constants an interval turns into
+    # Variables (_const_lines); nothing is added for a point
+    a_iv, b_iv, inv_iv = ptrs_consts(lam)
+    const_ranges = {"a_": a_iv, "b_": b_iv, "A2_": A2, "c0_": c0, "lam_": lam,
+                    "C_": _accept_C(inv_iv, LS2PI) if isinstance(lam, tuple) else 0.0}
+    floor_tol_vars = with_param_tols(floor_x_abs_tol_vars(args), const_ranges)
+    accept_tol_vars = with_param_tols(accept_x_abs_tol_vars(args), const_ranges)
 
     # k window shared with dist_poisson (see ptrs_accept_partition); k=0 is
     # outside it (dist_poisson.ptrs_accept_k_range clamps k_lo to 1).
-    k_lo, k_hi = base.ptrs_accept_k_range(lam, u_trunc)
+    k_lo, k_hi = base.ptrs_accept_k_range(lam_hi, u_trunc)
     parts = ptrs_accept_partition(lam, u_trunc)
     point_ks = range(int(k_lo), min(int(k_hi), STIRLERR_KMIN - 1) + 1)
-    vprint(verbose, f"poisson-stable PTRS lambda={lam}",
+    vprint(verbose, f"poisson-stable PTRS {label}",
            a=a, b=b, invalpha=invalpha, m=m, A2=A2, c0=c0, c_err=c_err,
            k_lo=k_lo, k_hi=k_hi, partitions=len(parts), point_ks=len(point_ks),
            v_trunc=v_trunc, u_trunc=u_trunc)
 
-    def query(stem, text, problem, label, tol_vars):
+    def query(stem, text, problem, what, tol_vars):
         in_path  = inputs_dir  / f"{stem}.txt"
         out_path = outputs_dir / f"{stem}.out"
         in_path.write_text(text)
@@ -341,10 +413,10 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
                                            tol_vars, approx)
         out_path.write_text(output)
         if verbose >= 2:
-            print(f"--- FPTaylor PTRS-stable {label} (lambda={lam}) ---\n{output}")
+            print(f"--- FPTaylor PTRS-stable {what} ({label}) ---\n{output}")
         if code != 0:
-            raise RuntimeError(f"FPTaylor PTRS-stable {label} failed for "
-                               f"lambda={lam}; see {out_path}")
+            raise RuntimeError(f"FPTaylor PTRS-stable {what} failed for "
+                               f"{label}; see {out_path}")
         return extract_abs_errors_by_problem(output)[problem]
 
     # ---- floor: max over the two signs of U ----
@@ -390,11 +462,17 @@ def add_args(parser):
                         help="File with lambda values, one or more per line")
     source.add_argument("--lam", type=float, default=None,
                         help="Single lambda value")
+    source.add_argument("--lam-range", nargs=2, type=float, default=None,
+                        metavar=("LMIN", "LMAX"),
+                        help="Interval mode: one TV bound valid for every "
+                             "lambda in [LMIN, LMAX] (see --split-depth)")
     parser.add_argument("--use-log", action="store_true",
                         help="Use log-space template for low-range lambdas")
 
 
 def default_out_dir(args):
+    if getattr(args, "lam_range", None) is not None:
+        return ROOT / "poisson_stable_runs_interval"
     lf = getattr(args, "lambda_file", None)
     if lf is None:
         return ROOT / "poisson_stable_runs"
@@ -402,6 +480,11 @@ def default_out_dir(args):
 
 
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
+    if args.lam_range is not None:
+        # interval mode: dist_poisson's driver, with this module's PTRS
+        return [base.run_box(args, fptaylor, inputs_dir, outputs_dir, env,
+                             base.lam_range_box(args), ptrs_runner=_run_ptrs_fptaylor,
+                             ptrs_regime=("ptrs-stable", "PTRS-stable"))]
     lambdas = [str(args.lam)] if args.lam is not None else base.read_lambdas(args.lambda_file)
 
     rows = []
@@ -453,5 +536,5 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
 
 def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
-    base.write_plot(rows, plot_path, plot_components=plot_components,
-                    plot_pgf=plot_pgf)
+    return base.write_plot(rows, plot_path, plot_components=plot_components,
+                           plot_pgf=plot_pgf)

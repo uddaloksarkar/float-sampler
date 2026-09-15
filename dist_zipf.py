@@ -22,6 +22,9 @@ Algorithm (rejection sampling, one iteration):
 pow(x, y) for real y has no rigorous FPTaylor primitive (Op_nat_pow only
 takes natural exponents), so it is modeled as exp(y*log(x)) throughout,
 mirroring dist_binomial._make_inversion_template's qn_step = exp(n*log(q)).
+
+Every runner takes a either as a point or as a (lo, hi) interval (interval
+mode, --s-range): see dist_common's "Interval (box) mode" section.
 """
 import math
 import time
@@ -31,13 +34,16 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     extract_abs_errors_by_problem,
     run_fptaylor_query,
-    point_ivar, fp_var_type,
+    iv, param_ivar, fp_var_type,
     vprint, elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
+    analyse_param_box, max_fields, parse_range, safe_box_name, box_label,
+    csv_num, fmt_num, with_param_tols,
 )
 
 NAME = "zipf"
-CSV_FIELDS = ["a", "fp", "regime", "eps_floor", "eps_accept", "tv", "time_s"]
+CSV_FIELDS = ["a", "a_lo", "a_hi", "fp", "regime", "eps_floor", "eps_accept",
+              "tv", "n_boxes", "time_s"]
 
 # Representative literal X values swept for eps_accept (a spot check, not a
 # rigorous cover of the whole unbounded support -- see module docstring).
@@ -55,8 +61,9 @@ _X_MAX = max(_X_SWEEP)
 def zipf_tail_prob(a, x_max=_X_MAX):
     """P(X > x_max) <= integral_{x_max}^inf t^-a dt = x_max^-(a-1) / (a-1),
     dropping the true PMF's 1/zeta(a) <= 1 normalizing factor (safe: that
-    only makes this bound larger, never violated)."""
-    am1 = a - 1.0
+    only makes this bound larger, never violated).  Decreasing in a, so an
+    interval takes its lo."""
+    am1 = iv(a)[0] - 1.0
     return x_max ** (-am1) / am1
 
 
@@ -68,15 +75,18 @@ def make_zipf_floor_template(a, fp):
     U is restricted to [U_min, 1], U_min = _X_MAX^-am1, so Y only ranges up
     to _X_MAX -- the X > _X_MAX tail is charged directly via zipf_tail_prob
     instead of asking FPTaylor to bound Y near its true U=0 singularity.
+    For an interval a, U_min is taken at a's hi (the smallest U_min): that
+    U range contains every a's own, so it is a superset of every point's
+    domain (Y then reaches past _X_MAX for smaller a -- sound, if looser).
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
-    am1 = a - 1.0
+    am1 = iv(a)[1] - 1.0
     u_min = _X_MAX ** (-am1)
     v0_max = 1.0 - u_min
     return (
         "Variables\n"
         f"  {fp_var_type(fp)} V0 in [0.0, {v0_max:.20e}],\n"
-        + point_ivar("a", a) + ";\n\n"
+        + param_ivar("a", a) + ";\n\n"
         + "Definitions\n"
         f"  U      {rnd}= 1.0 - V0,\n"
         f"  am1_   {rnd}= a - 1.0,\n"
@@ -97,7 +107,7 @@ def make_zipf_accept_template(a, x, fp):
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
-        + point_ivar("a", a) + ";\n\n"
+        + param_ivar("a", a) + ";\n\n"
         + "Definitions\n"
         f"  am1_   {rnd}= a - 1.0,\n"
         f"  b_     {rnd}= exp(am1_ * log(2.0)),\n"
@@ -112,16 +122,18 @@ def make_zipf_accept_template(a, x, fp):
 
 
 def _run_zipf_fptaylor(fptaylor, a, args, tag, inputs_dir, outputs_dir, env):
-    """(eps_floor, eps_accept, tv) for one a; see the module docstring for
-    what tv does and doesn't yet account for."""
+    """(eps_floor, eps_accept, tv) for one a (point or interval); see the
+    module docstring for what tv does and doesn't yet account for."""
+    label = _a_label(a)
     fp, verbose = args.fp, args.verbose
     ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
     x_abs_tol, approx = args.opt_x_abs_tol, args.approx
-    floor_tol_vars = floor_x_abs_tol_vars(args)
-    accept_tol_vars = accept_x_abs_tol_vars(args)
+    floor_tol_vars = with_param_tols(floor_x_abs_tol_vars(args), {"a": a})
+    accept_tol_vars = with_param_tols(accept_x_abs_tol_vars(args), {"a": a})
     tail_prob = zipf_tail_prob(a)
-    vprint(verbose, f"zipf a={a}",
-           am1=a - 1.0, u_min=_X_MAX ** (-(a - 1.0)), x_max=_X_MAX,
+    a_hi = iv(a)[1]
+    vprint(verbose, f"zipf {label}",
+           am1=a_hi - 1.0, u_min=_X_MAX ** (-(a_hi - 1.0)), x_max=_X_MAX,
            x_sweep=_X_SWEEP, tail_prob=tail_prob)
 
     # ---- floor ----
@@ -133,9 +145,9 @@ def _run_zipf_fptaylor(fptaylor, a, args, tag, inputs_dir, outputs_dir, env):
                                        ratio_tol, bb_eval, x_abs_tol, floor_tol_vars, approx)
     floor_output.write_text(output)
     if verbose >= 2:
-        print(f"--- FPTaylor zipf floor (a={a}) ---\n{output}")
+        print(f"--- FPTaylor zipf floor ({label}) ---\n{output}")
     if code != 0:
-        raise RuntimeError(f"FPTaylor zipf floor failed for a={a}; see {floor_output}")
+        raise RuntimeError(f"FPTaylor zipf floor failed for {label}; see {floor_output}")
 
     eps_floor = extract_abs_errors_by_problem(output)["eps_floor"]
 
@@ -151,10 +163,10 @@ def _run_zipf_fptaylor(fptaylor, a, args, tag, inputs_dir, outputs_dir, env):
                                            accept_tol_vars, approx)
         accept_output.write_text(output)
         if verbose >= 2:
-            print(f"--- FPTaylor zipf accept (a={a}, X={x}) ---\n{output}")
+            print(f"--- FPTaylor zipf accept ({label}, X={x}) ---\n{output}")
         if code != 0:
             raise RuntimeError(f"FPTaylor zipf accept failed for "
-                               f"a={a} X={x}; see {accept_output}")
+                               f"{label} X={x}; see {accept_output}")
         eps_accept = max(eps_accept,
                          extract_abs_errors_by_problem(output)["eps_accept"])
 
@@ -171,6 +183,10 @@ def _run_zipf_fptaylor(fptaylor, a, args, tag, inputs_dir, outputs_dir, env):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _a_label(a):
+    return box_label({"a": a}) if isinstance(a, tuple) else f"a={a}"
+
 
 def safe_a_name(a):
     return "a" + f"{a:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
@@ -199,8 +215,40 @@ def read_as(path):
 
 
 def _empty_row(a, fp):
-    return {"a": f"{a:.17g}", "fp": fp, "regime": "",
-            "eps_floor": "", "eps_accept": "", "tv": "", "time_s": ""}
+    return {"a": "" if a == "" else f"{a:.17g}", "a_lo": "", "a_hi": "",
+            "fp": fp, "regime": "", "eps_floor": "", "eps_accept": "", "tv": "",
+            "n_boxes": "", "time_s": ""}
+
+
+# ---------------------------------------------------------------------------
+# Interval mode  (--s-range)
+# ---------------------------------------------------------------------------
+
+def run_box(args, fptaylor, inputs_dir, outputs_dir, env, a_iv):
+    """One row bounding TV over every a in a_iv (a single regime, so the
+    only splitting is --split-depth's)."""
+    start = time.perf_counter()
+
+    def analyse(sub, regime):
+        eps_floor, eps_accept, tv = _run_zipf_fptaylor(
+            fptaylor, sub["a"], args, safe_box_name(sub), inputs_dir, outputs_dir, env)
+        return {"eps_floor": eps_floor, "eps_accept": eps_accept, "tv": tv}
+
+    fields = ("eps_floor", "eps_accept", "tv")
+    results = analyse_param_box({"a": a_iv}, lambda box: {"rejection"}, None, analyse,
+                                args.split_depth, verbose=args.verbose)
+    worst = max_fields(results, fields)
+
+    row = _empty_row("", args.fp)
+    row.update({"a_lo": f"{a_iv[0]:.17g}", "a_hi": f"{a_iv[1]:.17g}",
+                "regime": "rejection", "n_boxes": len(results),
+                "time_s": f"{elapsed_since(start):.6f}"})
+    row.update({f: csv_num(worst[f]) for f in fields})
+    print(f"{box_label({'a': a_iv})} [rejection] boxes={len(results)}"
+          f" eps_floor={fmt_num(worst['eps_floor'])}"
+          f" eps_accept={fmt_num(worst['eps_accept'])} TV={fmt_num(worst['tv'])}"
+          f" time={format_seconds(float(row['time_s']))}")
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +261,15 @@ def add_args(parser):
                         help="File with a values, one or more per line")
     source.add_argument("--s", type=float, default=None,
                         help="Single exponent a > 1 (zipf.c's `a`)")
+    source.add_argument("--s-range", nargs=2, type=float, default=None,
+                        metavar=("AMIN", "AMAX"),
+                        help="Interval mode: one TV bound valid for every a "
+                             "in [AMIN, AMAX] (see --split-depth)")
 
 
 def default_out_dir(args):
+    if getattr(args, "s_range", None) is not None:
+        return ROOT / "zipf_runs_interval"
     lf = getattr(args, "input_file", None)
     if lf is None:
         return ROOT / "zipf_runs"
@@ -223,6 +277,10 @@ def default_out_dir(args):
 
 
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
+    if args.s_range is not None:
+        a_iv = parse_range(args.s_range, "--s-range")
+        _validate(a_iv[0], "--s-range")
+        return [run_box(args, fptaylor, inputs_dir, outputs_dir, env, a_iv)]
     if args.s is not None:
         _validate(args.s)
         values = [args.s]
@@ -263,7 +321,8 @@ def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
     import contextlib
     import os
 
-    rows = sorted((r for r in rows if math.isfinite(float(r["tv"])) and float(r["tv"]) > 0),
+    rows = sorted((r for r in rows if r["a"] and math.isfinite(float(r["tv"]))
+                   and float(r["tv"]) > 0),
                   key=lambda r: float(r["a"]))
     if not rows:
         print("Nothing to plot")

@@ -193,15 +193,70 @@ positional/`--`-flag input options (e.g. `--lam`, `--n`/`--p`, `--N`/`--K`/`--n`
 | `--u-trunc FLOAT` | per-distribution (`fptaylor_settings.toml`) | BTRS/PTRS: minimum allowed `us` at the reachable-k boundary |
 | `--bb-geometric-ratio-tol FLOAT` | `2.0` | FPTaylor branch-and-bound geometric-splitter ratio |
 | `--bb-eval` / `--no-bb-eval` | per-distribution | Use FPTaylor's interpreted `--opt bb-eval` backend instead of the compiling `--opt bb` one |
+| `--split-depth N` | `0` | Interval mode: bisect every parameter axis `N` extra times (tighter, more queries) |
 
 Per-distribution defaults for several of these (`approx`, `bb_eval`,
 `v_trunc`, `u_trunc`, `opt_x_abs_tol`, ...) live in `fptaylor_settings.toml`
 and are applied automatically unless overridden on the command line.
 
+### Interval mode
+
+Give a parameter as a range instead of a point and `main.py` returns **one TV
+bound valid for every parameter value in the box**:
+
+```bash
+python main.py poisson        --lam-range 1000 2000
+python main.py poisson-stable --lam-range 1000 1100
+python main.py binomial       --n-range 1000 1100 --p-range 0.1 0.11   # or mix: --n 200 --p-range 0.4 0.6
+python main.py geometric      --p-range 0.01 0.02
+python main.py hypergeometric --N-range 1000 1010 --K-range 300 305 --n-range 200 205
+python main.py zipf           --s-range 2.0 2.5
+python main.py binomial --n-range 10000 40000 --p 0.3 --split-depth 2   # tighter, 4x the queries
+```
+
+How it stays sound (see `dist_common.py`'s "Interval (box) mode" section):
+
+- Each parameter becomes an FPTaylor `float64` Variable over its range, so
+  every error bound holds over the whole box. Constants the TV formula
+  multiplies by (`invalpha`, Hormann's `4a+b`, `accept_iter`, `d8`, `(1-p)/p`,
+  ...) are taken at their worst case, which is always a box corner because each
+  is monotone in the parameters. `tests/test_interval.py` samples each
+  enclosure against random points inside random boxes.
+- Boxes that straddle a regime switch (Poisson's λ = 30, binomial's n·p = 30,
+  geometric's p = 1/3, hypergeometric's n = 10 and n = N − 10) are split there
+  automatically, and every piece gets its own regime's analysis. The bound is
+  the max over the pieces.
+- Boxes too wide to analyse are bisected automatically (`BoxTooWide`). For
+  example, binomial needs `n_hi ≤ 2·n_lo + 1` for its k/j split of the support.
+- A zero-width box reproduces point mode exactly.
+
+Knobs and costs:
+
+- `--split-depth` trades queries for tightness: each extra level doubles the
+  sub-boxes per axis.
+- `box_<setting>` keys in `fptaylor_settings.toml` apply only in interval
+  mode. Currently `[poisson-stable] box_approx = true`: that module's box
+  queries are ~300× faster with `--approx`. Poisson and binomial boxes are the
+  opposite, so they keep `--no-approx`.
+- Hypergeometric HRUA boxes need the box's largest modal probability. It is
+  computed exactly by enumeration for boxes of at most 200,000 integer points,
+  and bounded by 1 above that (sound, but can loosen TV ~30–100×).
+
+Output: one row per box, with `<param>_lo`/`<param>_hi` columns, the regimes
+touched (e.g. `low+ptrs`), and `n_boxes` (the number of leaves analysed).
+
+### Tests
+
+```bash
+FAST=1 python3 -m unittest discover tests   # interval machinery only, <1s
+python3 -m unittest discover tests          # + FPTaylor integration (minutes)
+```
+
 ### Output structure
 
 Same layout as FPSampler below (`summary.csv`, `inputs/`, `outputs/`, and the
-plot if `--plot` is passed), under `--out-dir` (default `<dist>_runs[_<stem>]/`).
+plot if `--plot` is passed), under `--out-dir` (default `<dist>_runs[_<stem>]/`,
+or `<dist>_runs_interval/` in interval mode).
 
 ---
 

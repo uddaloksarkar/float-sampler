@@ -486,6 +486,14 @@ def add_common_args(parser):
                         help="Overrides --opt-x-abs-tol-vars for accept "
                              "queries only (eps_accept). See "
                              "--floor-opt-x-abs-tol-vars.")
+    parser.add_argument("--split-depth", type=int, default=0,
+                        help="Interval mode (--*-range): bisect every "
+                             "parameter axis of the box this many extra "
+                             "times, analysing 2^(depth*axes) sub-boxes and "
+                             "taking the max -- more FPTaylor queries, "
+                             "tighter bound (default: 0; regime switches and "
+                             "boxes too wide to analyse are split "
+                             "automatically regardless).")
 
 
 # ---------------------------------------------------------------------------
@@ -539,16 +547,26 @@ def apply_settings_defaults(args):
     argparse.parse_args(), before any distribution module reads these
     fields off args.
 
-    Precedence: explicit CLI flag > fptaylor_settings.toml[dist] >
-    hardcoded default.
+    In interval mode (any --*-range given) a `box_<field>` key in the same
+    section takes precedence over `<field>`: box queries carry the
+    parameters as extra FPTaylor variables, which can change which optimizer
+    setting is fastest (e.g. box_approx -- see fptaylor_settings.toml).
+
+    Precedence: explicit CLI flag > fptaylor_settings.toml[dist] box_<field>
+    (interval mode only) > <field> > hardcoded default.
     """
     settings = load_settings_toml()
     dist_settings = settings.get(args.dist, {})
+    box_mode = any(v is not None for k, v in vars(args).items() if k.endswith("_range"))
 
     for field in ("approx", "bb_eval", "v_trunc", "u_trunc",
                   "opt_x_abs_tol", "opt_x_abs_tol_vars",
                   "floor_opt_x_abs_tol_vars", "accept_opt_x_abs_tol_vars"):
-        if getattr(args, field, None) is None and field in dist_settings:
+        if getattr(args, field, None) is not None:
+            continue
+        if box_mode and f"box_{field}" in dist_settings:
+            setattr(args, field, dist_settings[f"box_{field}"])
+        elif field in dist_settings:
             setattr(args, field, dist_settings[field])
 
     for field, default in _HARDCODED_DEFAULTS.items():
@@ -978,6 +996,216 @@ def point_ivar(name, value, kind="real"):
     `name` afterward instead of re-embedding the literal at every occurrence."""
     lo, hi = exact_bracket(value)
     return f"  {kind} {name} in [{lo}, {hi}]"
+
+
+# ---------------------------------------------------------------------------
+# Interval (box) mode
+#
+# A box is a dict {axis: (lo, hi)} over a distribution's parameters (a
+# point is lo == hi).  Every dist_*.py runner accepts each parameter either
+# as a point or as an (lo, hi) interval: in the FPTaylor query the parameter
+# becomes a Variable over its range (param_ivar), so FPTaylor's bound holds
+# for every parameter in the box, and every Python-side constant the TV
+# formula multiplies by is taken at its worst case over the box.  A point is
+# the degenerate case of the same code path, which is what keeps point mode
+# unchanged.
+#
+# analyse_param_box drives one box: split at regime switches, optionally
+# bisect further (--split-depth), analyse each leaf, re-bisect any leaf that
+# raises BoxTooWide, and hand back every leaf result -- the bound over the
+# box is the max over the leaves (a bound over each piece of a cover bounds
+# the union).
+# ---------------------------------------------------------------------------
+
+class BoxTooWide(ValueError):
+    """Raised by a box analysis when the box must be split further before
+    it can be analysed soundly (e.g. a decoupled FPTaylor variable would
+    otherwise leave a function's domain); analyse_param_box bisects it."""
+
+
+def iv(x):
+    """(lo, hi) of an interval, or (x, x) for a point."""
+    return x if isinstance(x, tuple) else (x, x)
+
+
+def is_point(x):
+    lo, hi = iv(x)
+    return lo == hi
+
+
+def collapse(x):
+    """A degenerate (v, v) interval as the point v, so it takes exactly the
+    point-mode code path; anything else unchanged."""
+    return x[0] if isinstance(x, tuple) and x[0] == x[1] else x
+
+
+def interval_ivar(name, lo, hi, kind="real"):
+    """One Variables line for a parameter ranging over [lo, hi], endpoints
+    rounded outward to exact decimals (see exact_bracket)."""
+    lo_s, _ = exact_bracket(lo)
+    _, hi_s = exact_bracket(hi)
+    return f"  {kind} {name} in [{lo_s}, {hi_s}]"
+
+
+def param_ivar(name, value, kind="real", box_kind="float64"):
+    """point_ivar for a point (or degenerate interval), interval_ivar for a
+    proper (lo, hi) interval.
+
+    An interval parameter is declared `float64`, not `real`: FPTaylor rounds
+    a `real` variable wherever it enters a rounded expression (the input
+    conversion), but every sampler parameter already *is* a double in the C
+    code (integer ones exactly so), and a point parameter is an exact
+    constant with no such term either.  Declared `real`, a box query picks up
+    one spurious input-rounding term per use (measured: HRUA's accept query
+    grew 4 digamma-weighted terms, a ~30x looser eps_floor, and >100x the
+    runtime)."""
+    lo, hi = iv(value)
+    return point_ivar(name, lo, kind) if lo == hi else interval_ivar(name, lo, hi, box_kind)
+
+
+def bisect_interval(lo, hi, integer=False):
+    """Split [lo, hi] in two: at the geometric mean when it is positive and
+    spans more than a factor of 2 (scale parameters like lambda or n, whose
+    bounds degrade with relative rather than absolute width), else at the
+    midpoint.  Integer axes split into disjoint integer ranges, so repeated
+    bisection ends at single integers."""
+    if lo == hi:
+        return [(lo, hi)]
+    mid = math.sqrt(lo * hi) if lo > 0 and hi > 2 * lo else 0.5 * (lo + hi)
+    if integer:
+        mid = min(max(math.floor(mid), lo), hi - 1)
+        return [(lo, mid), (mid + 1, hi)]
+    return [(lo, mid), (mid, hi)]
+
+
+def bisect_box(box, integer_axes=()):
+    """Every sub-box from bisecting each non-degenerate axis once."""
+    boxes = [dict(box)]
+    for ax, (lo, hi) in box.items():
+        if lo == hi:
+            continue
+        halves = bisect_interval(lo, hi, ax in integer_axes)
+        boxes = [dict(b, **{ax: half}) for b in boxes for half in halves]
+    return boxes
+
+
+def box_label(box):
+    """'lam in [30, 100]' / 'n=1000 p in [0.1, 0.2]'."""
+    return " ".join(f"{ax}={lo:.10g}" if lo == hi else f"{ax} in [{lo:.10g}, {hi:.10g}]"
+                    for ax, (lo, hi) in ((a, iv(v)) for a, v in box.items()))
+
+
+def safe_box_name(box):
+    """Filename-safe tag for a (sub-)box, unique per endpoint pair."""
+    def f(v):
+        return f"{v:.10g}".replace(".", "p").replace("-", "m").replace("+", "")
+    return "box_" + "_".join(f"{ax}{f(lo)}" + ("" if lo == hi else f"-{f(hi)}")
+                             for ax, (lo, hi) in ((a, iv(v)) for a, v in box.items()))
+
+
+def analyse_param_box(box, regimes, split_at_switch, analyse, split_depth=0,
+                      integer_axes=(), verbose=0, max_switch_depth=10,
+                      max_retry_depth=8):
+    """
+    Analyse every parameter point of `box`; returns one dict per analysed
+    leaf (analyse's fields plus "box" and "regime").  The caller takes the
+    field-wise max (max_fields).
+
+      regimes(box)          -> set of the sampler's regimes the box touches
+      split_at_switch(box)  -> sub-boxes, splitting at (or towards) a switch
+      analyse(box, regime)  -> dict of numeric fields for that leaf
+
+    1. Boxes touching more than one regime are split until each touches one,
+       or max_switch_depth is hit; a box still straddling a switch then gets
+       every touched regime's analysis, which is sound (each of its points
+       uses one of them) if looser.
+    2. Each leaf is bisected split_depth more times along every axis.
+    3. A leaf whose analysis raises BoxTooWide is bisected and retried, up to
+       max_retry_depth times.
+    analyse sees every degenerate axis collapsed to a plain point (collapse),
+    so a box of width 0 takes exactly the point-mode path.
+    """
+    pending, leaves = [(box, 0)], []
+    while pending:
+        b, depth = pending.pop()
+        regs = regimes(b)
+        if len(regs) > 1 and depth < max_switch_depth:
+            pending += [(sb, depth + 1) for sb in split_at_switch(b)]
+        else:
+            leaves.append(b)
+    for _ in range(split_depth):
+        leaves = [sb for b in leaves for sb in bisect_box(b, integer_axes)]
+
+    results = []
+    work = [(b, r, 0) for b in leaves for r in sorted(regimes(b))]
+    while work:
+        b, r, depth = work.pop(0)
+        try:
+            fields = analyse({ax: collapse(v) for ax, v in b.items()}, r)
+        except BoxTooWide as exc:
+            subs = bisect_box(b, integer_axes)
+            if depth >= max_retry_depth or len(subs) == 1:
+                raise
+            vprint(verbose, f"split {box_label(b)}", reason=str(exc))
+            work += [(sb, r, depth + 1) for sb in subs if r in regimes(sb)]
+            continue
+        results.append(dict(fields, box=b, regime=r))
+    return results
+
+
+_PARAM_TOL_DIVS = 16
+
+
+def with_param_tols(tol_vars, ranges):
+    """--opt-x-abs-tol-vars string `tol_vars` (or None), plus a per-variable
+    tolerance of width/_PARAM_TOL_DIVS for each interval in `ranges`
+    ({FPTaylor variable name: point or (lo, hi)}) it doesn't already name.
+
+    A box parameter is an extra FPTaylor variable; left at the flat
+    --opt-x-abs-tol (0.01 absolute), branch-and-bound may subdivide e.g.
+    lambda in [1000, 1100] into ~10^4 slices.  Capping its splitting at a
+    fixed fraction of its own width keeps the cost independent of the
+    parameter's scale; any tolerance is sound (it only decides when
+    splitting stops).  Points add nothing, so point mode is unaffected."""
+    named = {kv.split("=", 1)[0] for kv in (tol_vars or "").split(",") if "=" in kv}
+    extra = [f"{name}={(hi - lo) / _PARAM_TOL_DIVS:.6g}"
+             for name, (lo, hi) in ((n, iv(r)) for n, r in ranges.items())
+             if hi > lo and name not in named]
+    if not extra:
+        return tol_vars
+    return ",".join(([tol_vars] if tol_vars else []) + extra)
+
+
+def csv_num(v):
+    """CSV cell for an optional float: '' when the field doesn't apply."""
+    return "" if v is None else f"{v:.17e}"
+
+
+def fmt_num(v):
+    """Printed value for an optional float."""
+    return "n/a" if v is None else f"{v:.6e}"
+
+
+def max_fields(results, fields):
+    """Field-wise max over analyse_param_box's leaf results, skipping
+    leaves that don't produce a field (another regime's); None if none do."""
+    out = {}
+    for f in fields:
+        vals = [r[f] for r in results if r.get(f) is not None]
+        out[f] = max(vals) if vals else None
+    return out
+
+
+def parse_range(values, name, lo_min=None, hi_max=None, integer=False):
+    """(lo, hi) from an argparse nargs=2 value, validated."""
+    lo, hi = (int(v) for v in values) if integer else (float(v) for v in values)
+    if lo > hi:
+        raise ValueError(f"{name}: need MIN <= MAX, got [{lo}, {hi}]")
+    if lo_min is not None and lo < lo_min:
+        raise ValueError(f"{name}: MIN must be >= {lo_min}")
+    if hi_max is not None and hi > hi_max:
+        raise ValueError(f"{name}: MAX must be <= {hi_max}")
+    return lo, hi
 
 
 def make_logv_template(fp, v_lo, v_hi=1.0):

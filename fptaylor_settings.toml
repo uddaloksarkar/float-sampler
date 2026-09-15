@@ -102,6 +102,15 @@ accept_opt_x_abs_tol_vars = "u=0.1"
 # exist in this module's templates (declared "us" and "k" instead) -- unset
 # here just means every variable falls back to the flat opt_x_abs_tol.
 approx = false
+# box_approx: interval mode (--lam-range) only -- see
+# dist_common.apply_settings_defaults. Box queries carry the constants
+# (a, b, lam, C, ...) as extra FPTaylor variables, and here the joint
+# --no-approx optimization scales badly with them: lambda in
+# [1000, 1100], series accept query 300s --no-approx vs 0.96s --approx
+# (bound 2% looser). NOT set for [poisson]/[binomial]: there the
+# opposite holds (poisson [50, 60]: 3s --no-approx vs 62s --approx;
+# binomial BTRS box accept: 0.9s vs >10 min).
+box_approx = true
 bb_eval = true
 v_trunc = 1e-20
 u_trunc = 1e-5

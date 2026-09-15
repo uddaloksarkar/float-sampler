@@ -16,15 +16,17 @@ from dist_common import (
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
     ulp_rnd_op,
-    point_ivar,
+    iv, param_ivar, interval_ivar,
     hormann_proposal_deviation, acceptance_tv,
     vprint, elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
+    analyse_param_box, max_fields, parse_range, safe_box_name, box_label,
+    csv_num, fmt_num, with_param_tols,
 )
 
 NAME = "poisson"
-CSV_FIELDS = ["lambda", "fp", "regime", "eps_floor", "eps_accept", "tv",
-              "ref_tv", "time_s"]
+CSV_FIELDS = ["lambda", "lambda_lo", "lambda_hi", "fp", "regime",
+              "eps_floor", "eps_accept", "tv", "ref_tv", "n_boxes", "time_s"]
 
 
 # ---------------------------------------------------------------------------
@@ -104,13 +106,14 @@ def make_ptrs_floor_template(lam, fp, utail):
 
     Only u is free; lambda is declared as a Variable bracketing its exact
     value (dist_common.exact_bracket) so a, b, c reference it by name
-    instead of re-embedding the literal at every occurrence.
+    instead of re-embedding the literal at every occurrence -- or, for an
+    (lo, hi) interval, ranging over it (dist_common.param_ivar).
     """
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
         f"  real u in [{-(0.5 - utail):.20e}, {0.5 - utail:.20e}],\n"
-        + point_ivar("lam", lam) + ";\n\n"
+        + param_ivar("lam", lam) + ";\n\n"
         + "Definitions\n"
         + "\n".join(ptrs_setup_defs(rnd, "lam")) + "\n"
         + f"  us_   {rnd}= 0.5 - abs(u),\n"
@@ -163,7 +166,7 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, k_lo, k_hi, fast=False):
         "Variables\n"
         f"  real u in [{u_lo:.20e}, {u_hi:.20e}],\n"
         f"  real k in [{k_lo:.20e}, {k_hi:.20e}],\n"
-        + point_ivar("lam", lam) + ";\n\n"
+        + param_ivar("lam", lam) + ";\n\n"
         + "Definitions\n"
         + "\n".join(ptrs_setup_defs(rnd, "lam", accept=True)) + "\n"
         + f"  us_    {rnd}= 0.5 - abs(u),\n"
@@ -183,17 +186,25 @@ def make_ptrs_accept_template(lam, fp, u_lo, u_hi, k_lo, k_hi, fast=False):
 
 def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     """(eps_floor, eps_accept, tv) for the PTRS regime at lambda; composes
-    the theorem 2.7 bound."""
+    the theorem 2.7 bound.
+
+    lam may be an (lo, hi) interval: the queries then range over it, and
+    the constants TV multiplies by take their worst case over it -- slam, a,
+    b, c all increase with lambda, so invalpha and the Hormann factor
+    1 + 3/(4a+b) are largest at lo, while the k window is widest at hi.
+    """
+    label = _lam_label(lam)
+    lam_lo, lam_hi = iv(lam)
     fp, verbose = args.fp, args.verbose
     fast, v_trunc = args.fast, args.v_trunc
     ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
     x_abs_tol, approx = args.opt_x_abs_tol, args.approx
     u_trunc = args.u_trunc
-    floor_tol_vars = floor_x_abs_tol_vars(args)
-    accept_tol_vars = accept_x_abs_tol_vars(args)
+    floor_tol_vars = with_param_tols(floor_x_abs_tol_vars(args), {"lam": lam})
+    accept_tol_vars = with_param_tols(accept_x_abs_tol_vars(args), {"lam": lam})
     if u_trunc is None or not (0.0 < u_trunc < 0.5):
         raise ValueError("PTRS requires --u-trunc with 0 < u_trunc < 0.5")
-    slam, a, b, c = ptrs_consts(lam)
+    slam, a, b, c = ptrs_consts(lam_lo)
     invalpha = 1.1239 + 1.1328 / (b - 3.4)
 
     # k is declared directly over its own interval (ptrs_accept_k_range),
@@ -202,11 +213,11 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
     # query over u's full (both-signs), u_trunc-truncated range: the
     # distribution's entire domain out to that cutoff, same as the floor
     # query, with no separate tail-probability correction needed.
-    k_lo, k_hi = ptrs_accept_k_range(lam, u_trunc)
+    k_lo, k_hi = ptrs_accept_k_range(lam_hi, u_trunc)
     u_lo, u_hi = clip_u_trunc(-0.5, 0.5, u_trunc)
     if u_lo > u_hi:
-        raise ValueError(f"lambda={lam}: u-range emptied by u_trunc={u_trunc}")
-    vprint(verbose, f"poisson PTRS lambda={lam}",
+        raise ValueError(f"{label}: u-range emptied by u_trunc={u_trunc}")
+    vprint(verbose, f"poisson PTRS {label}",
            slam=slam, a=a, b=b, c=c, invalpha=invalpha,
            u_lo=u_lo, u_hi=u_hi, k_lo=k_lo, k_hi=k_hi,
            v_trunc=v_trunc, u_trunc=u_trunc)
@@ -220,9 +231,9 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
                                        ratio_tol, bb_eval, x_abs_tol, floor_tol_vars, approx)
     floor_output.write_text(output)
     if verbose >= 2:
-        print(f"--- FPTaylor PTRS floor (lambda={lam}) ---\n{output}")
+        print(f"--- FPTaylor PTRS floor ({label}) ---\n{output}")
     if code != 0:
-        raise RuntimeError(f"FPTaylor PTRS floor failed for lambda={lam}; see {floor_output}")
+        raise RuntimeError(f"FPTaylor PTRS floor failed for {label}; see {floor_output}")
 
     floor_raw = extract_abs_errors_by_problem(output)["eps_floor"]
     eps_floor = hormann_proposal_deviation(floor_raw, a, b)
@@ -238,10 +249,10 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
                                        accept_tol_vars, approx)
     accept_output.write_text(output)
     if verbose >= 2:
-        print(f"--- FPTaylor PTRS accept (lambda={lam}) ---\n{output}")
+        print(f"--- FPTaylor PTRS accept ({label}) ---\n{output}")
     if code != 0:
         raise RuntimeError(f"FPTaylor PTRS accept failed for "
-                           f"lambda={lam}; see {accept_output}")
+                           f"{label}; see {accept_output}")
     accept_raw = extract_abs_errors_by_problem(output)["eps_accept"]
 
     logv, _ = eps_logv(
@@ -266,13 +277,31 @@ def _run_ptrs_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
 # Low-range FPTaylor templates  (lambda < SWITCH)
 # ---------------------------------------------------------------------------
 
-def _make_low_range_template(lam_str, fp):
-    lam = float(lam_str)
-    k_star = int(lam + 10 * math.sqrt(lam))
+def _low_range_k_star(lam):
+    """Knuth's worst-case iteration count K* = lambda + 10*sqrt(lambda); for
+    an (lo, hi) interval, at hi -- the product error only grows with the
+    number of multiplications, so the longest chain covers every lambda."""
+    lam_hi = iv(lam)[1]
+    return int(lam_hi + 10 * math.sqrt(lam_hi))
+
+
+def _low_range_lambda_lines(lam):
+    """(Variables lines, Definitions lines) introducing `lambda`: an exact
+    literal for a point (the input string, verbatim), a Variable over an
+    (lo, hi) interval."""
+    if isinstance(lam, tuple):
+        return [interval_ivar("lambda", *lam, kind="float64")], []
+    return [], [f"  lambda = {lam}"]
+
+
+def _make_low_range_template(lam, fp):
+    """lam: the input string (a point) or an (lo, hi) interval."""
+    k_star = _low_range_k_star(lam if isinstance(lam, tuple) else float(lam))
     rnd = FP_TO_FPTAYLOR_RND[fp]
-    var_lines = [f"  real u_{i} in [0, 1]" for i in range(1, k_star + 1)]
+    lam_vars, lam_defs = _low_range_lambda_lines(lam)
+    var_lines = [f"  real u_{i} in [0, 1]" for i in range(1, k_star + 1)] + lam_vars
     def_lines = (
-        [f"  lambda = {lam_str}", f"  L = {rnd}(exp(-lambda))", f"  p_1 = {rnd}(u_1)"]
+        lam_defs + [f"  L = {rnd}(exp(-lambda))", f"  p_1 = {rnd}(u_1)"]
         + [f"  p_{i} = {rnd}(p_{i-1} * u_{i})" for i in range(2, k_star + 1)]
     )
     return (
@@ -284,15 +313,17 @@ def _make_low_range_template(lam_str, fp):
     )
 
 
-def _make_log_low_range_template(lam_str, fp):
-    lam = float(lam_str)
-    k_star = int(lam + 10 * math.sqrt(lam))
+def _make_log_low_range_template(lam, fp):
+    """lam: the input string (a point) or an (lo, hi) interval."""
+    k_star = _low_range_k_star(lam if isinstance(lam, tuple) else float(lam))
     rnd = FP_TO_FPTAYLOR_RND[fp]
-    var_lines = [f"  real u_{i} in [1e-300, 1]" for i in range(1, k_star + 1)]
+    lam_vars, lam_defs = _low_range_lambda_lines(lam)
+    lam_ref = "lambda" if isinstance(lam, tuple) else lam
+    var_lines = [f"  real u_{i} in [1e-300, 1]" for i in range(1, k_star + 1)] + lam_vars
     def_lines = (
-        [f"  lambda = {lam_str}",
-         f"  lambda_fp {rnd}= {lam_str}",
-         f"  logp_1 = {rnd}(log(u_1))"]
+        lam_defs
+        + [f"  lambda_fp {rnd}= {lam_ref}",
+           f"  logp_1 = {rnd}(log(u_1))"]
         + [f"  logp_{i} = {rnd}(logp_{i-1} + {rnd}(log(u_{i})))"
            for i in range(2, k_star + 1)]
     )
@@ -306,10 +337,14 @@ def _make_log_low_range_template(lam_str, fp):
 
 
 def _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env):
-    """tv for the low range at lambda (`lam` is the input string, embedded
-    verbatim as the template's literal). Also used by dist_poisson_stable."""
+    """tv for the low range at lambda -- `lam` is the input string (embedded
+    verbatim as the template's literal) or an (lo, hi) interval, for which
+    TV is taken at hi (the smallest e^-lambda the error is divided by).
+    Also used by dist_poisson_stable."""
+    label = _lam_label(lam)
     fp, verbose = args.fp, args.verbose
-    lam_float = float(lam)
+    lam_hi = iv(lam)[1] if isinstance(lam, tuple) else float(lam)
+    vprint(verbose, f"poisson low range {label}", k_star=_low_range_k_star(lam_hi))
 
     lr_input  = inputs_dir  / f"low_range_{fp}_lam_{tag}.txt"
     lr_output = outputs_dir / f"low_range_{fp}_lam_{tag}.out"
@@ -321,9 +356,9 @@ def _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, e
     code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
     lr_output.write_text(output)
     if verbose >= 2:
-        print(f"--- FPTaylor low range (lambda={lam}) ---\n{output}")
+        print(f"--- FPTaylor low range ({label}) ---\n{output}")
     if code != 0:
-        raise RuntimeError(f"FPTaylor low range failed for lambda={lam}; see {lr_output}")
+        raise RuntimeError(f"FPTaylor low range failed for {label}; see {lr_output}")
 
     errs = extract_abs_errors_by_problem(output)
     if args.use_log:
@@ -337,7 +372,7 @@ def _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, e
         if missing:
             raise RuntimeError(f"could not parse low-range errors for {', '.join(sorted(missing))}")
         _, _, tv = _compute_low_range_delta(
-            lam_float, errs["L_compute"], errs["prod_compute"])
+            lam_hi, errs["L_compute"], errs["prod_compute"])
     return tv
 
 
@@ -378,10 +413,95 @@ def _compute_log_low_range_delta(lambda_fp_error, log_prod_error):
     return E, 2 * E
 
 
+def _lam_label(lam):
+    """'lambda=50' for a point, 'lambda in [30, 100]' for an interval."""
+    if isinstance(lam, tuple):
+        return f"lambda in [{lam[0]:.10g}, {lam[1]:.10g}]"
+    return f"lambda={lam}"
+
+
 def _empty_row(lam, fp):
-    return {"lambda": lam, "fp": fp, "regime": "",
-            "eps_floor": "", "eps_accept": "", "tv": "", "ref_tv": "",
-            "time_s": ""}
+    return {"lambda": lam, "lambda_lo": "", "lambda_hi": "", "fp": fp,
+            "regime": "", "eps_floor": "", "eps_accept": "", "tv": "",
+            "ref_tv": "", "n_boxes": "", "time_s": ""}
+
+
+# ---------------------------------------------------------------------------
+# Interval mode  (--lam-range)
+# ---------------------------------------------------------------------------
+
+_LOW_TOP = math.nextafter(SWITCH, 0.0)     # largest lambda in the low range
+
+
+def _box_regimes(box):
+    lo, hi = box["lam"]
+    return ({"low"} if lo < SWITCH else set()) | ({"ptrs"} if hi >= SWITCH else set())
+
+
+def _split_at_switch(box):
+    lo, hi = box["lam"]
+    return [{"lam": (lo, _LOW_TOP)}, {"lam": (SWITCH, hi)}]
+
+
+def _ref_tv(lam_iv, regime, fp):
+    """analyticError's reference bound at the box's endpoints (indicative
+    only: the analytic formulas are not maximised over the box)."""
+    ref = (computeDeltaLowRange if regime == "low"
+           else lambda lam, beta: computeDeltaHighRange(lam, beta)[0])
+    return max(ref(lam, FP_BETA[fp]) for lam in iv(lam_iv))
+
+
+def run_box(args, fptaylor, inputs_dir, outputs_dir, env, box, ptrs_runner=None,
+            ptrs_regime=("ptrs", "PTRS")):
+    """One row bounding TV over every lambda in box["lam"], via
+    dist_common.analyse_param_box: split at SWITCH, then the low-range and
+    PTRS runners over each piece.  ptrs_runner / ptrs_regime (CSV name,
+    printed tag) let dist_poisson_stable reuse this with its own PTRS
+    analysis."""
+    ptrs_runner = ptrs_runner or _run_ptrs_fptaylor
+    start = time.perf_counter()
+
+    def analyse(sub, regime):
+        lam, tag = sub["lam"], safe_box_name(sub)
+        if regime == "low":
+            tv = _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, env)
+            return {"tv": tv, "ref_tv": _ref_tv(lam, regime, args.fp)}
+        eps_floor, eps_accept, tv = ptrs_runner(
+            fptaylor, lam, args, tag, inputs_dir, outputs_dir, env)
+        return {"eps_floor": eps_floor, "eps_accept": eps_accept, "tv": tv,
+                "ref_tv": _ref_tv(lam, regime, args.fp)}
+
+    results = analyse_param_box(box, _box_regimes, _split_at_switch, analyse,
+                                args.split_depth, verbose=args.verbose)
+    worst = max_fields(results, ("eps_floor", "eps_accept", "tv", "ref_tv"))
+    names = {"low": ("low", "low"), "ptrs": ptrs_regime}
+    regimes = sorted({r["regime"] for r in results})
+
+    row = _empty_row("", args.fp)
+    row.update({
+        "lambda_lo": f"{box['lam'][0]:.17g}",
+        "lambda_hi": f"{box['lam'][1]:.17g}",
+        "regime": "+".join(names[r][0] for r in regimes),
+        "eps_floor": csv_num(worst["eps_floor"]),
+        "eps_accept": csv_num(worst["eps_accept"]),
+        "tv": csv_num(worst["tv"]),
+        "ref_tv": csv_num(worst["ref_tv"]),
+        "n_boxes": len(results),
+        "time_s": f"{elapsed_since(start):.6f}",
+    })
+    print(f"{box_label(box)} [{'+'.join(names[r][1] for r in regimes)}]"
+          f" boxes={len(results)} eps_floor={fmt_num(worst['eps_floor'])}"
+          f" eps_accept={fmt_num(worst['eps_accept'])} TV={fmt_num(worst['tv'])}"
+          f" ref_TV={fmt_num(worst['ref_tv'])}"
+          f" time={format_seconds(float(row['time_s']))}")
+    return row
+
+
+def lam_range_box(args):
+    lo, hi = parse_range(args.lam_range, "--lam-range")
+    if lo <= 0:
+        raise ValueError("--lam-range: lambda must be positive")
+    return {"lam": (lo, hi)}
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +514,10 @@ def add_args(parser):
                         help="File with lambda values, one or more per line")
     source.add_argument("--lam", type=float, default=None,
                         help="Single lambda value")
+    source.add_argument("--lam-range", nargs=2, type=float, default=None,
+                        metavar=("LMIN", "LMAX"),
+                        help="Interval mode: one TV bound valid for every "
+                             "lambda in [LMIN, LMAX] (see --split-depth)")
     parser.add_argument("--use-log", action="store_true",
                         help="Use log-space template for low-range lambdas")
     parser.add_argument("--fast", action="store_true",
@@ -405,6 +529,8 @@ def add_args(parser):
 
 
 def default_out_dir(args):
+    if getattr(args, "lam_range", None) is not None:
+        return ROOT / "poisson_runs_interval"
     lf = getattr(args, "lambda_file", None)
     if lf is None:
         return ROOT / "poisson_runs"
@@ -412,6 +538,8 @@ def default_out_dir(args):
 
 
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
+    if args.lam_range is not None:
+        return [run_box(args, fptaylor, inputs_dir, outputs_dir, env, lam_range_box(args))]
     lambdas = [str(args.lam)] if args.lam is not None else read_lambdas(args.lambda_file)
 
     rows = []
@@ -463,6 +591,10 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 
 
 def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
+    rows = [r for r in rows if r["lambda"]]          # interval rows aren't points
+    if not rows:
+        print("Nothing to plot: interval-mode rows are not points on the lambda axis")
+        return False
     points = []
     for row in rows:
         points.append((float(row["lambda"]), float(row["tv"]), float(row["ref_tv"])))

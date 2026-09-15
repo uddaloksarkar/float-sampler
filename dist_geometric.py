@@ -6,6 +6,11 @@ Two regimes, split at p = _SWITCH (1/3 by default):
   p <  _SWITCH : inversion -- X = ceil(log(1-u)/log(1-p)); absolute error
                               delta of H(u) = log(1-u)/log(1-p)
 Both regimes run on FPTaylor (default) or CIRE (--backend cire).
+
+Every runner takes p either as a point or as a (lo, hi) interval (interval
+mode, --p-range): see dist_common's "Interval (box) mode" section.  The TV
+formulas' p-dependent factors are each taken at their own worst end of the
+interval.
 """
 import math
 import time
@@ -15,14 +20,16 @@ from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     run_cire_llvm, extract_cire_abs_error,
-    point_ivar,
+    iv, param_ivar,
     vprint, elapsed_since, format_seconds,
     dist_switch,
+    analyse_param_box, max_fields, parse_range, safe_box_name, box_label,
+    csv_num, fmt_num,
 )
 
 NAME = "geometric"
-CSV_FIELDS = ["p", "fp", "regime", "backend", "eps0", "eps1", "eps2", "delta",
-              "tv", "time_s"]
+CSV_FIELDS = ["p", "p_lo", "p_hi", "fp", "regime", "backend", "eps0", "eps1",
+              "eps2", "delta", "tv", "n_boxes", "time_s"]
 
 # p threshold: inversion below, search above -- overridable via
 # fptaylor_settings.toml's [geometric].switch (dist_common.dist_switch).
@@ -45,13 +52,14 @@ def _make_search_template(p, fp):
       eps1 : rel. error of prod = z * q
       eps2 : rel. error of sum  = sum + prod
     """
-    z_lo = p * math.exp(-22)
+    p_lo = iv(p)[0]          # z's and sum's ranges only widen as p shrinks
+    z_lo = p_lo * math.exp(-22)
     rnd = FP_TO_FPTAYLOR_RND[fp]
     return (
         "Variables\n"
         f"  real z in [{z_lo:.20e}, 1.0],\n"
-        f"  real sum in [{p:.20e}, 1.0],\n"
-        + point_ivar("p", p) + ";\n\n"
+        f"  real sum in [{p_lo:.20e}, 1.0],\n"
+        + param_ivar("p", p) + ";\n\n"
         + "Definitions\n"
         f"  q         {rnd}= 1.0 - p,\n"
         f"  prod      {rnd}= z * q,\n"
@@ -75,14 +83,18 @@ double geometric_sum(double s, double pr) { return s + pr; }
 
 def _compute_search_tv(p, eps0, eps1, eps2):
     """tv from the search loop's per-op relative errors: eps2 is charged on
-    the 7/log(1/q) expected summation steps."""
-    return 0.5 * (eps0 + eps1 * p + eps2 * 7.0 / math.log(1.0 / (1.0 - p)))
+    the 7/log(1/q) expected summation steps.  For an interval, eps1's factor
+    p is largest at hi and 7/log(1/q) at lo."""
+    p_lo, p_hi = iv(p)
+    return 0.5 * (eps0 + eps1 * p_hi + eps2 * 7.0 / math.log(1.0 / (1.0 - p_lo)))
 
 
 def _run_search_fptaylor(fptaylor, p, args, tag, inputs_dir, outputs_dir, env):
-    """(eps0, eps1, eps2, tv) for the search regime at p, via FPTaylor."""
+    """(eps0, eps1, eps2, tv) for the search regime at p (point or
+    interval), via FPTaylor."""
+    label = _p_label(p)
     fp, verbose = args.fp, args.verbose
-    vprint(verbose, f"geometric search p={p}", z_lo=p * math.exp(-22))
+    vprint(verbose, f"geometric search {label}", z_lo=iv(p)[0] * math.exp(-22))
 
     search_input  = inputs_dir  / f"geometric_search_{fp}_{tag}.txt"
     search_output = outputs_dir / f"geometric_search_{fp}_{tag}.out"
@@ -92,36 +104,38 @@ def _run_search_fptaylor(fptaylor, p, args, tag, inputs_dir, outputs_dir, env):
         [fptaylor, "--rel-error", "true", str(search_input)], cwd=ROOT, env=env)
     search_output.write_text(output)
     if verbose >= 2:
-        print(f"--- FPTaylor search (p={p}) ---\n{output}")
+        print(f"--- FPTaylor search ({label}) ---\n{output}")
     if code != 0:
-        raise RuntimeError(f"FPTaylor search failed for p={p}; see {search_output}")
+        raise RuntimeError(f"FPTaylor search failed for {label}; see {search_output}")
 
-    deltas = extract_deltas_by_problem(output, f"p={p}")
+    deltas = extract_deltas_by_problem(output, label)
     eps0, eps1, eps2 = deltas["eps0"], deltas["eps1"], deltas["eps2"]
     return eps0, eps1, eps2, _compute_search_tv(p, eps0, eps1, eps2)
 
 
 def _run_search_cire(cire, p, args, tag, inputs_dir, outputs_dir):
-    """(eps0, eps1, eps2, tv) for the search regime at p, via CIRE.  CIRE
-    reports absolute errors; each is turned into a relative one by dividing
-    by the lower bound of its exact expression."""
-    q = 1.0 - p
-    z_lo = p * math.exp(-22)
-    vprint(args.verbose, f"geometric search p={p}", z_lo=z_lo)
+    """(eps0, eps1, eps2, tv) for the search regime at p (point or
+    interval), via CIRE.  CIRE reports absolute errors; each is turned into
+    a relative one by dividing by the lower bound of its exact expression."""
+    label = _p_label(p)
+    p_lo, p_hi = iv(p)
+    q_lo, q_hi = 1.0 - p_hi, 1.0 - p_lo
+    z_lo = p_lo * math.exp(-22)
+    vprint(args.verbose, f"geometric search {label}", z_lo=z_lo)
 
-    def one(func, domains, label):
+    def one(func, domains, what):
         rc, out = run_cire_llvm(cire, _SEARCH_C, func, domains, tag,
                                 inputs_dir, outputs_dir, verbose=args.verbose)
         if rc != 0:
-            raise RuntimeError(f"CIRE search failed for {label} (p={p})")
-        return extract_cire_abs_error(out, label)
+            raise RuntimeError(f"CIRE search failed for {what} ({label})")
+        return extract_cire_abs_error(out, what)
 
-    # eps0: 1-p  -> lower bound = q (single-valued)
+    # eps0: 1-p  -> lower bound = q
     # eps1: z*q  -> lower bound = z_lo * q
     # eps2: s+pr -> lower bound = p (min sum = p, min prod = 0)
-    eps0 = one("geometric_q",    [(p, p)],               "eps0") / q
-    eps1 = one("geometric_prod", [(z_lo, 1.0), (q, q)],  "eps1") / max(z_lo * q, 1e-300)
-    eps2 = one("geometric_sum",  [(p, 1.0), (0.0, 1.0)], "eps2") / p
+    eps0 = one("geometric_q",    [(p_lo, p_hi)],               "eps0") / q_lo
+    eps1 = one("geometric_prod", [(z_lo, 1.0), (q_lo, q_hi)],  "eps1") / max(z_lo * q_lo, 1e-300)
+    eps2 = one("geometric_sum",  [(p_lo, 1.0), (0.0, 1.0)],    "eps2") / p_lo
     return eps0, eps1, eps2, _compute_search_tv(p, eps0, eps1, eps2)
 
 
@@ -142,7 +156,7 @@ def _make_inversion_template(p, fp):
     return (
         "Variables\n"
         f"  real u in [0.0, 9.99999900000000000000e-01],\n"
-        + point_ivar("p", p) + ";\n\n"
+        + param_ivar("p", p) + ";\n\n"
         + "Definitions\n"
         f"  log_q   {rnd}= log(1.0 - p),\n"
         f"  log_1mu {rnd}= log(1.0 - u),\n"
@@ -161,15 +175,30 @@ double geometric_H(double u, double p) { return log(1.0 - u) / log(1.0 - p); }
 
 def _compute_inversion_tv(p, delta):
     """tv from H's absolute error delta, plus the 1e-7 of u-mass above the
-    analysed u <= 0.9999999."""
-    log_inv_q = math.log(1.0 / (1.0 - p))
-    return 2.0 * (1.0 - p) / p * math.sinh(delta * log_inv_q) + 1e-7
+    analysed u <= 0.9999999.
+
+    For an interval, write tv - 1e-7 = 2*delta * h(p) * S(delta*L(p)) with
+    L = log(1/q), h(p) = (1-p)*L(p)/p and S(t) = sinh(t)/t: h decreases in
+    p (from 1 at p -> 0; checked in tests/test_interval.py) and S increases
+    in t, with L increasing in p, so h is taken at lo and S at hi.  Taking
+    (1-p)/p and L at opposite ends instead was ~300x loose over p in
+    [0.001, 0.3]."""
+    if not isinstance(p, tuple):
+        log_inv_q = math.log(1.0 / (1.0 - p))
+        return 2.0 * (1.0 - p) / p * math.sinh(delta * log_inv_q) + 1e-7
+    p_lo, p_hi = p
+    h_lo = (1.0 - p_lo) * math.log(1.0 / (1.0 - p_lo)) / p_lo
+    t_hi = delta * math.log(1.0 / (1.0 - p_hi))
+    s_hi = math.sinh(t_hi) / t_hi if t_hi > 0.0 else 1.0
+    return 2.0 * delta * h_lo * s_hi + 1e-7
 
 
 def _run_inversion_fptaylor(fptaylor, p, args, tag, inputs_dir, outputs_dir, env):
-    """(delta, tv) for the inversion regime at p, via FPTaylor."""
+    """(delta, tv) for the inversion regime at p (point or interval), via
+    FPTaylor."""
+    label = _p_label(p)
     fp, verbose = args.fp, args.verbose
-    vprint(verbose, f"geometric inversion p={p}", log_q=math.log(1.0 - p))
+    vprint(verbose, f"geometric inversion {label}", log_q=math.log(1.0 - iv(p)[1]))
 
     inv_input  = inputs_dir  / f"geometric_inversion_{fp}_{tag}.txt"
     inv_output = outputs_dir / f"geometric_inversion_{fp}_{tag}.out"
@@ -179,25 +208,27 @@ def _run_inversion_fptaylor(fptaylor, p, args, tag, inputs_dir, outputs_dir, env
         [fptaylor, "--rel-error", "true", str(inv_input)], cwd=ROOT, env=env)
     inv_output.write_text(output)
     if verbose >= 2:
-        print(f"--- FPTaylor inversion (p={p}) ---\n{output}")
+        print(f"--- FPTaylor inversion ({label}) ---\n{output}")
     if code != 0:
-        raise RuntimeError(f"FPTaylor inversion failed for p={p}; see {inv_output}")
+        raise RuntimeError(f"FPTaylor inversion failed for {label}; see {inv_output}")
 
     abs_errors = extract_abs_errors_by_problem(output)
     if "delta" not in abs_errors:
-        raise RuntimeError(f"p={p}: could not parse absolute error for 'delta'")
+        raise RuntimeError(f"{label}: could not parse absolute error for 'delta'")
     delta = abs_errors["delta"]
     return delta, _compute_inversion_tv(p, delta)
 
 
 def _run_inversion_cire(cire, p, args, tag, inputs_dir, outputs_dir):
-    """(delta, tv) for the inversion regime at p, via CIRE."""
-    vprint(args.verbose, f"geometric inversion p={p}", log_q=math.log(1.0 - p))
+    """(delta, tv) for the inversion regime at p (point or interval), via
+    CIRE."""
+    label = _p_label(p)
+    vprint(args.verbose, f"geometric inversion {label}", log_q=math.log(1.0 - iv(p)[1]))
     rc, out = run_cire_llvm(cire, _INVERSION_C, "geometric_H",
-                            [(0.0, 0.9999999), (p, p)], tag,
+                            [(0.0, 0.9999999), iv(p)], tag,
                             inputs_dir, outputs_dir, verbose=args.verbose)
     if rc != 0:
-        raise RuntimeError(f"CIRE inversion failed for delta (p={p})")
+        raise RuntimeError(f"CIRE inversion failed for delta ({label})")
     delta = extract_cire_abs_error(out, "delta")
     return delta, _compute_inversion_tv(p, delta)
 
@@ -208,6 +239,10 @@ def _run_inversion_cire(cire, p, args, tag, inputs_dir, outputs_dir):
 
 def _use_inversion(p):
     return p < _SWITCH
+
+
+def _p_label(p):
+    return box_label({"p": p}) if isinstance(p, tuple) else f"p={p}"
 
 
 def safe_p_name(p):
@@ -237,9 +272,66 @@ def read_ps(path):
 
 
 def _empty_row(p, fp, backend):
-    return {"p": f"{p:.17g}", "fp": fp, "regime": "", "backend": backend,
+    return {"p": "" if p == "" else f"{p:.17g}", "p_lo": "", "p_hi": "",
+            "fp": fp, "regime": "", "backend": backend,
             "eps0": "", "eps1": "", "eps2": "", "delta": "", "tv": "",
-            "time_s": ""}
+            "n_boxes": "", "time_s": ""}
+
+
+# ---------------------------------------------------------------------------
+# Interval mode  (--p-range)
+# ---------------------------------------------------------------------------
+
+def _box_regimes(box):
+    lo, hi = box["p"]
+    return (({"inversion"} if lo < _SWITCH else set())
+            | ({"search"} if hi >= _SWITCH else set()))
+
+
+def _split_at_switch(box):
+    lo, hi = box["p"]
+    return [{"p": (lo, math.nextafter(_SWITCH, 0.0))}, {"p": (_SWITCH, hi)}]
+
+
+def run_box(args, fptaylor, inputs_dir, outputs_dir, env, p_iv):
+    """One row bounding TV over every p in p_iv."""
+    start = time.perf_counter()
+    cire = args.backend == "cire"
+
+    def analyse(sub, regime):
+        p, tag = sub["p"], safe_box_name(sub)
+        if regime == "inversion":
+            if cire:
+                delta, tv = _run_inversion_cire(
+                    fptaylor, p, args, tag, inputs_dir, outputs_dir)
+            else:
+                delta, tv = _run_inversion_fptaylor(
+                    fptaylor, p, args, tag, inputs_dir, outputs_dir, env)
+            return {"delta": delta, "tv": tv}
+        if cire:
+            eps0, eps1, eps2, tv = _run_search_cire(
+                fptaylor, p, args, tag, inputs_dir, outputs_dir)
+        else:
+            eps0, eps1, eps2, tv = _run_search_fptaylor(
+                fptaylor, p, args, tag, inputs_dir, outputs_dir, env)
+        return {"eps0": eps0, "eps1": eps1, "eps2": eps2, "tv": tv}
+
+    fields = ("eps0", "eps1", "eps2", "delta", "tv")
+    results = analyse_param_box({"p": p_iv}, _box_regimes, _split_at_switch, analyse,
+                                args.split_depth, verbose=args.verbose)
+    worst = max_fields(results, fields)
+    regimes = sorted({r["regime"] for r in results})
+
+    row = _empty_row("", args.fp, args.backend)
+    row.update({"p_lo": f"{p_iv[0]:.17g}", "p_hi": f"{p_iv[1]:.17g}",
+                "regime": "+".join(regimes), "n_boxes": len(results),
+                "time_s": f"{elapsed_since(start):.6f}"})
+    row.update({f: csv_num(worst[f]) for f in fields})
+    print(f"{box_label({'p': p_iv})} [{'+'.join(regimes)}] boxes={len(results)}"
+          f" eps0={fmt_num(worst['eps0'])} eps1={fmt_num(worst['eps1'])}"
+          f" eps2={fmt_num(worst['eps2'])} delta={fmt_num(worst['delta'])}"
+          f" TV={fmt_num(worst['tv'])} time={format_seconds(float(row['time_s']))}")
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -252,9 +344,15 @@ def add_args(parser):
                         help="File with p values, one or more per line")
     source.add_argument("--p", type=float, default=None,
                         help="Single probability p in (0,1)")
+    source.add_argument("--p-range", nargs=2, type=float, default=None,
+                        metavar=("PMIN", "PMAX"),
+                        help="Interval mode: one TV bound valid for every p "
+                             "in [PMIN, PMAX] (see --split-depth)")
 
 
 def default_out_dir(args):
+    if getattr(args, "p_range", None) is not None:
+        return ROOT / f"geometric_runs_interval_{args.backend}"
     lf = getattr(args, "input_file", None)
     if lf is None:
         return ROOT / f"geometric_runs_{args.backend}"
@@ -264,6 +362,11 @@ def default_out_dir(args):
 def run(args, fptaylor, inputs_dir, outputs_dir, env):
     # `fptaylor` is whichever backend binary main.py resolved (CIRE_LLVM
     # under --backend cire).
+    if args.p_range is not None:
+        p_iv = parse_range(args.p_range, "--p-range")
+        for p in p_iv:
+            _validate(p, "--p-range")
+        return [run_box(args, fptaylor, inputs_dir, outputs_dir, env, p_iv)]
     if args.p is not None:
         _validate(args.p)
         ps = [args.p]
@@ -329,6 +432,11 @@ def run(args, fptaylor, inputs_dir, outputs_dir, env):
 def write_plot(rows, plot_path, plot_components=False, plot_pgf=False):
     import contextlib
     import os
+
+    rows = [r for r in rows if r["p"]]          # interval rows aren't points
+    if not rows:
+        print("Nothing to plot: interval-mode rows are not points on the p axis")
+        return False
 
     # Both groups use k = -log2(p) as x-coordinate.
     search    = [(r, -math.log2(float(r["p"]))) for r in rows if r["regime"] == "search"]

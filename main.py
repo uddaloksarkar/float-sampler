@@ -10,6 +10,12 @@ Usage:
   python main.py hypergeometric triples.txt | --N N --K K --n n [common opts]
   python main.py zipf           as.txt      | --s A            [common opts]
 
+Interval mode -- one TV bound valid over a whole parameter box; any point
+flag above has a --*-range counterpart (see README "Interval mode"):
+  python main.py poisson        --lam-range 1000 2000          [--split-depth D]
+  python main.py binomial       --n-range 1000 1100 --p-range 0.1 0.11
+  python main.py hypergeometric --N-range 1000 1010 --K-range 300 305 --n-range 200 205
+
 Common options (shared by all distributions):
   --fptaylor PATH   path to FPTaylor executable
   --fp {fp32,fp64,fp128}
