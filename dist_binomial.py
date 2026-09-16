@@ -23,13 +23,14 @@ from dist_common import (
     run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
     loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
     ulp_rnd_op,
-    iv, param_ivar, interval_ivar,
+    iv, is_point, param_ivar, interval_ivar,
     us_root, hormann_u_at, hormann_proposal_deviation, acceptance_tv,
     vprint, elapsed_since, format_seconds,
     floor_x_abs_tol_vars, accept_x_abs_tol_vars,
     dist_switch,
     BoxTooWide, analyse_param_box, max_fields, parse_range, bisect_box,
     safe_box_name, box_label, csv_num, fmt_num, with_param_tols,
+    int_or_float_str,
 )
 
 NAME = "binomial"
@@ -200,6 +201,32 @@ def make_btrs_floor_template(n, p, fp, u_lo, u_hi):
     )
 
 
+def btrs_m_range(n, p):
+    """
+    Box-mode enclosure [m_lo, m_hi] of BTRS's floor-encoded m
+    (m_ = (n+1)*p - fm, fm in [0, 1); see make_btrs_accept_template) over
+    the box: (n+1)*p is increasing in both n and p (p > 0), so the corners
+    give (n_lo+1)*p_lo and (n_hi+1)*p_hi; widened by 1 below for the floor
+    itself (m <= (n+1)*p < m+1) and a further relative 1e-9 pad for this
+    function's own float64 rounding.
+
+    Raises BoxTooWide if the box is wide enough that this enclosure's
+    upper end would reach n_lo + 1 -- the point at which n - m_ + 1 (hnm's
+    lgamma argument) could go non-positive for some point in the box.
+    """
+    n_lo, n_hi = iv(n)
+    p_lo, p_hi = iv(p)
+    lo = (n_lo + 1.0) * p_lo - 1.0
+    hi = (n_hi + 1.0) * p_hi
+    pad = 1e-9 * max(abs(lo), abs(hi), 1.0)
+    lo, hi = lo - pad, hi + pad
+    if n_lo - hi + 1.0 <= 0.0:
+        raise BoxTooWide(f"n in [{n_lo}, {n_hi}] p in [{p_lo}, {p_hi}]: "
+                         "m's box-wide range reaches n_lo -- n - m_ + 1 "
+                         "(hnm's lgamma argument) would go non-positive")
+    return lo, hi
+
+
 def make_btrs_accept_template(n, p, fp, u_lo, u_hi, k_lo, k_hi, fast=False,
                               param="k"):
     """
@@ -213,12 +240,24 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, k_lo, k_hi, fast=False,
     forming 1/us^2 directly when us is small.
 
     m is tied to (n, p) via a floor encoding fm (m_ = (n+1)*p - fm, fm in
-    [0, 1)), computed inside FPTaylor rather than precomputed in Python,
-    which can't guarantee matching the compiled sampler's rounding
-    bit-for-bit; h = lgamma(m+1) + lgamma(n-m+1) [btrs.c line 77] is
-    likewise derived from m_ inside the query, since each lgamma() call's
-    own error can be as large as the whole eps_accept bound for m in the
-    thousands.
+    [0, 1)); h = lgamma(m+1) + lgamma(n-m+1) [btrs.c line 77] is derived
+    from m_ inside the query. For a point (n, p), m_ is computed inside
+    FPTaylor rather than precomputed in Python, which can't guarantee
+    matching the compiled sampler's rounding bit-for-bit -- exact, and
+    fast, since m_ = (n+1)*p - fm is then linear in fm alone.
+
+    For a box, (n+1)*p is a genuine product of two ranging Variables, and
+    feeding that bilinear term through *two* lgamma calls (h_'s own
+    anti-correlated pair, since m_+1 and n-m_+1 always sum to n+2) measured
+    at >90s without converging. Declaring m_ directly as its own Variable
+    over a Python-computed enclosure (btrs_m_range) instead -- the same
+    reparametrization already used for k below -- removes that bilinear
+    coupling (n - m_ + 1 becomes linear in two independent Variables) and
+    measured at ~18s for the same query. This is a sound relaxation for the
+    same reason k's is: m_ is a *deterministic* function of (n, p), not a
+    per-draw random quantity needing its own error term, so its box-wide
+    enclosure can be computed once, outside FPTaylor, like any other
+    derived-constant enclosure in this file.
 
     k is declared directly as a Variable over [k_lo, k_hi] (from
     btrs_accept_k_range) rather than derived here from u via the y = f(u)
@@ -255,16 +294,23 @@ def make_btrs_accept_template(n, p, fp, u_lo, u_hi, k_lo, k_hi, fast=False,
         k_defs, k_ref = ("  k_     = n - j,\n  k1_    = k_ + 1.0,\n"
                          "  nk1_   = j + 1.0,\n"), "k_"
 
+    if not is_point(n) or not is_point(p):
+        m_var_line = interval_ivar("m_", *btrs_m_range(n, p), kind="real")
+        m_def_line = ""
+    else:
+        m_var_line = "  real fm in [0.0, 1.0]"
+        m_def_line = "  m_     = (n + 1.0) * p - fm,\n"
+
     return (
         "Variables\n"
         f"  real u in [{u_lo:.20e}, {u_hi:.20e}],\n"
         f"  real {param} in [{k_lo:.20e}, {k_hi:.20e}],\n"
         + param_ivar("n", n) + ",\n"
         + param_ivar("p", p) + ",\n"
-        + "  real fm in [0.0, 1.0];\n\n"
+        + m_var_line + ";\n\n"
         + "Definitions\n"
         + "\n".join(btrs_setup_defs(rnd, "n", "p", accept=True)) + "\n"
-        + "  m_     = (n + 1.0) * p - fm,\n"
+        + m_def_line
         + "\n".join(defs_hm + defs_hnm) + "\n"
         + f"  h_     {rnd}= {name_hm} + {name_hnm},\n"
         + f"  us_    {rnd}= 0.5 - abs(u),\n"
@@ -636,7 +682,7 @@ def add_args(parser):
                         help="File with (n, p) pairs, one per line (format: 'n p')")
     source.add_argument("--n", type=int, default=None,
                         help="Single n value (requires --p or --p-range)")
-    source.add_argument("--n-range", nargs=2, type=float, default=None,
+    source.add_argument("--n-range", nargs=2, type=int_or_float_str, default=None,
                         metavar=("NMIN", "NMAX"),
                         help="Interval mode: one TV bound valid for every "
                              "integer n in [NMIN, NMAX] (with --p or --p-range)")

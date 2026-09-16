@@ -34,6 +34,7 @@ from dist_common import (
     dist_switch,
     BoxTooWide, analyse_param_box, max_fields, parse_range, bisect_box,
     safe_box_name, box_label, csv_num, fmt_num, with_param_tols,
+    int_or_float_str,
 )
 
 NAME = "hypergeometric"
@@ -840,17 +841,17 @@ def add_args(parser):
                         help="File with (N K n) triples, one per line")
     source.add_argument("--N", type=int, default=None, dest="N_pop",
                         help="Population size (requires --K and --n)")
-    source.add_argument("--N-range", nargs=2, type=float, default=None,
+    source.add_argument("--N-range", nargs=2, type=int_or_float_str, default=None,
                         metavar=("NMIN", "NMAX"),
                         help="Interval mode: every integer N in [NMIN, NMAX] "
                              "(with --K/--K-range and --n/--n-range)")
     parser.add_argument("--K", type=int, default=None,
                         help="Number of success states in population")
-    parser.add_argument("--K-range", nargs=2, type=float, default=None,
+    parser.add_argument("--K-range", nargs=2, type=int_or_float_str, default=None,
                         metavar=("KMIN", "KMAX"), help="Interval mode: K range")
     parser.add_argument("--n", type=int, default=None, dest="n_draw",
                         help="Number of draws")
-    parser.add_argument("--n-range", nargs=2, type=float, default=None,
+    parser.add_argument("--n-range", nargs=2, type=int_or_float_str, default=None,
                         dest="n_draw_range", metavar=("NMIN", "NMAX"),
                         help="Interval mode: n (draws) range")
 

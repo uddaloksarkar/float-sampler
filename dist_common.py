@@ -1196,6 +1196,25 @@ def max_fields(results, fields):
     return out
 
 
+def int_or_float_str(s):
+    """argparse `type=` for a --*-range endpoint that should be an integer:
+    parses via int(s) directly rather than float(s), so a huge exact value
+    (e.g. anything above 2^53) keeps full precision instead of being
+    silently rounded to the nearest representable double before parse_range
+    ever sees it -- argparse's type= conversion runs first, so `type=float`
+    on an integer-valued flag (as every --n-range/--N-range/--K-range used
+    to be) corrupts values beyond FP64's exact-integer range regardless of
+    what parse_range(integer=True) does afterward. Falls back to float(s)
+    for scientific notation or a decimal point, matching int(float(s))'s
+    old truncating behavior for that input shape (unchanged: precision loss
+    there was already inherent to the user's own chosen input format, not a
+    round-trip this parser introduces)."""
+    try:
+        return int(s)
+    except ValueError:
+        return float(s)
+
+
 def parse_range(values, name, lo_min=None, hi_max=None, integer=False):
     """(lo, hi) from an argparse nargs=2 value, validated."""
     lo, hi = (int(v) for v in values) if integer else (float(v) for v in values)
