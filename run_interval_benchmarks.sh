@@ -47,7 +47,7 @@ set -u
 dist="${1:-all}"
 outdir="${2:-bench_out}"
 jobs="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
-tlimit="${TLIMIT:-300}"
+tlimit="${TLIMIT:-1800}"
 python_bin="${PYTHON:-python3}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
