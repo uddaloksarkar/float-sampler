@@ -12,7 +12,7 @@ from pathlib import Path
 from analyticError import FP_BETA, SWITCH, computeDeltaHighRange, computeDeltaLowRange
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
-    run_command, extract_abs_errors_by_problem,
+    extract_abs_errors_by_problem,
     save_loglog_plot,
     loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
     ulp_rnd_op,
@@ -343,6 +343,8 @@ def _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, e
     Also used by dist_poisson_stable."""
     label = _lam_label(lam)
     fp, verbose = args.fp, args.verbose
+    ratio_tol, bb_eval = args.bb_geometric_ratio_tol, args.bb_eval
+    x_abs_tol, approx = args.opt_x_abs_tol, args.approx
     lam_hi = iv(lam)[1] if isinstance(lam, tuple) else float(lam)
     vprint(verbose, f"poisson low range {label}", k_star=_low_range_k_star(lam_hi))
 
@@ -353,7 +355,24 @@ def _run_low_range_fptaylor(fptaylor, lam, args, tag, inputs_dir, outputs_dir, e
     else:
         lr_input.write_text(_make_low_range_template(lam, fp))
 
-    code, output = run_command([fptaylor, str(lr_input)], cwd=ROOT, env=env)
+    # Was a bare `[fptaylor, str(lr_input)]` call with no --tmp-base-dir/
+    # --log-base-dir: FPTaylor's own defaults (FPTaylor/default.cfg) are the
+    # *relative* paths tmp/ and log/, resolved against cwd=ROOT -- a single
+    # directory shared by every low-range query, not the isolated
+    # tempfile.mkdtemp() work dir every other query in this codebase gets via
+    # run_fptaylor_query. Worse, default.cfg's opt=auto resolves to the
+    # *compiled* --opt bb backend for this query shape, which (per
+    # fptaylor_cmd's own docstring) writes its generated OCaml to fixed
+    # filenames (tmp/bb_1.ml, tmp/bb) and runs the compiled binary by a path
+    # relative to the working directory regardless of --tmp-base-dir -- so
+    # concurrent low-range queries (now routine under
+    # run_interval_benchmarks.sh's xargs -P) raced to compile/execute the
+    # same tmp/bb, observed as FPTaylor failing to create its log file.
+    # run_fptaylor_query gives this the same isolated-work-dir + bb_eval
+    # handling every other query already relies on for safe concurrency.
+    code, output = run_fptaylor_query(fptaylor, lr_input, outputs_dir, env,
+                                      ratio_tol, bb_eval, x_abs_tol,
+                                      args.opt_x_abs_tol_vars, approx)
     lr_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor low range ({label}) ---\n{output}")
