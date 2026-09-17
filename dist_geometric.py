@@ -18,8 +18,8 @@ from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
-    run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
-    run_cire_llvm, extract_cire_abs_error,
+    extract_deltas_by_problem, extract_abs_errors_by_problem,
+    run_cire_llvm, extract_cire_abs_error, run_fptaylor_isolated,
     iv, param_ivar,
     vprint, elapsed_since, format_seconds,
     dist_switch,
@@ -100,8 +100,14 @@ def _run_search_fptaylor(fptaylor, p, args, tag, inputs_dir, outputs_dir, env):
     search_output = outputs_dir / f"geometric_search_{fp}_{tag}.out"
     search_input.write_text(_make_search_template(p, fp))
 
-    code, output = run_command(
-        [fptaylor, "--rel-error", "true", str(search_input)], cwd=ROOT, env=env)
+    # See dist_common.run_fptaylor_isolated's docstring: a bare run_command
+    # here (no --tmp-base-dir/--log-base-dir) shares FPTaylor's default
+    # tmp/log dirs across every concurrent search query, observed in
+    # practice (dist_binomial's identical pattern) as
+    # "Sys_error(...log: Permission denied)" under
+    # run_interval_benchmarks.sh's parallel xargs -P.
+    code, output = run_fptaylor_isolated(
+        fptaylor, ["--rel-error", "true"], search_input, outputs_dir, env)
     search_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor search ({label}) ---\n{output}")
@@ -204,8 +210,14 @@ def _run_inversion_fptaylor(fptaylor, p, args, tag, inputs_dir, outputs_dir, env
     inv_output = outputs_dir / f"geometric_inversion_{fp}_{tag}.out"
     inv_input.write_text(_make_inversion_template(p, fp))
 
-    code, output = run_command(
-        [fptaylor, "--rel-error", "true", str(inv_input)], cwd=ROOT, env=env)
+    # See dist_common.run_fptaylor_isolated's docstring: a bare run_command
+    # here (no --tmp-base-dir/--log-base-dir) shares FPTaylor's default
+    # tmp/log dirs across every concurrent inversion query, observed in
+    # practice (dist_binomial's identical pattern) as
+    # "Sys_error(...log: Permission denied)" under
+    # run_interval_benchmarks.sh's parallel xargs -P.
+    code, output = run_fptaylor_isolated(
+        fptaylor, ["--rel-error", "true"], inv_input, outputs_dir, env)
     inv_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor inversion ({label}) ---\n{output}")

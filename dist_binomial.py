@@ -20,8 +20,8 @@ from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
-    run_command, extract_deltas_by_problem, extract_abs_errors_by_problem,
-    loggam_defs, eps_logv, eps_logus, run_fptaylor_query,
+    extract_deltas_by_problem, extract_abs_errors_by_problem,
+    loggam_defs, eps_logv, eps_logus, run_fptaylor_query, run_fptaylor_isolated,
     ulp_rnd_op,
     iv, is_point, param_ivar, interval_ivar,
     us_root, hormann_u_at, hormann_proposal_deviation, acceptance_tv,
@@ -518,8 +518,13 @@ def _run_inversion_fptaylor(fptaylor, n, p, args, tag, inputs_dir, outputs_dir, 
     inv_output = outputs_dir / f"binomial_inversion_{fp}_{tag}.out"
     inv_input.write_text(_make_inversion_template(n, p, fp))
 
-    code, output = run_command(
-        [fptaylor, "--rel-error", "true", str(inv_input)], cwd=ROOT, env=env)
+    # See dist_common.run_fptaylor_isolated's docstring: a bare run_command
+    # here (no --tmp-base-dir/--log-base-dir) shares FPTaylor's default
+    # tmp/log dirs across every concurrent inversion query, observed in
+    # practice as "Sys_error(...log: Permission denied)" under
+    # run_interval_benchmarks.sh's parallel xargs -P.
+    code, output = run_fptaylor_isolated(
+        fptaylor, ["--rel-error", "true"], inv_input, outputs_dir, env)
     inv_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor inversion ({label}) ---\n{output}")

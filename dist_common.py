@@ -943,6 +943,22 @@ def fptaylor_cmd(fptaylor, input_path, work_dir, ratio_tol=2.0, bb_eval=False,
             str(input_path)]
 
 
+def _run_fptaylor_with_isolated_workdir(argv_fn, outputs_dir, env):
+    """Core executor shared by every FPTaylor call site in this codebase
+    that needs its own scratch space: makes a fresh isolated
+    tempfile.mkdtemp() work directory, calls `argv_fn(work_dir)` to get that
+    query's full argv (so a caller can still reference work_dir for its own
+    --tmp-base-dir/--log-base-dir, e.g. via fptaylor_cmd), runs it, and
+    always cleans up -- run_fptaylor_query, run_fptaylor_isolated, eps_logv
+    and eps_logus all delegate here rather than each repeating their own
+    mkdtemp/try/finally, so there is exactly one place that does it."""
+    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
+    try:
+        return run_command(argv_fn(work), cwd=ROOT, env=env)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
                        bb_eval=False, x_abs_tol=None, x_abs_tol_vars=None,
                        approx=True):
@@ -951,14 +967,42 @@ def run_fptaylor_query(fptaylor, input_path, outputs_dir, env, ratio_tol,
     zipf), all of which run their queries one at a time, so there is no
     compile race (dist_common.fptaylor_cmd) to guard against here even with
     the default --opt bb backend."""
-    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
-    try:
-        return run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars, approx),
-            cwd=ROOT, env=env)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    return _run_fptaylor_with_isolated_workdir(
+        lambda work: fptaylor_cmd(fptaylor, input_path, work, ratio_tol,
+                                  bb_eval, x_abs_tol, x_abs_tol_vars, approx),
+        outputs_dir, env)
+
+
+def run_fptaylor_isolated(fptaylor, extra_argv, input_path, outputs_dir, env):
+    """Run `fptaylor <extra_argv> --tmp-base-dir ... --log-base-dir ...
+    input_path` with the same isolated-work-dir handling as
+    run_fptaylor_query, for FPTaylor invocations that don't go through
+    fptaylor_cmd's --opt bb/bb-eval box-mode flag set (e.g. `--rel-error
+    true`, or no extra flags at all) but still need the same safe-under-
+    concurrency isolation.
+
+    Without this, a bare `[fptaylor, *extra_argv, str(input_path)]` call
+    falls back to FPTaylor/default.cfg's tmp-base-dir=tmp, log-base-dir=log
+    -- relative paths resolved against cwd, i.e. one directory shared by
+    every such call in the whole process (and across concurrent processes
+    under e.g. run_interval_benchmarks.sh's xargs -P), not a per-query
+    directory. Worse, default.cfg's opt=auto can resolve to the *compiled*
+    --opt bb backend, which fptaylor_cmd's own docstring documents as
+    writing fixed-name files (tmp/bb_1.ml, tmp/bb) and running the compiled
+    binary from a path outside --tmp-base-dir's control regardless -- two
+    concurrent calls race on that shared file, observed in practice as
+    FPTaylor dying with "Sys_error(...log: Permission denied)" trying to
+    create its own log file out from under a sibling process's still-open
+    handle on it. See dist_poisson._run_low_range_fptaylor's (fixed) and
+    dist_binomial._run_inversion_fptaylor's (also fixed) own comments for
+    the specific traceback this produced.
+    """
+    return _run_fptaylor_with_isolated_workdir(
+        lambda work: [fptaylor, *extra_argv,
+                     "--tmp-base-dir", str(work / "tmp"),
+                     "--log-base-dir", str(work / "log"),
+                     str(input_path)],
+        outputs_dir, env)
 
 
 def fp_var_type(fp):
@@ -1280,14 +1324,10 @@ def eps_logv(fptaylor, fp, vtail, inputs_dir, outputs_dir, env, verbose,
     out_path   = outputs_dir / f"{stem}.out"
     input_path.write_text(make_logv_template(fp, vtail, 1.0))
 
-    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
-    try:
-        code, output = run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars, approx),
-            cwd=ROOT, env=env)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    code, output = _run_fptaylor_with_isolated_workdir(
+        lambda work: fptaylor_cmd(fptaylor, input_path, work, ratio_tol,
+                                  bb_eval, x_abs_tol, x_abs_tol_vars, approx),
+        outputs_dir, env)
     out_path.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor log(v) on [{vtail:.3e}, 1.0] ---\n{output}")
@@ -1356,14 +1396,10 @@ def eps_logus(fptaylor, fp, utail, inputs_dir, outputs_dir, env, verbose,
     out_path   = outputs_dir / f"{stem}.out"
     input_path.write_text(make_logus_template(fp, utail, 0.5))
 
-    work = Path(tempfile.mkdtemp(prefix="fpt_", dir=outputs_dir))
-    try:
-        code, output = run_command(
-            fptaylor_cmd(fptaylor, input_path, work, ratio_tol, bb_eval,
-                        x_abs_tol, x_abs_tol_vars, approx),
-            cwd=ROOT, env=env)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    code, output = _run_fptaylor_with_isolated_workdir(
+        lambda work: fptaylor_cmd(fptaylor, input_path, work, ratio_tol,
+                                  bb_eval, x_abs_tol, x_abs_tol_vars, approx),
+        outputs_dir, env)
     out_path.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor log(us) on [{utail:.3e}, 0.5] ---\n{output}")

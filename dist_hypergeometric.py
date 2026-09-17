@@ -23,9 +23,9 @@ from pathlib import Path
 
 from dist_common import (
     ROOT, FP_TO_FPTAYLOR_RND,
-    run_command, extract_abs_errors_by_problem,
+    extract_abs_errors_by_problem,
     save_loglog_plot,
-    loggam_defs, run_fptaylor_query,
+    loggam_defs, run_fptaylor_query, run_fptaylor_isolated,
     ulp_rnd_op,
     iv, interval_ivar,
     rou_proposal_deviation, acceptance_tv,
@@ -682,7 +682,12 @@ def _run_hyp_fptaylor(fptaylor, N, K, n, args, tag, inputs_dir, outputs_dir, env
     hyp_output = outputs_dir / f"hypergeometric_hyp_{fp}_{tag}.out"
     hyp_input.write_text(_make_hyp_template(N, K, n, fp))
 
-    code, output = run_command([fptaylor, str(hyp_input)], cwd=ROOT, env=env)
+    # See dist_common.run_fptaylor_isolated's docstring: a bare run_command
+    # here (no --tmp-base-dir/--log-base-dir) shares FPTaylor's default
+    # tmp/log dirs across every concurrent HYP query, observed in practice
+    # as "Sys_error(...log: Permission denied)" under
+    # run_interval_benchmarks.sh's parallel xargs -P.
+    code, output = run_fptaylor_isolated(fptaylor, [], hyp_input, outputs_dir, env)
     hyp_output.write_text(output)
     if verbose >= 2:
         print(f"--- FPTaylor HYP ({label}) ---\n{output}")
