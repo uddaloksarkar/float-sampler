@@ -36,6 +36,16 @@
 #             of <this script's dir>/bins/myrnd, ./bins/myrnd,
 #             $FLOAT_SAMPLER_ROOT/bins/myrnd; falls back to file order with
 #             a warning if none found)
+#   CACHE_DIR directory holding bench_cache/<dist>.csv, the cross-job ledger
+#             of tags already known-good from EARLIER jobs/outdirs (see
+#             plot_summary.py's update_cache) -- read once per dist, before
+#             dispatch, to skip tags a previous run already finished, so a
+#             fresh bench_out_<jobid> doesn't recompute the same FPTaylor
+#             query twice. Read-only here by design (see plot_summary.py's
+#             module docstring for why); this script never writes it.
+#                                                   (default: <this script's
+#             dir>/bench_cache; no effect if bench_cache/<dist>.csv doesn't
+#             exist yet -- run plot_summary.py at least once to seed it)
 #
 # Examples:
 #   ./run_interval_benchmarks.sh                      # everything, nproc workers
@@ -102,6 +112,8 @@ else
     shuf_cmd=(cat)
 fi
 
+cache_dir="${CACHE_DIR:-${script_dir}/bench_cache}"
+
 case "$dist" in
     binomial|poisson|hypergeometric) dist_list=("$dist") ;;
     all) dist_list=(poisson binomial hypergeometric) ;;
@@ -165,8 +177,32 @@ for d in "${dist_list[@]}"; do
         exit 1
     fi
     n_rows=$(grep -cv '^#' "$tsv")
-    echo "=== ${d}: ${n_rows} benchmark(s), ${jobs} parallel worker(s), ${tlimit}s cap each ==="
-    grep -v '^#' "$tsv" | "${shuf_cmd[@]}" | xargs -d '\n' -P "$jobs" -I{} bash -c 'run_one "$0" "$1"' "$d" {}
+
+    # Cache pre-filter: read bench_cache/<d>.csv (if plot_summary.py has
+    # ever populated it) exactly once, up front -- not per-row and not from
+    # inside run_one, so this stays a pure read done before any parallel
+    # worker starts (see CACHE_DIR above for why writes never happen here).
+    cache_csv="${cache_dir}/${d}.csv"
+    done_tags=""
+    n_cached=0
+    if [[ -s "$cache_csv" ]]; then
+        done_tags=$(mktemp)
+        tail -n +2 "$cache_csv" | cut -d',' -f1 > "$done_tags"
+        n_cached=$(wc -l < "$done_tags")
+    fi
+
+    echo "=== ${d}: ${n_rows} benchmark(s) in suite, ${n_cached} already" \
+         "known-good in cache, ${jobs} parallel worker(s), ${tlimit}s cap each ==="
+
+    if [[ -n "$done_tags" ]]; then
+        grep -v '^#' "$tsv" | awk -F'\t' -v donefile="$done_tags" '
+            BEGIN { while ((getline line < donefile) > 0) done[line] = 1 }
+            !($1 in done) { print }
+        ' | "${shuf_cmd[@]}" | xargs -d '\n' -P "$jobs" -I{} bash -c 'run_one "$0" "$1"' "$d" {}
+        rm -f "$done_tags"
+    else
+        grep -v '^#' "$tsv" | "${shuf_cmd[@]}" | xargs -d '\n' -P "$jobs" -I{} bash -c 'run_one "$0" "$1"' "$d" {}
+    fi
 done
 
 # ---------------------------------------------------------------------------
