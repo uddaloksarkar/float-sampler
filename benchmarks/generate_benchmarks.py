@@ -26,8 +26,10 @@ Two different coverage strategies, by dimensionality:
   Binomial (n, p): GAP-FREE in both axes. n is chained edge-to-edge from 1
   to 2^53 at a uniform 10% step; p is chained edge-to-edge from 2^-53 to
   0.5 (p only needs (0, 0.5] -- see sampler_p's reflection) at the same 10%
-  step. Every (n, p) row is one cell of the resulting 2D grid, kept only
-  where the box's center satisfies n*p > 1 (a stricter, uniformly-safe
+  step. Every (n, p) row is one cell of the resulting 2D grid, kept where
+  the box's MAXIMUM n*p exceeds 1, so that every (n, p) with n*p > 1 has a
+  box; a centre test instead would drop boxes straddling the n*p = 1 line,
+  losing points up to n*p ~ 1.2. (A stricter, uniformly-safe
   width -- e.g. the ~0.5% ceiling measured at n~1e8 -- would make a
   gap-free 2D grid combinatorially unrunnable: two ~1D partitions of a few
   thousand steps each cross-multiply into the tens of millions). 10% is a
@@ -48,7 +50,6 @@ Two different coverage strategies, by dimensionality:
 
 Regenerate with: python3 generate_benchmarks.py
 """
-import math
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -142,8 +143,14 @@ def binomial_rows():
     p_boxes = chain_edges(P_MIN, P_MAX, GRID_RATIO, integer=False)
     for i, (n_lo, n_hi) in enumerate(n_boxes):
         for j, (p_lo, p_hi) in enumerate(p_boxes):
-            if math.sqrt(n_lo * n_hi) * math.sqrt(p_lo * p_hi) <= 1.0:
-                continue   # degenerate mean -- skip, per n*p > 1 requirement
+            # Test the box's MAXIMUM n*p, not its geometric centre. A box whose
+            # centre-mean is <= 1 still reaches n_hi*p_hi = centre*sqrt(r_n*r_p)
+            # at its top corner, so a centre test drops boxes that do contain
+            # n*p > 1 -- and since this grid is a partition, those points land in
+            # no other box. Testing the max keeps a superset of {n*p > 1}
+            # (374 boxes more here), making the coverage claim exact.
+            if n_hi * p_hi <= 1.0:
+                continue
             rows.append((f"b_n{i:04d}_p{j:04d}",
                         f"--n-range {n_lo} {n_hi} --p-range {p_lo:.10g} {p_hi:.10g}"))
     return rows
@@ -203,10 +210,14 @@ def hyper_rows():
                 n_dlo, n_dhi = max(1, round(n_lo * N_lo)), max(1, round(n_hi * N_hi))
                 if n_dlo > N_hi:
                     continue
-                mean = (math.sqrt(N_lo * N_hi) * math.sqrt(k_lo * k_hi)
-                        * math.sqrt(n_lo * n_hi))
-                if mean <= 1.0:
-                    continue   # degenerate mean -- skip, per n*K/N > 1
+                # Max of sample*good/popsize over the DERIVED box (largest good
+                # and sample against the smallest popsize), for the same reason
+                # binomial_rows tests its max rather than its centre. The gap is
+                # wider here: three axes each contribute sqrt(r), and the derived
+                # K/n intervals widen the box further, so a centre test was
+                # dropping boxes reaching a mean of 3.5 (4973 boxes more here).
+                if n_dhi * K_hi / N_lo <= 1.0:
+                    continue
                 rows.append((f"h_N{i:04d}_K{j:04d}_n{k:04d}",
                             f"--N-range {N_lo} {N_hi} --K-range {K_lo} {K_hi} "
                             f"--n-range {n_dlo} {n_dhi}"))
